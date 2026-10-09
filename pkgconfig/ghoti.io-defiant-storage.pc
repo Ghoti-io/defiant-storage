@@ -1,0 +1,8 @@
+Name: Ghoti.io Defiant Storage(BRANCH)
+Description: Defiant storage port, versioned formats and snapshot zip
+Version: (VERSION)
+URL: https://github.com/Ghoti-io/defiant-storage
+Libs: -L(PC_LIB_DIR) -l(SUITE)-(PROJECT)(BRANCH)
+CFlags: -I(PC_INCLUDE_DIR)
+Requires: (REQUIRES)
+conformance_dir=(CONFORMANCE_DIR)
