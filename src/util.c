@@ -92,12 +92,22 @@ GDEFSTOR_Result gdefstor_key_hex(const GDEFSTOR_Allocator * alloc,
     return GDEFSTOR_ERR_INVALID;
   }
   prefix_len = strlen(prefix);
+  if (a_len > SIZE_MAX / 2 || prefix_len > SIZE_MAX - a_len * 2) {
+    return GDEFSTOR_ERR_LIMIT;
+  }
   need = prefix_len + a_len * 2;
   if (with_b) {
     if (b == NULL) {
       return GDEFSTOR_ERR_INVALID;
     }
+    if (b_len > SIZE_MAX / 2 || need > SIZE_MAX - 1 ||
+        b_len * 2 > SIZE_MAX - 1 - need) {
+      return GDEFSTOR_ERR_LIMIT;
+    }
     need += 1 + b_len * 2;
+  }
+  if (need > SIZE_MAX - 1) {
+    return GDEFSTOR_ERR_LIMIT;
   }
   key = (char *)gdefstor_mem(alloc, need + 1);
   if (key == NULL) {

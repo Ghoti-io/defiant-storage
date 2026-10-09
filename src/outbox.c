@@ -589,9 +589,12 @@ GDEFSTOR_Result gdefstor_outbox_claim(GDEFSTOR_Store * store,
       return GDEFSTOR_ERR_INTERNAL;
     }
     meta->lease_until = now + lease_ms;
+    rc = gdefstor_outbox_get(store, tenant, tenant_len, best_id, best_id_len,
+        out_row);
+    if (rc != GDEFSTOR_OK) {
+      meta->lease_until = 0;
+    }
   }
-  rc = gdefstor_outbox_get(store, tenant, tenant_len, best_id, best_id_len,
-      out_row);
   gcu_allocator_free(store->alloc, best_id);
   return rc;
 }
@@ -623,7 +626,9 @@ GDEFSTOR_Result gdefstor_outbox_ack(GDEFSTOR_Store * store, const char * tenant,
   rc = store->backend.remove(store->backend.ctx, tenant, tenant_len, key,
       key_len);
   gcu_allocator_free(store->alloc, key);
-  gdefstor_meta_drop(store, tenant, tenant_len, id, id_len);
+  if (rc == GDEFSTOR_OK) {
+    gdefstor_meta_drop(store, tenant, tenant_len, id, id_len);
+  }
   return rc;
 }
 
@@ -658,12 +663,22 @@ GDEFSTOR_Result gdefstor_outbox_fail(GDEFSTOR_Store * store, const char * tenant
   return GDEFSTOR_OK;
 }
 
+static GDEFSTOR_Result fail_claimed(GDEFSTOR_Store * store, const char * tenant,
+    size_t tenant_len, GDEFSTOR_Outbox_Row * row, GDEFSTOR_Result rc) {
+  gdefstor_outbox_fail(store, tenant, tenant_len, row->id, row->id_len);
+  gdefstor_outbox_row_free(row);
+  return rc;
+}
+
 GDEFSTOR_Result gdefstor_outbox_run(GDEFSTOR_Store * store, const char * tenant,
     size_t tenant_len, const char * stream, size_t stream_len, int64_t lease_ms,
     const GDEFSTOR_Clock * clock, const GDEFSTOR_Sink * sink,
     const GDEFSTOR_Limits * limits) {
   GDEFSTOR_Limits cap;
-  if (store == NULL || sink == NULL || sink->append == NULL) {
+  if (store == NULL || sink == NULL || sink->append == NULL || clock == NULL ||
+      clock->now_ms == NULL || lease_ms < 0 ||
+      !gdefstor_span_ok(tenant, tenant_len, store->limits.max_tenant_bytes) ||
+      !gdefstor_span_ok(stream, stream_len, store->limits.max_stream_bytes)) {
     return GDEFSTOR_ERR_INVALID;
   }
   if (limits == NULL) {
@@ -694,26 +709,22 @@ GDEFSTOR_Result gdefstor_outbox_run(GDEFSTOR_Store * store, const char * tenant,
     rc = gdefstor_key_hex(store->alloc, "o:", row->id, row->id_len, NULL, 0, 0,
         &key, &key_len);
     if (rc != GDEFSTOR_OK) {
-      gdefstor_outbox_row_free(row);
-      return rc;
+      return fail_claimed(store, tenant, tenant_len, row, rc);
     }
     rc = gdefstor_lookup(store, tenant, tenant_len, key, key_len, 0, &bytes,
         &len);
     gcu_allocator_free(store->alloc, key);
     if (rc != GDEFSTOR_OK) {
-      gdefstor_outbox_row_free(row);
-      return rc;
+      return fail_claimed(store, tenant, tenant_len, row, rc);
     }
     if (len > SIZE_MAX - 1) {
       gcu_allocator_free(store->alloc, bytes);
-      gdefstor_outbox_row_free(row);
-      return GDEFSTOR_ERR_LIMIT;
+      return fail_claimed(store, tenant, tenant_len, row, GDEFSTOR_ERR_LIMIT);
     }
     line = (uint8_t *)gdefstor_mem(store->alloc, len + 1);
     if (line == NULL) {
       gcu_allocator_free(store->alloc, bytes);
-      gdefstor_outbox_row_free(row);
-      return GDEFSTOR_ERR_OOM;
+      return fail_claimed(store, tenant, tenant_len, row, GDEFSTOR_ERR_OOM);
     }
     memcpy(line, bytes, len);
     line[len] = (uint8_t)'\n';

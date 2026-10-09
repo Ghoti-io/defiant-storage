@@ -49,6 +49,10 @@ typedef struct SnapMem {
   int kind;
   char * id;
   size_t id_len;
+  char * stream;
+  size_t stream_len;
+  uint64_t seq;
+  int have_seq;
 } SnapMem;
 
 static void free_mems(const GDEFSTOR_Allocator * alloc, SnapMem * mems,
@@ -61,6 +65,7 @@ static void free_mems(const GDEFSTOR_Allocator * alloc, SnapMem * mems,
     gcu_allocator_free(alloc, mems[i].name);
     gcu_allocator_free(alloc, mems[i].bytes);
     gcu_allocator_free(alloc, mems[i].id);
+    gcu_allocator_free(alloc, mems[i].stream);
   }
   gcu_allocator_free(alloc, mems);
 }
@@ -654,6 +659,11 @@ GDEFSTOR_Result gdefstor_snapshot_import(GDEFSTOR_Store * store,
       free_mems(store->alloc, mems, count);
       return GDEFSTOR_ERR_CORRUPT;
     }
+    if (version > 1000000u) {
+      gtext_json_free(root);
+      free_mems(store->alloc, mems, count);
+      return GDEFSTOR_ERR_UNSUPPORTED;
+    }
     version = version * 10u + (unsigned)(format_text[i] - '0');
   }
   if (version == 0 || version > GDEFSTOR_SNAPSHOT_VERSION) {
@@ -747,9 +757,27 @@ GDEFSTOR_Result gdefstor_snapshot_import(GDEFSTOR_Store * store,
         rc = GDEFSTOR_ERR_CORRUPT;
       }
       if (rc == GDEFSTOR_OK) {
+        size_t j;
+        for (j = 0; j < count; j++) {
+          if (&mems[j] == mem || !mems[j].have_seq) {
+            continue;
+          }
+          if (mems[j].seq == row->seq &&
+              mems[j].stream_len == row->stream_len &&
+              memcmp(mems[j].stream, row->stream, row->stream_len) == 0) {
+            rc = GDEFSTOR_ERR_CORRUPT;
+            break;
+          }
+        }
+      }
+      if (rc == GDEFSTOR_OK) {
         mem->id = gdefstor_dup(store->alloc, row->id, row->id_len);
+        mem->stream = gdefstor_dup(store->alloc, row->stream, row->stream_len);
         mem->id_len = row->id_len;
-        if (mem->id == NULL) {
+        mem->stream_len = row->stream_len;
+        mem->seq = row->seq;
+        mem->have_seq = 1;
+        if (mem->id == NULL || mem->stream == NULL) {
           rc = GDEFSTOR_ERR_OOM;
         }
       }
@@ -765,20 +793,52 @@ GDEFSTOR_Result gdefstor_snapshot_import(GDEFSTOR_Store * store,
     rc = GDEFSTOR_ERR_CORRUPT;
     goto done;
   }
+  rc = gdefstor_write_begin(store, tenant, tenant_len, &cap, &write);
+  if (rc != GDEFSTOR_OK) {
+    goto done;
+  }
   rc = store->backend.list(store->backend.ctx, tenant, tenant_len, "", 0, &keys,
       &lens, &have);
   if (rc != GDEFSTOR_OK) {
+    gdefstor_write_abort(write);
+    write = NULL;
     goto done;
   }
   free_keys(store->alloc, keys, lens, have);
   keys = NULL;
   if (have != 0) {
+    gdefstor_write_abort(write);
+    write = NULL;
     rc = GDEFSTOR_ERR_INVALID;
     goto done;
   }
-  rc = gdefstor_write_begin(store, tenant, tenant_len, &cap, &write);
-  if (rc != GDEFSTOR_OK) {
-    goto done;
+  {
+    size_t nrev = 0;
+    size_t nblob = 0;
+    size_t nproj = 0;
+    size_t nout = 0;
+    for (i = 0; i < count; i++) {
+      if (mems[i].name_len == strlen(MANIFEST_NAME) &&
+          memcmp(mems[i].name, MANIFEST_NAME, mems[i].name_len) == 0) {
+        continue;
+      }
+      if (mems[i].kind == GDEFSTOR_KIND_REV) {
+        nrev += 1;
+      } else if (mems[i].kind == GDEFSTOR_KIND_BLOB) {
+        nblob += 1;
+      } else if (mems[i].kind == GDEFSTOR_KIND_PROJ) {
+        nproj += 1;
+      } else if (mems[i].kind == GDEFSTOR_KIND_OUT) {
+        nout += 1;
+      }
+    }
+    if (nrev > cap.max_revisions || nblob > cap.max_blobs ||
+        nproj > cap.max_projections || nout > cap.max_outbox_rows) {
+      gdefstor_write_abort(write);
+      write = NULL;
+      rc = GDEFSTOR_ERR_LIMIT;
+      goto done;
+    }
   }
   for (i = 0; i < count; i++) {
     GDEFSTOR_Pending * row;

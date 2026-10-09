@@ -1340,6 +1340,9 @@ ifeq ($(OS_NAME), Windows)
 	@rm -f $(BIN_INSTALL_PATH)/$(TARGET)
 endif
 	@rm -rf $(INCLUDE_INSTALL_PATH)/$(SUITE)/$(PROJECT)$(BRANCH)
+	@rm -rf $(CONFORMANCE_DIR)
+	@rmdir --ignore-fail-on-non-empty $(dir $(CONFORMANCE_DIR))
+	@rmdir --ignore-fail-on-non-empty $(abspath $(PC_INSTALL_PATH)/../ghoti.io)
 	@rm -f $(PKGCONFIG_INSTALL_PATH)/$(SUITE)-$(PROJECT)$(BRANCH).pc
 	@rmdir --ignore-fail-on-non-empty $(INCLUDE_INSTALL_PATH)/$(SUITE)
 	@rmdir --ignore-fail-on-non-empty $(LIB_INSTALL_PATH)/$(SUITE)

@@ -45,9 +45,10 @@ A zip. The member named `manifest` is:
 
 `kind` is `revision`, `blob`, `projection` or `outbox`. Every other member
 name is a storage key (`r:`, `b:`, `p:` or `o:` plus hex of the caller-supplied
-ids). Names are never joined to a filesystem path. A name containing `..`,
-a slash, a backslash or a NUL is `GDEFSTOR_ERR_CORRUPT`, and the tenant is
-left unchanged. The tenant is an argument of import, not a member of the zip.
+ids). Names are never joined to a filesystem path. A name with an empty
+segment, a segment `.` or `..`, or a backslash is `GDEFSTOR_ERR_CORRUPT`,
+and the tenant is left unchanged. A slash only separates those segments.
+The tenant is an argument of import, not a member of the zip.
 
 ## Limits
 

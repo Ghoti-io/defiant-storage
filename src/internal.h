@@ -33,6 +33,31 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Renames for symbols that are not part of the installed API. */
+#define gdefstor_alloc GHOTIIO_DEFSTOR(gdefstor_alloc)
+#define gdefstor_buf_append GHOTIIO_DEFSTOR(gdefstor_buf_append)
+#define gdefstor_check_payload GHOTIIO_DEFSTOR(gdefstor_check_payload)
+#define gdefstor_count GHOTIIO_DEFSTOR(gdefstor_count)
+#define gdefstor_decode_outbox GHOTIIO_DEFSTOR(gdefstor_decode_outbox)
+#define gdefstor_dup GHOTIIO_DEFSTOR(gdefstor_dup)
+#define gdefstor_encode_outbox GHOTIIO_DEFSTOR(gdefstor_encode_outbox)
+#define gdefstor_free_pending GHOTIIO_DEFSTOR(gdefstor_free_pending)
+#define gdefstor_json_escape_append GHOTIIO_DEFSTOR(gdefstor_json_escape_append)
+#define gdefstor_key_hex GHOTIIO_DEFSTOR(gdefstor_key_hex)
+#define gdefstor_limits_resolve GHOTIIO_DEFSTOR(gdefstor_limits_resolve)
+#define gdefstor_lookup GHOTIIO_DEFSTOR(gdefstor_lookup)
+#define gdefstor_mem GHOTIIO_DEFSTOR(gdefstor_mem)
+#define gdefstor_mem0 GHOTIIO_DEFSTOR(gdefstor_mem0)
+#define gdefstor_meta_add GHOTIIO_DEFSTOR(gdefstor_meta_add)
+#define gdefstor_meta_drop GHOTIIO_DEFSTOR(gdefstor_meta_drop)
+#define gdefstor_meta_find GHOTIIO_DEFSTOR(gdefstor_meta_find)
+#define gdefstor_plant_enforce_limit GHOTIIO_DEFSTOR(gdefstor_plant_enforce_limit)
+#define gdefstor_plant_keep_outbox GHOTIIO_DEFSTOR(gdefstor_plant_keep_outbox)
+#define gdefstor_plant_see_uncommitted \
+  GHOTIIO_DEFSTOR(gdefstor_plant_see_uncommitted)
+#define gdefstor_span_ok GHOTIIO_DEFSTOR(gdefstor_span_ok)
+#define gdefstor_stage GHOTIIO_DEFSTOR(gdefstor_stage)
+
 enum {
   GDEFSTOR_KIND_REV = 1,
   GDEFSTOR_KIND_BLOB = 2,

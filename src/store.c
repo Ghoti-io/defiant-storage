@@ -217,14 +217,30 @@ GDEFSTOR_Result gdefstor_count(GDEFSTOR_Store * store, GDEFSTOR_Write * write,
     return rc;
   }
   *out_count = count;
-  free_list(store->alloc, keys, lens, count);
   for (p = write->head; p != NULL; p = p->next) {
+    int seen = 0;
     if (p->key != NULL && p->key_len >= prefix_len &&
         memcmp(p->key, prefix, prefix_len) == 0) {
+      for (i = 0; i < count; i++) {
+        if (lens[i] == p->key_len &&
+            memcmp(keys[i], p->key, p->key_len) == 0) {
+          seen = 1;
+          break;
+        }
+      }
+      if (!seen) {
+        *out_count += 1;
+      }
+    } else if (p->key == NULL && prefix_len >= 2 &&
+        ((p->kind == GDEFSTOR_KIND_REV && prefix[0] == 'r') ||
+            (p->kind == GDEFSTOR_KIND_BLOB && prefix[0] == 'b') ||
+            (p->kind == GDEFSTOR_KIND_PROJ && prefix[0] == 'p') ||
+            (p->kind == GDEFSTOR_KIND_OUT && prefix[0] == 'o')) &&
+        prefix[1] == ':') {
       *out_count += 1;
     }
   }
-  (void)i;
+  free_list(store->alloc, keys, lens, count);
   return GDEFSTOR_OK;
 }
 
@@ -282,55 +298,77 @@ void gdefstor_meta_drop(GDEFSTOR_Store * store, const char * tenant,
   }
 }
 
+static void unlink_waiter(GDEFSTOR_Gate * gate, GDEFSTOR_Waiter * waiter,
+    const GDEFSTOR_Allocator * alloc) {
+  GDEFSTOR_Waiter ** pp = &gate->head;
+  GDEFSTOR_Waiter * prev = NULL;
+  while (*pp != NULL) {
+    if (*pp == waiter) {
+      *pp = waiter->next;
+      if (gate->tail == waiter) {
+        gate->tail = prev;
+      }
+      gcu_allocator_free(alloc, waiter);
+      return;
+    }
+    prev = *pp;
+    pp = &(*pp)->next;
+  }
+}
+
+/* The parked fiber unlinks itself after yield returns. A failed switch
+ * leaves the waiter queued so a later release can try again. */
+static GDEFSTOR_Result wake_waiter(GDEFSTOR_Gate * gate) {
+  gate->held = 0;
+  if (gate->head == NULL) {
+    return GDEFSTOR_OK;
+  }
+  if (gcu_fiber_switch_to(gate->head->fiber) != GCU_FIBER_OK) {
+    return GDEFSTOR_ERR_INTERNAL;
+  }
+  return GDEFSTOR_OK;
+}
+
 static GDEFSTOR_Result release_gate(GDEFSTOR_Store * store,
     GDEFSTOR_Write * write) {
   GDEFSTOR_Gate * gate = find_gate(store, write->tenant, write->tenant_len);
-  GDEFSTOR_Waiter * waiter = NULL;
-  GCU_Fiber * fiber = NULL;
   write->alive = 0;
   forget_open(write);
-  if (gate != NULL) {
-    gate->held = 0;
-    if (gate->head != NULL) {
-      waiter = gate->head;
-      gate->head = waiter->next;
-      if (gate->head == NULL) {
-        gate->tail = NULL;
-      }
-      fiber = waiter->fiber;
-      gcu_allocator_free(store->alloc, waiter);
-    }
+  if (gate == NULL) {
+    return GDEFSTOR_OK;
   }
-  if (fiber != NULL) {
-    /* Runs the parked writer until it yields or returns. The lock is
-     * already clear, so its write_begin takes it. */
-    if (gcu_fiber_switch_to(fiber) != GCU_FIBER_OK) {
-      return GDEFSTOR_ERR_INTERNAL;
-    }
-  }
-  return GDEFSTOR_OK;
+  return wake_waiter(gate);
 }
 
 static GDEFSTOR_Result assign_and_encode(GDEFSTOR_Store * store,
     GDEFSTOR_Write * write);
 
+typedef struct AppliedKey {
+  char * key;
+  size_t key_len;
+  const char * id;
+  size_t id_len;
+} AppliedKey;
+
 static void rollback_applied(GDEFSTOR_Store * store, GDEFSTOR_Write * write,
-    char ** applied, size_t * applied_len, size_t applied_count) {
+    AppliedKey * applied, size_t applied_count) {
   size_t i;
   for (i = 0; i < applied_count; i++) {
     store->backend.remove(store->backend.ctx, write->tenant, write->tenant_len,
-        applied[i], applied_len[i]);
-    gcu_allocator_free(store->alloc, applied[i]);
+        applied[i].key, applied[i].key_len);
+    if (applied[i].id != NULL) {
+      gdefstor_meta_drop(store, write->tenant, write->tenant_len,
+          applied[i].id, applied[i].id_len);
+    }
+    gcu_allocator_free(store->alloc, applied[i].key);
   }
   gcu_allocator_free(store->alloc, applied);
-  gcu_allocator_free(store->alloc, applied_len);
 }
 
 static GDEFSTOR_Result apply_pending(GDEFSTOR_Store * store,
     GDEFSTOR_Write * write, int outbox_only) {
   GDEFSTOR_Pending * p;
-  char ** applied = NULL;
-  size_t * applied_len = NULL;
+  AppliedKey * applied = NULL;
   size_t applied_count = 0;
   size_t applied_cap = 0;
   GDEFSTOR_Result rc;
@@ -340,72 +378,90 @@ static GDEFSTOR_Result apply_pending(GDEFSTOR_Store * store,
     return rc;
   }
   for (p = write->head; p != NULL; p = p->next) {
-    char ** next_keys;
-    size_t * next_lens;
+    AppliedKey * next;
+    char * key_copy;
     if (outbox_only && p->kind != GDEFSTOR_KIND_OUT) {
       continue;
     }
     if (p->key == NULL || p->bytes == NULL) {
-      rollback_applied(store, write, applied, applied_len, applied_count);
+      rollback_applied(store, write, applied, applied_count);
       return GDEFSTOR_ERR_INTERNAL;
-    }
-    rc = store->backend.put(store->backend.ctx, write->tenant,
-        write->tenant_len, p->key, p->key_len, p->bytes, p->len);
-    if (rc != GDEFSTOR_OK) {
-      rollback_applied(store, write, applied, applied_len, applied_count);
-      return rc;
     }
     if (applied_count == applied_cap) {
       size_t cap = applied_cap == 0 ? 4 : applied_cap * 2;
-      next_keys = (char **)gcu_allocator_realloc(store->alloc, applied,
-          cap * sizeof *next_keys);
-      if (next_keys == NULL) {
-        rollback_applied(store, write, applied, applied_len, applied_count);
+      next = (AppliedKey *)gcu_allocator_realloc(store->alloc, applied,
+          cap * sizeof *next);
+      if (next == NULL) {
+        rollback_applied(store, write, applied, applied_count);
         return GDEFSTOR_ERR_OOM;
       }
-      applied = next_keys;
-      next_lens = (size_t *)gcu_allocator_realloc(store->alloc, applied_len,
-          cap * sizeof *next_lens);
-      if (next_lens == NULL) {
-        rollback_applied(store, write, applied, applied_len, applied_count);
-        return GDEFSTOR_ERR_OOM;
-      }
-      applied_len = next_lens;
+      applied = next;
       applied_cap = cap;
     }
-    applied[applied_count] = gdefstor_dup(store->alloc, p->key, p->key_len);
-    applied_len[applied_count] = p->key_len;
-    if (applied[applied_count] == NULL) {
-      rollback_applied(store, write, applied, applied_len, applied_count);
+    key_copy = gdefstor_dup(store->alloc, p->key, p->key_len);
+    if (key_copy == NULL) {
+      rollback_applied(store, write, applied, applied_count);
       return GDEFSTOR_ERR_OOM;
     }
+    applied[applied_count].key = key_copy;
+    applied[applied_count].key_len = p->key_len;
+    applied[applied_count].id = NULL;
+    applied[applied_count].id_len = 0;
     applied_count += 1;
+    rc = store->backend.put(store->backend.ctx, write->tenant,
+        write->tenant_len, p->key, p->key_len, p->bytes, p->len);
+    if (rc != GDEFSTOR_OK) {
+      rollback_applied(store, write, applied, applied_count);
+      return rc;
+    }
     if (p->kind == GDEFSTOR_KIND_OUT) {
       rc = gdefstor_meta_add(store, write->tenant, write->tenant_len, p->id,
           p->id_len);
       if (rc != GDEFSTOR_OK) {
-        rollback_applied(store, write, applied, applied_len, applied_count);
+        rollback_applied(store, write, applied, applied_count);
         return rc;
       }
+      applied[applied_count - 1].id = p->id;
+      applied[applied_count - 1].id_len = p->id_len;
     }
   }
   {
     size_t i;
     for (i = 0; i < applied_count; i++) {
-      gcu_allocator_free(store->alloc, applied[i]);
+      gcu_allocator_free(store->alloc, applied[i].key);
     }
   }
   gcu_allocator_free(store->alloc, applied);
-  gcu_allocator_free(store->alloc, applied_len);
   return GDEFSTOR_OK;
+}
+
+static void limits_for_stored(size_t len, GDEFSTOR_Limits * cap) {
+  gdefstor_limits_default(cap);
+  if (len > cap->max_document_bytes) {
+    cap->max_document_bytes = len;
+  }
+  if (len > cap->max_public_id_bytes) {
+    cap->max_public_id_bytes = len;
+  }
+  if (len > cap->max_stream_bytes) {
+    cap->max_stream_bytes = len;
+  }
+  if (len > cap->max_outbox_payload_bytes) {
+    cap->max_outbox_payload_bytes = len;
+  }
+  if (len > cap->max_json_depth) {
+    cap->max_json_depth = len;
+  }
 }
 
 static uint64_t parse_seq_from_row(const uint8_t * bytes, size_t len,
     const char * stream, size_t stream_len, int * match) {
+  GDEFSTOR_Limits cap;
   GDEFSTOR_Outbox_Row * row = NULL;
   uint64_t seq = 0;
   *match = 0;
-  if (gdefstor_decode_outbox(NULL, NULL, bytes, len, &row) != GDEFSTOR_OK) {
+  limits_for_stored(len, &cap);
+  if (gdefstor_decode_outbox(NULL, &cap, bytes, len, &row) != GDEFSTOR_OK) {
     return 0;
   }
   if (same_span(row->stream, row->stream_len, stream, stream_len)) {
@@ -494,17 +550,19 @@ static GDEFSTOR_Result assign_and_encode(GDEFSTOR_Store * store,
   return GDEFSTOR_OK;
 }
 
-static void finish_write(GDEFSTOR_Store * store, GDEFSTOR_Write * write) {
+static GDEFSTOR_Result finish_write(GDEFSTOR_Store * store,
+    GDEFSTOR_Write * write) {
   const GDEFSTOR_Allocator * alloc = store->alloc;
   /* release_gate reads the tenant and may switch to the next writer before
    * it returns, so the write stays intact until that switch comes back. */
-  release_gate(store, write);
+  GDEFSTOR_Result rc = release_gate(store, write);
   free_pending_list(alloc, write->head);
   write->head = NULL;
   write->tail = NULL;
   gcu_allocator_free(alloc, write->tenant);
   write->tenant = NULL;
   gcu_allocator_free(alloc, write);
+  return rc;
 }
 
 GDEFSTOR_Result gdefstor_store_create(const GDEFSTOR_Backend * backend,
@@ -621,23 +679,25 @@ GDEFSTOR_Result gdefstor_write_begin(GDEFSTOR_Store * store,
         gate->tail->next = waiter;
         gate->tail = waiter;
       }
-    }
-    if (gcu_fiber_yield() != GCU_FIBER_OK) {
-      return GDEFSTOR_ERR_INTERNAL;
+      if (gcu_fiber_yield() != GCU_FIBER_OK) {
+        unlink_waiter(gate, waiter, store->alloc);
+        return GDEFSTOR_ERR_INTERNAL;
+      }
+      unlink_waiter(gate, waiter, store->alloc);
     }
   }
   gate->held = 1;
   write = (GDEFSTOR_Write *)gdefstor_mem0(store->alloc, sizeof *write);
   if (write == NULL) {
-    gate->held = 0;
-    return GDEFSTOR_ERR_OOM;
+    rc = wake_waiter(gate);
+    return rc != GDEFSTOR_OK ? rc : GDEFSTOR_ERR_OOM;
   }
   write->store = store;
   write->tenant = gdefstor_dup(store->alloc, tenant, tenant_len);
   if (write->tenant == NULL) {
-    gate->held = 0;
     gcu_allocator_free(store->alloc, write);
-    return GDEFSTOR_ERR_OOM;
+    rc = wake_waiter(gate);
+    return rc != GDEFSTOR_OK ? rc : GDEFSTOR_ERR_OOM;
   }
   write->tenant_len = tenant_len;
   if (limits == NULL) {
@@ -648,10 +708,12 @@ GDEFSTOR_Result gdefstor_write_begin(GDEFSTOR_Store * store,
   write->alive = 1;
   rc = remember_open(write);
   if (rc != GDEFSTOR_OK) {
-    gate->held = 0;
     gcu_allocator_free(store->alloc, write->tenant);
     gcu_allocator_free(store->alloc, write);
-    return rc;
+    {
+      GDEFSTOR_Result wake = wake_waiter(gate);
+      return wake != GDEFSTOR_OK ? wake : rc;
+    }
   }
   *out_write = write;
   return GDEFSTOR_OK;
@@ -668,11 +730,15 @@ GDEFSTOR_Result gdefstor_write_commit(GDEFSTOR_Write * write) {
   if (rc != GDEFSTOR_OK) {
     free_pending_list(store->alloc, write->head);
     write->head = NULL;
-    finish_write(store, write);
-    return rc;
+    write->tail = NULL;
   }
-  finish_write(store, write);
-  return GDEFSTOR_OK;
+  {
+    GDEFSTOR_Result done = finish_write(store, write);
+    if (done != GDEFSTOR_OK) {
+      return done;
+    }
+  }
+  return rc;
 }
 
 GDEFSTOR_Result gdefstor_write_abort(GDEFSTOR_Write * write) {
@@ -686,11 +752,11 @@ GDEFSTOR_Result gdefstor_write_abort(GDEFSTOR_Write * write) {
   store = write->store;
   if (gdefstor_plant_keep_outbox) {
     GDEFSTOR_Result rc = apply_pending(store, write, 1);
-    if (rc != GDEFSTOR_OK) {
-      finish_write(store, write);
-      return rc;
+    GDEFSTOR_Result done = finish_write(store, write);
+    if (done != GDEFSTOR_OK) {
+      return done;
     }
+    return rc;
   }
-  finish_write(store, write);
-  return GDEFSTOR_OK;
+  return finish_write(store, write);
 }
