@@ -1,0 +1,11 @@
+# libFuzzer writes its own corpus here as it discovers inputs. Those are
+# machine-generated and regenerable, so only the hand-built seeds are tracked.
+#
+# `!*/` is required. An excluded directory blocks every negation inside it, so
+# a seed in a new harness directory would otherwise be silently un-addable.
+*
+!.gitignore
+!*/
+!revision/hello.json
+!snapshot/empty.zip
+!*/*.seed
