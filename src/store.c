@@ -350,12 +350,10 @@ typedef struct AppliedKey {
   size_t id_len;
 } AppliedKey;
 
-static void rollback_applied(GDEFSTOR_Store * store, GDEFSTOR_Write * write,
+static void free_applied(GDEFSTOR_Store * store, GDEFSTOR_Write * write,
     AppliedKey * applied, size_t applied_count) {
   size_t i;
   for (i = 0; i < applied_count; i++) {
-    store->backend.remove(store->backend.ctx, write->tenant, write->tenant_len,
-        applied[i].key, applied[i].key_len);
     if (applied[i].id != NULL) {
       gdefstor_meta_drop(store, write->tenant, write->tenant_len,
           applied[i].id, applied[i].id_len);
@@ -365,12 +363,38 @@ static void rollback_applied(GDEFSTOR_Store * store, GDEFSTOR_Write * write,
   gcu_allocator_free(store->alloc, applied);
 }
 
+static void rollback_applied(GDEFSTOR_Store * store, GDEFSTOR_Write * write,
+    AppliedKey * applied, size_t applied_count) {
+  size_t i;
+  for (i = 0; i < applied_count; i++) {
+    store->backend.remove(store->backend.ctx, write->tenant, write->tenant_len,
+        applied[i].key, applied[i].key_len);
+  }
+  free_applied(store, write, applied, applied_count);
+}
+
+static GDEFSTOR_Result fail_applied(GDEFSTOR_Store * store,
+    GDEFSTOR_Write * write, AppliedKey * applied, size_t applied_count,
+    int began, GDEFSTOR_Result rc) {
+  if (began) {
+    GDEFSTOR_Result aborted = store->backend.abort(store->backend.ctx);
+    free_applied(store, write, applied, applied_count);
+    if (aborted != GDEFSTOR_OK) {
+      return aborted;
+    }
+    return rc;
+  }
+  rollback_applied(store, write, applied, applied_count);
+  return rc;
+}
+
 static GDEFSTOR_Result apply_pending(GDEFSTOR_Store * store,
     GDEFSTOR_Write * write, int outbox_only) {
   GDEFSTOR_Pending * p;
   AppliedKey * applied = NULL;
   size_t applied_count = 0;
   size_t applied_cap = 0;
+  int began = 0;
   GDEFSTOR_Result rc;
 
   rc = assign_and_encode(store, write);
@@ -384,45 +408,58 @@ static GDEFSTOR_Result apply_pending(GDEFSTOR_Store * store,
       continue;
     }
     if (p->key == NULL || p->bytes == NULL) {
-      rollback_applied(store, write, applied, applied_count);
-      return GDEFSTOR_ERR_INTERNAL;
+      return fail_applied(store, write, applied, applied_count, began,
+          GDEFSTOR_ERR_INTERNAL);
     }
     if (applied_count == applied_cap) {
       size_t cap = applied_cap == 0 ? 4 : applied_cap * 2;
       next = (AppliedKey *)gcu_allocator_realloc(store->alloc, applied,
           cap * sizeof *next);
       if (next == NULL) {
-        rollback_applied(store, write, applied, applied_count);
-        return GDEFSTOR_ERR_OOM;
+        return fail_applied(store, write, applied, applied_count, began,
+            GDEFSTOR_ERR_OOM);
       }
       applied = next;
       applied_cap = cap;
     }
     key_copy = gdefstor_dup(store->alloc, p->key, p->key_len);
     if (key_copy == NULL) {
-      rollback_applied(store, write, applied, applied_count);
-      return GDEFSTOR_ERR_OOM;
+      return fail_applied(store, write, applied, applied_count, began,
+          GDEFSTOR_ERR_OOM);
     }
     applied[applied_count].key = key_copy;
     applied[applied_count].key_len = p->key_len;
     applied[applied_count].id = NULL;
     applied[applied_count].id_len = 0;
     applied_count += 1;
+    if (!began && store->backend.begin != NULL) {
+      rc = store->backend.begin(store->backend.ctx, write->tenant,
+          write->tenant_len);
+      if (rc != GDEFSTOR_OK) {
+        free_applied(store, write, applied, applied_count);
+        return rc;
+      }
+      began = 1;
+    }
     rc = store->backend.put(store->backend.ctx, write->tenant,
         write->tenant_len, p->key, p->key_len, p->bytes, p->len);
     if (rc != GDEFSTOR_OK) {
-      rollback_applied(store, write, applied, applied_count);
-      return rc;
+      return fail_applied(store, write, applied, applied_count, began, rc);
     }
     if (p->kind == GDEFSTOR_KIND_OUT) {
       rc = gdefstor_meta_add(store, write->tenant, write->tenant_len, p->id,
           p->id_len);
       if (rc != GDEFSTOR_OK) {
-        rollback_applied(store, write, applied, applied_count);
-        return rc;
+        return fail_applied(store, write, applied, applied_count, began, rc);
       }
       applied[applied_count - 1].id = p->id;
       applied[applied_count - 1].id_len = p->id_len;
+    }
+  }
+  if (began) {
+    rc = store->backend.commit(store->backend.ctx);
+    if (rc != GDEFSTOR_OK) {
+      return fail_applied(store, write, applied, applied_count, began, rc);
     }
   }
   {
@@ -572,6 +609,12 @@ GDEFSTOR_Result gdefstor_store_create(const GDEFSTOR_Backend * backend,
   if (backend == NULL || out_store == NULL || backend->destroy == NULL ||
       backend->put == NULL || backend->get == NULL ||
       backend->remove == NULL || backend->list == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if ((backend->begin != NULL || backend->commit != NULL ||
+          backend->abort != NULL) &&
+      (backend->begin == NULL || backend->commit == NULL ||
+          backend->abort == NULL)) {
     return GDEFSTOR_ERR_INVALID;
   }
   store = (GDEFSTOR_Store *)gdefstor_mem0(allocator, sizeof *store);

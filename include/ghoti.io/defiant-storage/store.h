@@ -50,10 +50,13 @@ typedef struct GDEFSTOR_Write GDEFSTOR_Write;
 /**
  * @brief What a backend stores: committed bytes under a tenant and a key.
  *
- * The port keeps uncommitted writes and the writer queue. A backend sees a
- * key only after commit. Keys are storage keys, not filesystem paths.
- * Function pointers are required. New pointers are added at the end; a
- * backend zeroes the struct before filling it.
+ * The port keeps uncommitted writes and the writer queue. A backend receives
+ * a key when the port commits. Keys are storage keys, not filesystem paths.
+ * Function pointers through `list` are required. `begin`, `commit` and
+ * `abort` are optional and come as a set: when `begin` is set, one commit is
+ * one transaction and a failure aborts it instead of removing keys. A
+ * backend zeroes the struct before filling it, so those three stay NULL
+ * when a backend has no transaction.
  *
  * `get` writes a fresh block the port frees with the store allocator, or
  * returns ::GDEFSTOR_ERR_INVALID when the key is absent. `list` writes a
@@ -71,6 +74,15 @@ typedef struct GDEFSTOR_Backend {
   GDEFSTOR_Result (*list)(void * ctx, const char * tenant, size_t tenant_len,
       const char * prefix, size_t prefix_len, char *** out_keys,
       size_t ** out_key_lens, size_t * out_count);
+  /**
+   * Start one transaction for @p tenant. NULL when each `put` is its own
+   * commit. `commit` and `abort` are then also NULL.
+   */
+  GDEFSTOR_Result (*begin)(void * ctx, const char * tenant, size_t tenant_len);
+  /** Finish the transaction started by `begin`. */
+  GDEFSTOR_Result (*commit)(void * ctx);
+  /** Drop the transaction started by `begin`. The previous bytes remain. */
+  GDEFSTOR_Result (*abort)(void * ctx);
 } GDEFSTOR_Backend;
 
 /**
