@@ -99,8 +99,9 @@ GDEFSTOR_API void gdefstor_revision_free(GDEFSTOR_Revision * revision);
  * @brief Append a revision to an open write.
  *
  * The bytes are parsed and stored in the current version. The same
- * `(entity, seq)` twice, in this write or already committed, is
- * ::GDEFSTOR_ERR_INVALID and the first document stays.
+ * `(row, seq)` twice, in this write or already committed, is
+ * ::GDEFSTOR_ERR_INVALID and the first document stays. The key is the
+ * decimal `row`. The document's `entity` string stays the public id.
  *
  * @param write The open write.
  * @param bytes The document.
@@ -116,7 +117,7 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_revision_append(GDEFSTOR_Write * write,
  * @param store The store.
  * @param tenant Tenant bytes.
  * @param tenant_len Its length.
- * @param entity Caller-supplied public id.
+ * @param entity Decimal row id. Not the document's public id.
  * @param entity_len Its length.
  * @param seq Sequence number from the document.
  * @param out_bytes Receives a fresh copy on success.
@@ -131,6 +132,9 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_revision_get(GDEFSTOR_Store * store,
 /** @return The revision's sequence, or 0 when @p revision is NULL. */
 GDEFSTOR_API uint64_t gdefstor_revision_seq(const GDEFSTOR_Revision * revision);
 
+/** @return The revision's row id, or 0 when @p revision is NULL. */
+GDEFSTOR_API uint64_t gdefstor_revision_row(const GDEFSTOR_Revision * revision);
+
 /**
  * @brief Borrow the entity public id. Valid until the revision is freed.
  *
@@ -139,6 +143,16 @@ GDEFSTOR_API uint64_t gdefstor_revision_seq(const GDEFSTOR_Revision * revision);
  * @return The bytes, or NULL.
  */
 GDEFSTOR_API const char * gdefstor_revision_entity(
+    const GDEFSTOR_Revision * revision, size_t * out_len);
+
+/**
+ * @brief Borrow the `lang` object as JSON. Valid until the revision is freed.
+ *
+ * @param revision The revision.
+ * @param out_len Receives the length. May be NULL.
+ * @return The bytes, or NULL.
+ */
+GDEFSTOR_API const char * gdefstor_revision_lang(
     const GDEFSTOR_Revision * revision, size_t * out_len);
 
 /**

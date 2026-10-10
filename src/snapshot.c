@@ -717,16 +717,17 @@ GDEFSTOR_Result gdefstor_snapshot_import(GDEFSTOR_Store * store,
           &rev);
       if (rc == GDEFSTOR_OK) {
         char seq[32];
+        char row_text[32];
         char * expect = NULL;
         size_t expect_len = 0;
         int n = snprintf(seq, sizeof seq, "%llu",
             (unsigned long long)gdefstor_revision_seq(rev));
-        size_t elen = 0;
-        const char * entity = gdefstor_revision_entity(rev, &elen);
-        if (n <= 0) {
+        int nr = snprintf(row_text, sizeof row_text, "%llu",
+            (unsigned long long)gdefstor_revision_row(rev));
+        if (n <= 0 || nr <= 0 || gdefstor_revision_row(rev) == 0) {
           rc = GDEFSTOR_ERR_CORRUPT;
         } else {
-          rc = gdefstor_key_hex(store->alloc, "r:", entity, elen, seq,
+          rc = gdefstor_key_hex(store->alloc, "r:", row_text, (size_t)nr, seq,
               (size_t)n, 1, &expect, &expect_len);
         }
         if (rc == GDEFSTOR_OK &&

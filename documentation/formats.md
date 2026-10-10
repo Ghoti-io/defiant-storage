@@ -10,12 +10,20 @@ Nothing over a limit is truncated: the call returns `GDEFSTOR_ERR_LIMIT`.
 One JSON object, written canonically by `gdefstor_revision_write`:
 
 ```json
-{"format":"defiant-revision/1","seq":1,"entity":"<public-id>","type":"core.post","lang":{"en":{"title":["Hello"]}},"body":""}
+{"format":"defiant-revision/1","seq":1,"row":1,"entity":"<public-id>","type":"core.post","lang":{"en":{"title":["Hello"]}},"body":""}
 ```
 
-`seq` is a positive integer the caller supplies. The revision's identity is
-that sequence together with `entity`. Appending the same identity again
-leaves the first document and returns `GDEFSTOR_ERR_INVALID`.
+`seq` and `row` are positive integers the caller supplies. `row` is the
+storage key, written in decimal. `entity` is the public id and is not the
+key. A document with no `row`, or with `row` of 0, is `GDEFSTOR_ERR_CORRUPT`
+and is not stored. The revision's identity is that sequence together with
+`row`. Appending the same identity again leaves the first document and
+returns `GDEFSTOR_ERR_INVALID`.
+
+`lang` is the language axis. Each language is an object of fields, and each
+field value is an array of strings. This story does not write a
+`{"blob":...}` member; a large value of that shape is still accepted by the
+port when a caller supplies one.
 
 An empty `body` means the body is inline in `lang`. A non-empty `body` is
 the location an archive module already chose; the port stores the string
@@ -45,7 +53,10 @@ A zip. The member named `manifest` is:
 
 `kind` is `revision`, `blob`, `projection` or `outbox`. Every other member
 name is a storage key (`r:`, `b:`, `p:` or `o:` plus hex of the caller-supplied
-ids). Names are never joined to a filesystem path. A name with an empty
+ids). A revision member's name is `r:` plus the hex of the decimal
+`row` text, not the document's `entity`. Import refuses a member whose
+key does not match that row and sequence. Names are never joined to a
+filesystem path. A name with an empty
 segment, a segment `.` or `..`, or a backslash is `GDEFSTOR_ERR_CORRUPT`,
 and the tenant is left unchanged. A slash only separates those segments.
 The tenant is an argument of import, not a member of the zip.

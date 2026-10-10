@@ -179,6 +179,66 @@ GDEFSTOR_Result gdefstor_projection_put(GDEFSTOR_Write * write,
   return rc;
 }
 
+GDEFSTOR_Result gdefstor_projection_delete(GDEFSTOR_Write * write,
+    const char * type, size_t type_len, const char * entity,
+    size_t entity_len) {
+  GDEFSTOR_Pending * row;
+  uint8_t * existing = NULL;
+  size_t existing_len = 0;
+  GDEFSTOR_Result rc;
+  if (write == NULL || !write->alive ||
+      !gdefstor_span_ok(type, type_len, write->limits.max_type_bytes) ||
+      !gdefstor_span_ok(entity, entity_len, write->limits.max_public_id_bytes)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  row = (GDEFSTOR_Pending *)gdefstor_mem0(write->store->alloc, sizeof *row);
+  if (row == NULL) {
+    return GDEFSTOR_ERR_OOM;
+  }
+  row->kind = GDEFSTOR_KIND_PROJ;
+  row->encoded = 1;
+  row->drop = 1;
+  rc = gdefstor_key_hex(write->store->alloc, "p:", type, type_len, entity,
+      entity_len, 1, &row->key, &row->key_len);
+  if (rc != GDEFSTOR_OK) {
+    gdefstor_free_pending(write->store->alloc, row);
+    return rc;
+  }
+  rc = gdefstor_lookup(write->store, write->tenant, write->tenant_len, row->key,
+      row->key_len, 1, &existing, &existing_len);
+  if (rc == GDEFSTOR_ERR_INVALID) {
+    gdefstor_free_pending(write->store->alloc, row);
+    return GDEFSTOR_OK;
+  }
+  if (rc != GDEFSTOR_OK) {
+    gdefstor_free_pending(write->store->alloc, row);
+    return rc;
+  }
+  gcu_allocator_free(write->store->alloc, existing);
+  rc = gdefstor_stage(write, row);
+  if (rc != GDEFSTOR_OK) {
+    if (rc == GDEFSTOR_ERR_INVALID) {
+      GDEFSTOR_Pending ** pp = &write->head;
+      while (*pp != NULL) {
+        if ((*pp)->key != NULL && (*pp)->key_len == row->key_len &&
+            memcmp((*pp)->key, row->key, row->key_len) == 0) {
+          GDEFSTOR_Pending * old = *pp;
+          row->next = old->next;
+          *pp = row;
+          if (write->tail == old) {
+            write->tail = row;
+          }
+          gdefstor_free_pending(write->store->alloc, old);
+          return GDEFSTOR_OK;
+        }
+        pp = &(*pp)->next;
+      }
+    }
+    gdefstor_free_pending(write->store->alloc, row);
+  }
+  return rc;
+}
+
 static GDEFSTOR_Result decode_projection(const GDEFSTOR_Allocator * alloc,
     const GDEFSTOR_Limits * limits, const uint8_t * bytes, size_t len,
     GDEFSTOR_Projection ** out_row) {

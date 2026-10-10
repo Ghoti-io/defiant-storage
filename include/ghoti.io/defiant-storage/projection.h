@@ -71,6 +71,23 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_projection_put(GDEFSTOR_Write * write,
     size_t entity_len, const GDEFSTOR_Column * columns, size_t column_count);
 
 /**
+ * @brief Stage removal of a projection row.
+ *
+ * An absent row is success and stages nothing. A later put of the same key
+ * in this write replaces the removal.
+ *
+ * @param write The open write.
+ * @param type Entity type, caller-supplied.
+ * @param type_len Its length.
+ * @param entity Opaque entity argument, the same one put used.
+ * @param entity_len Its length.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID, or ::GDEFSTOR_ERR_OOM.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_projection_delete(GDEFSTOR_Write * write,
+    const char * type, size_t type_len, const char * entity,
+    size_t entity_len);
+
+/**
  * @brief Read a committed projection row.
  *
  * @param store The store.

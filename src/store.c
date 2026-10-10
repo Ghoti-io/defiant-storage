@@ -148,7 +148,11 @@ GDEFSTOR_Result gdefstor_lookup(GDEFSTOR_Store * store, const char * tenant,
       for (p = w->head; p != NULL; p = p->next) {
         if (p->key != NULL &&
             same_span(p->key, p->key_len, key, key_len)) {
-          uint8_t * copy = (uint8_t *)gdefstor_mem(store->alloc, p->len);
+          uint8_t * copy;
+          if (p->drop) {
+            return GDEFSTOR_ERR_INVALID;
+          }
+          copy = (uint8_t *)gdefstor_mem(store->alloc, p->len);
           if (copy == NULL) {
             return GDEFSTOR_ERR_OOM;
           }
@@ -407,7 +411,7 @@ static GDEFSTOR_Result apply_pending(GDEFSTOR_Store * store,
     if (outbox_only && p->kind != GDEFSTOR_KIND_OUT) {
       continue;
     }
-    if (p->key == NULL || p->bytes == NULL) {
+    if (p->key == NULL || (p->bytes == NULL && !p->drop)) {
       return fail_applied(store, write, applied, applied_count, began,
           GDEFSTOR_ERR_INTERNAL);
     }
@@ -441,8 +445,16 @@ static GDEFSTOR_Result apply_pending(GDEFSTOR_Store * store,
       }
       began = 1;
     }
-    rc = store->backend.put(store->backend.ctx, write->tenant,
-        write->tenant_len, p->key, p->key_len, p->bytes, p->len);
+    if (p->drop) {
+      rc = store->backend.remove(store->backend.ctx, write->tenant,
+          write->tenant_len, p->key, p->key_len);
+      if (rc == GDEFSTOR_ERR_INVALID) {
+        rc = GDEFSTOR_OK;
+      }
+    } else {
+      rc = store->backend.put(store->backend.ctx, write->tenant,
+          write->tenant_len, p->key, p->key_len, p->bytes, p->len);
+    }
     if (rc != GDEFSTOR_OK) {
       return fail_applied(store, write, applied, applied_count, began, rc);
     }

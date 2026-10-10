@@ -31,6 +31,7 @@
 #include <ghoti.io/archive/stream.h>
 #include <ghoti.io/archive/writer.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -45,9 +46,10 @@ void ConformanceClose(GDEFSTOR_Store * store);
 
 static const char kTenant[] = "tenant";
 static const char kEntity[] = "post1";
+static const char kRow[] = "1";
 static const char kType[] = "core.post";
 static const char kDoc[] =
-    "{\"format\":\"defiant-revision/1\",\"seq\":1,\"entity\":\"post1\","
+    "{\"format\":\"defiant-revision/1\",\"seq\":1,\"row\":1,\"entity\":\"post1\","
     "\"type\":\"core.post\",\"lang\":{\"en\":{\"title\":[\"Hello\"]}},"
     "\"body\":\"\"}";
 static const char kHash[] = "abc123";
@@ -100,12 +102,12 @@ TEST_F(ReadSnapshot, OpenWriteIsInvisible) {
   size_t len = 0;
   ASSERT_EQ(GDEFSTOR_OK, commit_doc(store, &write));
   EXPECT_EQ(GDEFSTOR_ERR_INVALID,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &bytes, &len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &bytes, &len));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(write));
   ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &bytes, &len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &bytes, &len));
   gdefstor_bytes_free(NULL, bytes);
 }
 
@@ -140,8 +142,8 @@ static void expect_absent(GDEFSTOR_Store * store) {
   GDEFSTOR_Projection * row = NULL;
   GDEFSTOR_Outbox_Row * event = NULL;
   EXPECT_EQ(GDEFSTOR_ERR_INVALID,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &bytes, &len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &bytes, &len));
   EXPECT_EQ(GDEFSTOR_ERR_INVALID,
       gdefstor_blob_get(store, kTenant, strlen(kTenant), kHash, strlen(kHash),
           &bytes, &len));
@@ -173,8 +175,8 @@ TEST_F(Revision, AppendedTwice) {
       gdefstor_revision_append(write, (const uint8_t *)kDoc, strlen(kDoc)));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(write));
   ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &bytes, &len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &bytes, &len));
   gdefstor_bytes_free(NULL, bytes);
 }
 
@@ -324,7 +326,7 @@ static void park_entry(void * arg) {
     return;
   }
   park->get_rc = gdefstor_revision_get(park->store, kTenant, strlen(kTenant),
-      kEntity, strlen(kEntity), 1, &bytes, &len);
+      kRow, strlen(kRow), 1, &bytes, &len);
   if (park->get_rc == GDEFSTOR_OK) {
     gdefstor_bytes_free(NULL, bytes);
   }
@@ -348,8 +350,8 @@ TEST_F(Writers, FiberParks) {
   ASSERT_EQ(GCU_FIBER_OK, gcu_fiber_switch_to(fiber));
   EXPECT_EQ(GDEFSTOR_RESULT_COUNT, park.begin_rc);
   EXPECT_EQ(GDEFSTOR_ERR_INVALID,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &bytes, &len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &bytes, &len));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(write));
   EXPECT_EQ(GDEFSTOR_OK, park.begin_rc);
   EXPECT_EQ(GDEFSTOR_OK, park.get_rc);
@@ -369,7 +371,7 @@ TEST_F(Writers, NonFiberBusy) {
 TEST_F(Formats, UnknownName) {
   GDEFSTOR_Write * write = NULL;
   const char doc[] =
-      "{\"format\":\"nope/1\",\"seq\":1,\"entity\":\"post1\","
+      "{\"format\":\"nope/1\",\"seq\":1,\"row\":1,\"entity\":\"post1\","
       "\"type\":\"core.post\",\"lang\":{},\"body\":\"\"}";
   ASSERT_EQ(GDEFSTOR_OK,
       gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
@@ -381,7 +383,7 @@ TEST_F(Formats, UnknownName) {
 TEST_F(Formats, NewerVersion) {
   GDEFSTOR_Write * write = NULL;
   const char doc[] =
-      "{\"format\":\"defiant-revision/2\",\"seq\":1,\"entity\":\"post1\","
+      "{\"format\":\"defiant-revision/2\",\"seq\":1,\"row\":1,\"entity\":\"post1\","
       "\"type\":\"core.post\",\"lang\":{},\"body\":\"\"}";
   ASSERT_EQ(GDEFSTOR_OK,
       gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
@@ -419,11 +421,11 @@ TEST_F(Snapshot, RoundTrip) {
       gdefstor_snapshot_import(other, kTenant, strlen(kTenant), zip, zip_len,
           NULL));
   ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &a, &a_len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &a, &a_len));
   ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_revision_get(other, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &b, &b_len));
+      gdefstor_revision_get(other, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &b, &b_len));
   ASSERT_EQ(a_len, b_len);
   EXPECT_EQ(0, memcmp(a, b, a_len));
   gdefstor_bytes_free(NULL, a);
@@ -616,7 +618,7 @@ TEST_F(ReadSnapshot, OtherTenantMisses) {
   size_t len = 0;
   ASSERT_EQ(GDEFSTOR_OK, commit_doc(store, NULL));
   EXPECT_EQ(GDEFSTOR_ERR_INVALID,
-      gdefstor_revision_get(store, "other", 5, kEntity, strlen(kEntity), 1,
+      gdefstor_revision_get(store, "other", 5, kRow, strlen(kRow), 1,
           &bytes, &len));
 }
 
@@ -628,8 +630,8 @@ TEST_F(ReadSnapshot, CommittedStaysVisible) {
   ASSERT_EQ(GDEFSTOR_OK,
       gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
   ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &bytes, &len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &bytes, &len));
   EXPECT_EQ(strlen(kDoc), len);
   gdefstor_bytes_free(NULL, bytes);
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(write));
@@ -676,21 +678,21 @@ TEST_F(Revision, DuplicateKeepsBytes) {
   size_t first_len = 0;
   size_t again_len = 0;
   const char other[] =
-      "{\"format\":\"defiant-revision/1\",\"seq\":1,\"entity\":\"post1\","
+      "{\"format\":\"defiant-revision/1\",\"seq\":1,\"row\":1,\"entity\":\"post1\","
       "\"type\":\"core.post\",\"lang\":{\"en\":{\"title\":[\"Other\"]}},"
       "\"body\":\"\"}";
   ASSERT_EQ(GDEFSTOR_OK, commit_doc(store, NULL));
   ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &first, &first_len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &first, &first_len));
   ASSERT_EQ(GDEFSTOR_OK,
       gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
   EXPECT_EQ(GDEFSTOR_ERR_INVALID,
       gdefstor_revision_append(write, (const uint8_t *)other, strlen(other)));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(write));
   ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &again, &again_len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &again, &again_len));
   ASSERT_EQ(first_len, again_len);
   EXPECT_EQ(0, memcmp(first, again, first_len));
   gdefstor_bytes_free(NULL, first);
@@ -700,7 +702,7 @@ TEST_F(Revision, DuplicateKeepsBytes) {
 TEST_F(Revision, SeqZero) {
   GDEFSTOR_Write * write = NULL;
   const char doc[] =
-      "{\"format\":\"defiant-revision/1\",\"seq\":0,\"entity\":\"post1\","
+      "{\"format\":\"defiant-revision/1\",\"seq\":0,\"row\":1,\"entity\":\"post1\","
       "\"type\":\"core.post\",\"lang\":{},\"body\":\"\"}";
   ASSERT_EQ(GDEFSTOR_OK,
       gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
@@ -708,6 +710,101 @@ TEST_F(Revision, SeqZero) {
       gdefstor_revision_append(write, (const uint8_t *)doc, strlen(doc)));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(write));
   expect_absent(store);
+}
+
+TEST_F(Revision, MissingRowIsCorrupt) {
+  GDEFSTOR_Write * write = NULL;
+  const char doc[] =
+      "{\"format\":\"defiant-revision/1\",\"seq\":1,\"entity\":\"post1\","
+      "\"type\":\"core.post\",\"lang\":{},\"body\":\"\"}";
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT,
+      gdefstor_revision_append(write, (const uint8_t *)doc, strlen(doc)));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(write));
+  expect_absent(store);
+}
+
+TEST_F(Revision, ZeroRowIsCorrupt) {
+  GDEFSTOR_Write * write = NULL;
+  const char doc[] =
+      "{\"format\":\"defiant-revision/1\",\"seq\":1,\"row\":0,\"entity\":\"post1\","
+      "\"type\":\"core.post\",\"lang\":{},\"body\":\"\"}";
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT,
+      gdefstor_revision_append(write, (const uint8_t *)doc, strlen(doc)));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(write));
+  expect_absent(store);
+}
+
+TEST_F(StoreFix, ProjectionDelete) {
+  GDEFSTOR_Write * write = NULL;
+  GDEFSTOR_Projection * row = NULL;
+  GDEFSTOR_Column column;
+  memset(&column, 0, sizeof column);
+  column.name = "title";
+  column.name_len = 5;
+  column.value = (const uint8_t *)"Hello";
+  column.value_len = 5;
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_projection_put(write, kType, strlen(kType), kEntity,
+          strlen(kEntity), &column, 1));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(write));
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_projection_get(store, kTenant, strlen(kTenant), kType,
+          strlen(kType), kEntity, strlen(kEntity), &row));
+  gdefstor_projection_free(row);
+  row = NULL;
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_projection_delete(write, kType, strlen(kType), kEntity,
+          strlen(kEntity)));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(write));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID,
+      gdefstor_projection_get(store, kTenant, strlen(kTenant), kType,
+          strlen(kType), kEntity, strlen(kEntity), &row));
+}
+
+TEST_F(Revision, KeyIsRowId) {
+  uint8_t * bytes = NULL;
+  uint8_t * zip = NULL;
+  size_t len = 0;
+  size_t zip_len = 0;
+  GDEFSTOR_Revision * rev = NULL;
+  const char * entity = NULL;
+  size_t entity_len = 0;
+  ASSERT_EQ(GDEFSTOR_OK, commit_doc(store, NULL));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID,
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
+          strlen(kEntity), 1, &bytes, &len));
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &bytes, &len));
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_revision_parse(bytes, len, NULL, NULL, &rev));
+  EXPECT_EQ(1u, gdefstor_revision_row(rev));
+  entity = gdefstor_revision_entity(rev, &entity_len);
+  ASSERT_NE(entity, nullptr);
+  EXPECT_EQ(strlen(kEntity), entity_len);
+  EXPECT_EQ(0, memcmp(entity, kEntity, entity_len));
+  gdefstor_revision_free(rev);
+  gdefstor_bytes_free(NULL, bytes);
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_snapshot_export(store, kTenant, strlen(kTenant), NULL, &zip,
+          &zip_len));
+  EXPECT_NE(std::search(zip, zip + zip_len,
+                reinterpret_cast<const uint8_t *>("r:31:31"),
+                reinterpret_cast<const uint8_t *>("r:31:31") + 7),
+      zip + zip_len);
+  EXPECT_EQ(std::search(zip, zip + zip_len,
+                reinterpret_cast<const uint8_t *>("r:706f737431:"),
+                reinterpret_cast<const uint8_t *>("r:706f737431:") + 13),
+      zip + zip_len);
+  gdefstor_bytes_free(NULL, zip);
 }
 
 TEST_F(Revision, DestroyDropsStaged) {
@@ -719,14 +816,14 @@ TEST_F(Revision, DestroyDropsStaged) {
   ASSERT_EQ(GDEFSTOR_OK,
       gdefstor_revision_append(write, (const uint8_t *)kDoc, strlen(kDoc)));
   EXPECT_EQ(GDEFSTOR_ERR_INVALID,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &bytes, &len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &bytes, &len));
   ConformanceClose(store);
   store = NULL;
   ASSERT_EQ(GDEFSTOR_OK, ConformanceOpen(&store, NULL));
   EXPECT_EQ(GDEFSTOR_ERR_INVALID,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &bytes, &len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &bytes, &len));
 }
 
 TEST_F(Outbox, StreamSequences) {
@@ -930,7 +1027,7 @@ TEST_F(Limits, RevisionsAtBound) {
   uint8_t * bytes = NULL;
   size_t len = 0;
   const char second[] =
-      "{\"format\":\"defiant-revision/1\",\"seq\":2,\"entity\":\"post1\","
+      "{\"format\":\"defiant-revision/1\",\"seq\":2,\"row\":1,\"entity\":\"post1\","
       "\"type\":\"core.post\",\"lang\":{},\"body\":\"\"}";
   gdefstor_limits_default(&limits);
   limits.max_revisions = 1;
@@ -942,12 +1039,12 @@ TEST_F(Limits, RevisionsAtBound) {
       gdefstor_revision_append(write, (const uint8_t *)second, strlen(second)));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(write));
   ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 1, &bytes, &len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 1, &bytes, &len));
   gdefstor_bytes_free(NULL, bytes);
   EXPECT_EQ(GDEFSTOR_ERR_INVALID,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kEntity,
-          strlen(kEntity), 2, &bytes, &len));
+      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
+          strlen(kRow), 2, &bytes, &len));
 }
 
 TEST_F(Limits, OutboxRowsAtBound) {

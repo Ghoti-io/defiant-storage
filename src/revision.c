@@ -232,6 +232,13 @@ GDEFSTOR_Result gdefstor_revision_parse(const uint8_t * bytes, size_t len,
     gtext_json_free(root);
     return GDEFSTOR_ERR_CORRUPT;
   }
+  if (gtext_json_get_u64(gtext_json_object_get(root, "row", 3), &rev->row) !=
+      GTEXT_JSON_OK ||
+      rev->row == 0) {
+    gdefstor_revision_free(rev);
+    gtext_json_free(root);
+    return GDEFSTOR_ERR_CORRUPT;
+  }
   rc = take_string(root, "entity", alloc, cap.max_public_id_bytes, 0,
       &rev->entity, &rev->entity_len);
   if (rc != GDEFSTOR_OK) {
@@ -303,18 +310,23 @@ GDEFSTOR_Result gdefstor_revision_write(const GDEFSTOR_Revision * revision,
   size_t len = 0;
   size_t buf_cap = 0;
   char seq[32];
+  char row[32];
   int n;
+  int nr;
   GDEFSTOR_Result rc;
 
   if (revision == NULL || out_bytes == NULL || out_len == NULL ||
       revision->entity == NULL || revision->type_name == NULL ||
-      revision->lang_json == NULL || revision->body == NULL) {
+      revision->lang_json == NULL || revision->body == NULL ||
+      revision->row == 0 || revision->seq == 0) {
     return GDEFSTOR_ERR_INVALID;
   }
   gdefstor_limits_resolve(limits, &cap);
   alloc = gdefstor_alloc(allocator);
   n = snprintf(seq, sizeof seq, "%llu", (unsigned long long)revision->seq);
-  if (n <= 0 || (size_t)n >= sizeof seq) {
+  nr = snprintf(row, sizeof row, "%llu", (unsigned long long)revision->row);
+  if (n <= 0 || (size_t)n >= sizeof seq || nr <= 0 ||
+      (size_t)nr >= sizeof row) {
     return GDEFSTOR_ERR_LIMIT;
   }
   rc = gdefstor_buf_append(&buf, &len, &buf_cap, alloc,
@@ -322,6 +334,13 @@ GDEFSTOR_Result gdefstor_revision_write(const GDEFSTOR_Revision * revision,
       strlen("{\"format\":\"defiant-revision/1\",\"seq\":"));
   if (rc == GDEFSTOR_OK) {
     rc = gdefstor_buf_append(&buf, &len, &buf_cap, alloc, seq, (size_t)n);
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = gdefstor_buf_append(&buf, &len, &buf_cap, alloc, ",\"row\":",
+        strlen(",\"row\":"));
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = gdefstor_buf_append(&buf, &len, &buf_cap, alloc, row, (size_t)nr);
   }
   if (rc == GDEFSTOR_OK) {
     rc = gdefstor_buf_append(&buf, &len, &buf_cap, alloc, ",\"entity\":",
@@ -386,6 +405,18 @@ uint64_t gdefstor_revision_seq(const GDEFSTOR_Revision * revision) {
   return revision == NULL ? 0 : revision->seq;
 }
 
+uint64_t gdefstor_revision_row(const GDEFSTOR_Revision * revision) {
+  return revision == NULL ? 0 : revision->row;
+}
+
+const char * gdefstor_revision_lang(const GDEFSTOR_Revision * revision,
+    size_t * out_len) {
+  if (out_len != NULL) {
+    *out_len = revision == NULL ? 0 : revision->lang_json_len;
+  }
+  return revision == NULL ? NULL : revision->lang_json;
+}
+
 const char * gdefstor_revision_entity(const GDEFSTOR_Revision * revision,
     size_t * out_len) {
   if (out_len != NULL) {
@@ -409,7 +440,9 @@ GDEFSTOR_Result gdefstor_revision_append(GDEFSTOR_Write * write,
   uint8_t * stored = NULL;
   size_t stored_len = 0;
   char seq[32];
+  char row_text[32];
   int n;
+  int nr;
   size_t count = 0;
   GDEFSTOR_Result rc;
   uint8_t * existing = NULL;
@@ -424,7 +457,8 @@ GDEFSTOR_Result gdefstor_revision_append(GDEFSTOR_Write * write,
     return rc;
   }
   n = snprintf(seq, sizeof seq, "%llu", (unsigned long long)rev->seq);
-  if (n <= 0) {
+  nr = snprintf(row_text, sizeof row_text, "%llu", (unsigned long long)rev->row);
+  if (n <= 0 || nr <= 0) {
     gdefstor_revision_free(rev);
     return GDEFSTOR_ERR_INTERNAL;
   }
@@ -435,8 +469,8 @@ GDEFSTOR_Result gdefstor_revision_append(GDEFSTOR_Write * write,
   }
   row->kind = GDEFSTOR_KIND_REV;
   row->encoded = 1;
-  rc = gdefstor_key_hex(write->store->alloc, "r:", rev->entity, rev->entity_len,
-      seq, (size_t)n, 1, &row->key, &row->key_len);
+  rc = gdefstor_key_hex(write->store->alloc, "r:", row_text, (size_t)nr, seq,
+      (size_t)n, 1, &row->key, &row->key_len);
   if (rc != GDEFSTOR_OK) {
     gdefstor_free_pending(write->store->alloc, row);
     gdefstor_revision_free(rev);

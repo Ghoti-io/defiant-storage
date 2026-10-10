@@ -73,6 +73,7 @@ extern int gdefstor_plant_enforce_limit;
 typedef struct GDEFSTOR_Pending {
   int kind;
   int encoded;
+  int drop;
   char * key;
   size_t key_len;
   uint8_t * bytes;
@@ -132,6 +133,7 @@ struct GDEFSTOR_Store {
 struct GDEFSTOR_Revision {
   const GDEFSTOR_Allocator * alloc;
   uint64_t seq;
+  uint64_t row;
   char * entity;
   size_t entity_len;
   char * type_name;
