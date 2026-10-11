@@ -969,7 +969,7 @@ GDEFSTOR_Result gdefstor_snapshot_ledger(GDEFSTOR_Store * store,
     return rc;
   }
   ledger = find_mem(mems, count, LEDGER_NAME, strlen(LEDGER_NAME));
-  copy = (uint8_t *)gdefstor_mem(store->alloc, ledger == NULL ? 0 : ledger->len);
+  copy = (uint8_t *)gdefstor_mem(NULL, ledger == NULL ? 0 : ledger->len);
   if (copy == NULL) {
     free_mems(store->alloc, mems, count);
     return GDEFSTOR_ERR_OOM;

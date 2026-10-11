@@ -77,7 +77,8 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_export_ledger(
 /**
  * @brief Copy the `ledger` member. A snapshot without one yields length 0.
  *
- * Free @p out_bytes with gdefstor_bytes_free() and the store's allocator.
+ * The copy is allocated with the default allocator, not the store's.
+ * Free @p out_bytes with gdefstor_bytes_free() and a NULL allocator.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_ledger(GDEFSTOR_Store * store,
     const uint8_t * bytes, size_t len, const GDEFSTOR_Limits * limits,
