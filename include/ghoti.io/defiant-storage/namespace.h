@@ -79,7 +79,10 @@
 #define gdefstor_revision_seq GHOTIIO_DEFSTOR(gdefstor_revision_seq)
 #define gdefstor_revision_write GHOTIIO_DEFSTOR(gdefstor_revision_write)
 #define gdefstor_snapshot_export GHOTIIO_DEFSTOR(gdefstor_snapshot_export)
+#define gdefstor_snapshot_export_ledger                                        \
+  GHOTIIO_DEFSTOR(gdefstor_snapshot_export_ledger)
 #define gdefstor_snapshot_import GHOTIIO_DEFSTOR(gdefstor_snapshot_import)
+#define gdefstor_snapshot_ledger GHOTIIO_DEFSTOR(gdefstor_snapshot_ledger)
 #define gdefstor_store_create GHOTIIO_DEFSTOR(gdefstor_store_create)
 #define gdefstor_store_destroy GHOTIIO_DEFSTOR(gdefstor_store_destroy)
 #define gdefstor_write_abort GHOTIIO_DEFSTOR(gdefstor_write_abort)

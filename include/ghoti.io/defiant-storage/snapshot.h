@@ -23,9 +23,11 @@
  * @brief A tenant snapshot: a zip whose manifest is `defiant-snapshot`.
  * @stability free
  *
- * Member names are storage keys. They are never joined to a filesystem
- * path. Import refuses a bad member with ::GDEFSTOR_ERR_CORRUPT and leaves
- * the tenant unchanged.
+ * Member names are storage keys, except a member named `ledger`. That
+ * member is a copy of an erasure ledger. It is not a storage key, it is
+ * not imported into the tenant, and it is not one of `r:`, `b:`, `p:` or
+ * `o:`. Import refuses any other unexpected member with
+ * ::GDEFSTOR_ERR_CORRUPT and leaves the tenant unchanged.
  */
 
 #ifndef GHOTI_IO_GDEFSTOR_SNAPSHOT_H
@@ -59,6 +61,26 @@ extern "C" {
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_export(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const GDEFSTOR_Limits * limits,
+    uint8_t ** out_bytes, size_t * out_len);
+
+/**
+ * @brief Export one tenant and attach @p ledger as the `ledger` member.
+ *
+ * The ledger is not a storage key. An empty copy is @p ledger_len 0.
+ * @p ledger may be NULL only then.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_export_ledger(
+    GDEFSTOR_Store * store, const char * tenant, size_t tenant_len,
+    const GDEFSTOR_Limits * limits, const uint8_t * ledger, size_t ledger_len,
+    uint8_t ** out_bytes, size_t * out_len);
+
+/**
+ * @brief Copy the `ledger` member. A snapshot without one yields length 0.
+ *
+ * Free @p out_bytes with gdefstor_bytes_free() and the store's allocator.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_ledger(GDEFSTOR_Store * store,
+    const uint8_t * bytes, size_t len, const GDEFSTOR_Limits * limits,
     uint8_t ** out_bytes, size_t * out_len);
 
 /**

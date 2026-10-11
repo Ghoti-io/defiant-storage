@@ -40,6 +40,7 @@
 #include <string.h>
 
 static const char MANIFEST_NAME[] = "manifest";
+static const char LEDGER_NAME[] = "ledger";
 
 typedef struct SnapMem {
   char * name;
@@ -247,9 +248,9 @@ static GDEFSTOR_Result from_json(GTEXT_JSON_Status code) {
   return GDEFSTOR_ERR_CORRUPT;
 }
 
-GDEFSTOR_Result gdefstor_snapshot_export(GDEFSTOR_Store * store,
-    const char * tenant, size_t tenant_len, const GDEFSTOR_Limits * limits,
-    uint8_t ** out_bytes, size_t * out_len) {
+static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
+    size_t tenant_len, const GDEFSTOR_Limits * limits, const uint8_t * ledger,
+    size_t ledger_len, int with_ledger, uint8_t ** out_bytes, size_t * out_len) {
   GDEFSTOR_Limits cap;
   char ** keys = NULL;
   size_t * lens = NULL;
@@ -268,6 +269,7 @@ GDEFSTOR_Result gdefstor_snapshot_export(GDEFSTOR_Store * store,
   GDEFSTOR_Result rc;
   GARC_Result gr;
   if (store == NULL || out_bytes == NULL || out_len == NULL ||
+      (with_ledger && ledger == NULL && ledger_len != 0) ||
       !gdefstor_span_ok(tenant, tenant_len, store->limits.max_tenant_bytes)) {
     return GDEFSTOR_ERR_INVALID;
   }
@@ -281,7 +283,8 @@ GDEFSTOR_Result gdefstor_snapshot_export(GDEFSTOR_Store * store,
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
-  if (count + 1 < count || count + 1 > cap.max_members) {
+  if (count + 1 < count ||
+      count + 1 + (with_ledger ? (size_t)1 : (size_t)0) > cap.max_members) {
     free_keys(store->alloc, keys, lens, count);
     return GDEFSTOR_ERR_LIMIT;
   }
@@ -363,12 +366,21 @@ GDEFSTOR_Result gdefstor_snapshot_export(GDEFSTOR_Store * store,
     free_mems(store->alloc, mems, count);
     return rc;
   }
-  if (manifest_len > cap.max_member_bytes ||
-      total > SIZE_MAX - manifest_len ||
-      total + manifest_len > cap.max_snapshot_bytes) {
+  if (with_ledger && ledger_len > cap.max_member_bytes) {
     gcu_allocator_free(store->alloc, manifest);
     free_mems(store->alloc, mems, count);
     return GDEFSTOR_ERR_LIMIT;
+  }
+  {
+    size_t extra_bytes = with_ledger ? ledger_len : 0;
+    if (manifest_len > cap.max_member_bytes ||
+        total > SIZE_MAX - manifest_len ||
+        total + manifest_len > SIZE_MAX - extra_bytes ||
+        total + manifest_len + extra_bytes > cap.max_snapshot_bytes) {
+      gcu_allocator_free(store->alloc, manifest);
+      free_mems(store->alloc, mems, count);
+      return GDEFSTOR_ERR_LIMIT;
+    }
   }
   gr = garc_sink_create_memory_with_allocator(
       (const GARC_Allocator *)store->alloc, &sink);
@@ -410,6 +422,18 @@ GDEFSTOR_Result gdefstor_snapshot_export(GDEFSTOR_Store * store,
       gr = garc_writer_write(writer, mems[i].bytes, mems[i].len);
     }
   }
+  if (gr == GARC_OK && with_ledger) {
+    GARC_Member member;
+    memset(&member, 0, sizeof member);
+    member.name = LEDGER_NAME;
+    member.name_length = strlen(LEDGER_NAME);
+    member.type = GARC_MEMBER_FILE;
+    member.size = ledger_len;
+    gr = garc_writer_add(writer, &member);
+    if (gr == GARC_OK && ledger_len > 0) {
+      gr = garc_writer_write(writer, ledger, ledger_len);
+    }
+  }
   if (gr == GARC_OK) {
     gr = garc_writer_finish(writer);
   }
@@ -445,6 +469,21 @@ GDEFSTOR_Result gdefstor_snapshot_export(GDEFSTOR_Store * store,
   gcu_allocator_free(store->alloc, manifest);
   free_mems(store->alloc, mems, count);
   return GDEFSTOR_OK;
+}
+
+GDEFSTOR_Result gdefstor_snapshot_export(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const GDEFSTOR_Limits * limits,
+    uint8_t ** out_bytes, size_t * out_len) {
+  return export_zip(store, tenant, tenant_len, limits, NULL, 0, 0, out_bytes,
+      out_len);
+}
+
+GDEFSTOR_Result gdefstor_snapshot_export_ledger(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const GDEFSTOR_Limits * limits,
+    const uint8_t * ledger, size_t ledger_len, uint8_t ** out_bytes,
+    size_t * out_len) {
+  return export_zip(store, tenant, tenant_len, limits, ledger, ledger_len, 1,
+      out_bytes, out_len);
 }
 
 static GDEFSTOR_Result read_members(GDEFSTOR_Store * store,
@@ -590,6 +629,7 @@ GDEFSTOR_Result gdefstor_snapshot_import(GDEFSTOR_Store * store,
   char ** keys = NULL;
   size_t * lens = NULL;
   size_t have = 0;
+  size_t extra = 0;
   GDEFSTOR_Write * write = NULL;
   GDEFSTOR_Result rc;
   unsigned version = 0;
@@ -678,7 +718,9 @@ GDEFSTOR_Result gdefstor_snapshot_import(GDEFSTOR_Store * store,
     return GDEFSTOR_ERR_CORRUPT;
   }
   entries_n = gtext_json_array_size(entries);
-  if (entries_n + 1 != count) {
+  extra = find_mem(mems, count, LEDGER_NAME, strlen(LEDGER_NAME)) == NULL ? 0
+                                                                         : 1;
+  if (entries_n + 1 + extra != count) {
     gtext_json_free(root);
     free_mems(store->alloc, mems, count);
     return GDEFSTOR_ERR_CORRUPT;
@@ -790,7 +832,7 @@ GDEFSTOR_Result gdefstor_snapshot_import(GDEFSTOR_Store * store,
     }
     listed += 1;
   }
-  if (listed + 1 != count) {
+  if (listed + 1 + extra != count) {
     rc = GDEFSTOR_ERR_CORRUPT;
     goto done;
   }
@@ -823,6 +865,10 @@ GDEFSTOR_Result gdefstor_snapshot_import(GDEFSTOR_Store * store,
           memcmp(mems[i].name, MANIFEST_NAME, mems[i].name_len) == 0) {
         continue;
       }
+      if (mems[i].name_len == strlen(LEDGER_NAME) &&
+          memcmp(mems[i].name, LEDGER_NAME, mems[i].name_len) == 0) {
+        continue;
+      }
       if (mems[i].kind == GDEFSTOR_KIND_REV) {
         nrev += 1;
       } else if (mems[i].kind == GDEFSTOR_KIND_BLOB) {
@@ -845,6 +891,10 @@ GDEFSTOR_Result gdefstor_snapshot_import(GDEFSTOR_Store * store,
     GDEFSTOR_Pending * row;
     if (mems[i].name_len == strlen(MANIFEST_NAME) &&
         memcmp(mems[i].name, MANIFEST_NAME, mems[i].name_len) == 0) {
+      continue;
+    }
+    if (mems[i].name_len == strlen(LEDGER_NAME) &&
+        memcmp(mems[i].name, LEDGER_NAME, mems[i].name_len) == 0) {
       continue;
     }
     row = (GDEFSTOR_Pending *)gdefstor_mem0(store->alloc, sizeof *row);
@@ -894,4 +944,41 @@ done:
   }
   free_mems(store->alloc, mems, count);
   return rc;
+}
+
+GDEFSTOR_Result gdefstor_snapshot_ledger(GDEFSTOR_Store * store,
+    const uint8_t * bytes, size_t len, const GDEFSTOR_Limits * limits,
+    uint8_t ** out_bytes, size_t * out_len) {
+  GDEFSTOR_Limits cap;
+  SnapMem * mems = NULL;
+  size_t count = 0;
+  SnapMem * ledger;
+  uint8_t * copy;
+  GDEFSTOR_Result rc;
+  if (store == NULL || out_bytes == NULL || out_len == NULL ||
+      (bytes == NULL && len != 0)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (limits == NULL) {
+    cap = store->limits;
+  } else {
+    cap = *limits;
+  }
+  rc = read_members(store, &cap, bytes, len, &mems, &count);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  ledger = find_mem(mems, count, LEDGER_NAME, strlen(LEDGER_NAME));
+  copy = (uint8_t *)gdefstor_mem(store->alloc, ledger == NULL ? 0 : ledger->len);
+  if (copy == NULL) {
+    free_mems(store->alloc, mems, count);
+    return GDEFSTOR_ERR_OOM;
+  }
+  if (ledger != NULL && ledger->len > 0) {
+    memcpy(copy, ledger->bytes, ledger->len);
+  }
+  *out_bytes = copy;
+  *out_len = ledger == NULL ? 0 : ledger->len;
+  free_mems(store->alloc, mems, count);
+  return GDEFSTOR_OK;
 }
