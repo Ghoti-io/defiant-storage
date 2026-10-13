@@ -19,4 +19,4 @@ make test PREFIX=/path/to/prefix
 make test-valgrind test-asan fuzz FUZZ_TIME=30 PREFIX=/path/to/prefix
 ```
 
-`make test` also runs `check-symbols`, `check-aliasing` and `check-defects`.
+`make test` also runs `check-symbols`, `check-aliasing`, `check-seams` and `check-defects`.
