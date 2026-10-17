@@ -52,6 +52,16 @@
  * are the usual truth tables, and an `and` or `or` with no children is true
  * and false.
  *
+ * ## A semi-join
+ *
+ * ::GDEFSTOR_QUERY_EXISTS holds on a row when some row of another projection
+ * type (`exists_type`, any entity) satisfies its one child, which is a
+ * predicate of that other row. Operands of the child flagged
+ * ::GDEFSTOR_QUERY_OUTER are of the row EXISTS is being decided for, so the
+ * child can say "the other row's column equals this row's column". An
+ * EXISTS inside an EXISTS is refused, and so is an OUTER operand outside one.
+ * A relation read as a condition is one of these.
+ *
  * ## Order and pages
  *
  * Rows are ordered by the sort keys, then by the entity argument, which is
@@ -108,6 +118,9 @@ extern "C" {
 
 /** An operand's flag: an empty set is the single empty text. */
 #define GDEFSTOR_QUERY_EMPTY_IF_NONE 1
+/** An operand's flag, inside an EXISTS: the operand is of the row the EXISTS
+ * is being decided for (the outer row), not of the row it looks at. */
+#define GDEFSTOR_QUERY_OUTER 2
 
 /** One text. Borrowed for the call that takes it. */
 typedef struct GDEFSTOR_QueryText {
@@ -152,7 +165,8 @@ typedef enum GDEFSTOR_QueryOp {
   GDEFSTOR_QUERY_LT,       ///< Some integer pair, left < right.
   GDEFSTOR_QUERY_LE,       ///< Some integer pair, left <= right.
   GDEFSTOR_QUERY_GT,       ///< Some integer pair, left > right.
-  GDEFSTOR_QUERY_GE        ///< Some integer pair, left >= right.
+  GDEFSTOR_QUERY_GE,       ///< Some integer pair, left >= right.
+  GDEFSTOR_QUERY_EXISTS    ///< Some row of another type satisfies the child.
 } GDEFSTOR_QueryOp;
 
 /** A node of the predicate tree. */
@@ -160,8 +174,10 @@ typedef struct GDEFSTOR_QueryNode {
   int op;                                   ///< A ::GDEFSTOR_QueryOp.
   GDEFSTOR_QueryOperand left;               ///< Comparisons only.
   GDEFSTOR_QueryOperand right;              ///< Comparisons only.
-  const struct GDEFSTOR_QueryNode * const * children; ///< AND, OR, NOT.
+  const struct GDEFSTOR_QueryNode * const * children; ///< AND, OR, NOT, EXISTS.
   size_t child_count;                       ///< How many children.
+  const char * exists_type;                 ///< EXISTS: the projection type.
+  size_t exists_type_len;                   ///< Length of @ref exists_type.
 } GDEFSTOR_QueryNode;
 
 /** One sort key. */
@@ -317,11 +333,14 @@ typedef struct GDEFSTOR_QueryRowRef {
  * operand's `join_type` and that of the right's, all with this entity.
  */
 typedef struct GDEFSTOR_QueryEnv {
-  GDEFSTOR_QueryRowRef main;       ///< The queried row.
-  GDEFSTOR_QueryRowRef left_join;  ///< The left operand's joined row.
-  GDEFSTOR_QueryRowRef right_join; ///< The right operand's joined row.
+  GDEFSTOR_QueryRowRef main;       ///< The queried row (inside an EXISTS, the other type's).
+  GDEFSTOR_QueryRowRef left_join;  ///< The left operand's joined row, of its own row's entity.
+  GDEFSTOR_QueryRowRef right_join; ///< The right operand's joined row, likewise.
   const uint8_t * entity;          ///< The entity argument.
   size_t entity_len;               ///< Its length.
+  GDEFSTOR_QueryRowRef outer;      ///< Inside an EXISTS: the row it is decided for.
+  const uint8_t * outer_entity;    ///< Inside an EXISTS: that row's entity argument.
+  size_t outer_entity_len;         ///< Its length.
 } GDEFSTOR_QueryEnv;
 
 /**

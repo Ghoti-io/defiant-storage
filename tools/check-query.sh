@@ -120,4 +120,26 @@ plant no-scan-fallback src/query.c testConformance \
   '  if (rc == GDEFSTOR_ERR_UNSUPPORTED && store->backend.query == NULL) {
     memset(rows, 0, sizeof *rows);'
 
+# An outer operand read from the row the EXISTS looks at.
+plant exists-outer-as-inner src/query.c testConformance \
+  'Query.ExistsIsASemiJoinOnTheOuterRow' \
+  '            : ((o->flags & GDEFSTOR_QUERY_OUTER) != 0 ? &env->outer : &env->main);' \
+  '            : &env->main;'
+
+# The outer row'"'"'s entity read as the inner row'"'"'s.
+plant exists-outer-entity src/query.c testConformance \
+  'Query.ExistsReadsTheOuterRowsJoinedRow' \
+  '    if ((o->flags & GDEFSTOR_QUERY_OUTER) != 0) {
+      return texts_add(t, env->outer_entity, env->outer_entity_len);
+    }' \
+  '    if (0) {
+      return texts_add(t, env->outer_entity, env->outer_entity_len);
+    }'
+
+# An EXISTS inside an EXISTS accepted.
+plant exists-nested-allowed src/query.c testConformance \
+  'Query.ExistsHasItsRules' \
+  '      if (in_exists || n->child_count != 1 || n->children == NULL ||' \
+  '      if (n->child_count != 1 || n->children == NULL ||'
+
 plant_finish

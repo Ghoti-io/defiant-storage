@@ -553,13 +553,21 @@ static GDEFSTOR_Result operand_texts(const GDEFSTOR_Allocator * alloc,
     return rc;
   }
   if (o->kind == GDEFSTOR_QUERY_ENTITY) {
+    if ((o->flags & GDEFSTOR_QUERY_OUTER) != 0) {
+      return texts_add(t, env->outer_entity, env->outer_entity_len);
+    }
     return texts_add(t, env->entity, env->entity_len);
   }
   if (o->kind != GDEFSTOR_QUERY_COLUMN) {
     return GDEFSTOR_ERR_INVALID;
   }
   {
-    const GDEFSTOR_QueryRowRef * row = o->join_type != NULL ? join : &env->main;
+    /* A joined row has been fetched by the walker for the entity of the row
+     * the operand is of; an unjoined one is that row itself. */
+    const GDEFSTOR_QueryRowRef * row =
+        o->join_type != NULL
+            ? join
+            : ((o->flags & GDEFSTOR_QUERY_OUTER) != 0 ? &env->outer : &env->main);
     int found = 0;
     const uint8_t * val = NULL;
     size_t vlen = 0;
@@ -890,8 +898,14 @@ typedef struct Check {
 } Check;
 
 static GDEFSTOR_Result check_operand(const Check * c,
-    const GDEFSTOR_QueryOperand * o, int allow_join, int allow_const) {
+    const GDEFSTOR_QueryOperand * o, int allow_join, int allow_const,
+    int in_exists) {
   size_t i;
+  if ((o->flags & ~(GDEFSTOR_QUERY_EMPTY_IF_NONE | GDEFSTOR_QUERY_OUTER)) != 0 ||
+      ((o->flags & GDEFSTOR_QUERY_OUTER) != 0 &&
+          (!in_exists || o->kind == GDEFSTOR_QUERY_CONST))) {
+    return GDEFSTOR_ERR_INVALID;
+  }
   if (o->kind == GDEFSTOR_QUERY_CONST) {
     if (!allow_const) {
       return GDEFSTOR_ERR_INVALID;
@@ -942,7 +956,7 @@ static GDEFSTOR_Result check_operand(const Check * c,
 }
 
 static GDEFSTOR_Result check_node(Check * c, const GDEFSTOR_QueryNode * n,
-    size_t depth) {
+    size_t depth, int in_exists) {
   size_t i;
   GDEFSTOR_Result rc;
   if (n == NULL) {
@@ -970,12 +984,19 @@ static GDEFSTOR_Result check_node(Check * c, const GDEFSTOR_QueryNode * n,
         return GDEFSTOR_ERR_LIMIT;
       }
       for (i = 0; i < n->child_count; i++) {
-        rc = check_node(c, n->children[i], depth + 1);
+        rc = check_node(c, n->children[i], depth + 1, in_exists);
         if (rc != GDEFSTOR_OK) {
           return rc;
         }
       }
       return GDEFSTOR_OK;
+    case GDEFSTOR_QUERY_EXISTS:
+      if (in_exists || n->child_count != 1 || n->children == NULL ||
+          !gdefstor_span_ok(n->exists_type, n->exists_type_len,
+              c->limits->max_type_bytes)) {
+        return GDEFSTOR_ERR_INVALID;
+      }
+      return check_node(c, n->children[0], depth + 1, 1);
     case GDEFSTOR_QUERY_EQ:
     case GDEFSTOR_QUERY_NE:
     case GDEFSTOR_QUERY_IN:
@@ -990,9 +1011,9 @@ static GDEFSTOR_Result check_node(Check * c, const GDEFSTOR_QueryNode * n,
           n->right.kind != GDEFSTOR_QUERY_CONST) {
         return GDEFSTOR_ERR_INVALID;
       }
-      rc = check_operand(c, &n->left, 1, 1);
+      rc = check_operand(c, &n->left, 1, 1, in_exists);
       if (rc == GDEFSTOR_OK) {
-        rc = check_operand(c, &n->right, 1, 1);
+        rc = check_operand(c, &n->right, 1, 1, in_exists);
       }
       return rc;
     default:
@@ -1008,7 +1029,7 @@ static GDEFSTOR_Result check_where(const GDEFSTOR_Limits * limits,
   if (where == NULL) {
     return GDEFSTOR_OK;
   }
-  return check_node(&c, where, 1);
+  return check_node(&c, where, 1, 0);
 }
 
 static GDEFSTOR_Result check_query(const GDEFSTOR_Limits * limits,
@@ -1037,13 +1058,13 @@ static GDEFSTOR_Result check_query(const GDEFSTOR_Limits * limits,
     if (q->sorts[i].key.kind == GDEFSTOR_QUERY_CONST) {
       return GDEFSTOR_ERR_INVALID;
     }
-    rc = check_operand(&c, &q->sorts[i].key, 0, 0);
+    rc = check_operand(&c, &q->sorts[i].key, 0, 0, 0);
     if (rc != GDEFSTOR_OK) {
       return rc;
     }
   }
   for (i = 0; i < q->select_count; i++) {
-    rc = check_operand(&c, &q->select[i], 0, 0);
+    rc = check_operand(&c, &q->select[i], 0, 0, 0);
     if (rc != GDEFSTOR_OK) {
       return rc;
     }
@@ -1056,20 +1077,37 @@ static GDEFSTOR_Result check_query(const GDEFSTOR_Limits * limits,
 typedef struct JoinSlot {
   const char * type;
   size_t type_len;
-  int loaded;
+  const char * entity;
+  size_t entity_len;
   uint8_t * bytes;
   size_t len;
 } JoinSlot;
 
-enum { kJoinSlots = 16 };
+/* Every row of a type, read once for a whole query: what an EXISTS looks at. */
+typedef struct InnerRow {
+  char * entity;
+  size_t entity_len;
+  uint8_t * bytes;
+  size_t len;
+} InnerRow;
+
+typedef struct InnerSet {
+  const char * type;
+  size_t type_len;
+  InnerRow * rows;
+  size_t count;
+} InnerSet;
 
 typedef struct Scan {
   GDEFSTOR_Store * store;
   const char * tenant;
   size_t tenant_len;
   GDEFSTOR_QueryEnv env;
-  JoinSlot slots[kJoinSlots];
+  JoinSlot * slots;
   size_t nslots;
+  size_t cap_slots;
+  InnerSet * inner;
+  size_t ninner;
   char * entity;
   size_t entity_len;
 } Scan;
@@ -1082,14 +1120,34 @@ static void scan_row_reset(Scan * s) {
   s->nslots = 0;
 }
 
-/* The row of @p type with the current entity, or absent. */
+static void scan_free(Scan * s) {
+  size_t i;
+  size_t j;
+  scan_row_reset(s);
+  gcu_allocator_free(s->store->alloc, s->slots);
+  for (i = 0; i < s->ninner; i++) {
+    for (j = 0; j < s->inner[i].count; j++) {
+      gcu_allocator_free(s->store->alloc, s->inner[i].rows[j].entity);
+      gcu_allocator_free(s->store->alloc, s->inner[i].rows[j].bytes);
+    }
+    gcu_allocator_free(s->store->alloc, s->inner[i].rows);
+  }
+  gcu_allocator_free(s->store->alloc, s->inner);
+  s->slots = NULL;
+  s->inner = NULL;
+  s->nslots = s->cap_slots = s->ninner = 0;
+}
+
+/* The row of @p type with entity @p entity, or absent. */
 static GDEFSTOR_Result scan_join(Scan * s, const char * type, size_t type_len,
-    GDEFSTOR_QueryRowRef * ref) {
+    const uint8_t * entity, size_t entity_len, GDEFSTOR_QueryRowRef * ref) {
   size_t i;
   JoinSlot * slot = NULL;
   for (i = 0; i < s->nslots; i++) {
     if (s->slots[i].type_len == type_len &&
-        memcmp(s->slots[i].type, type, type_len) == 0) {
+        memcmp(s->slots[i].type, type, type_len) == 0 &&
+        s->slots[i].entity_len == entity_len &&
+        (entity_len == 0 || memcmp(s->slots[i].entity, entity, entity_len) == 0)) {
       slot = &s->slots[i];
       break;
     }
@@ -1098,16 +1156,25 @@ static GDEFSTOR_Result scan_join(Scan * s, const char * type, size_t type_len,
     char * key = NULL;
     size_t key_len = 0;
     GDEFSTOR_Result rc;
-    if (s->nslots >= kJoinSlots) {
-      return GDEFSTOR_ERR_LIMIT;
+    if (s->nslots == s->cap_slots) {
+      size_t cap = s->cap_slots == 0 ? 8 : s->cap_slots * 2;
+      JoinSlot * grown = (JoinSlot *)gcu_allocator_realloc(s->store->alloc,
+          s->slots, cap * sizeof *grown);
+      if (grown == NULL) {
+        return GDEFSTOR_ERR_OOM;
+      }
+      s->slots = grown;
+      s->cap_slots = cap;
     }
     slot = &s->slots[s->nslots];
     memset(slot, 0, sizeof *slot);
     slot->type = type;
     slot->type_len = type_len;
+    slot->entity = (const char *)entity;
+    slot->entity_len = entity_len;
     s->nslots += 1;
-    rc = gdefstor_projection_key(s->store->alloc, type, type_len, s->entity,
-        s->entity_len, &key, &key_len);
+    rc = gdefstor_projection_key(s->store->alloc, type, type_len,
+        (const char *)entity, entity_len, &key, &key_len);
     if (rc != GDEFSTOR_OK) {
       return rc;
     }
@@ -1120,11 +1187,92 @@ static GDEFSTOR_Result scan_join(Scan * s, const char * type, size_t type_len,
     } else if (rc != GDEFSTOR_OK) {
       return rc;
     }
-    slot->loaded = 1;
   }
   ref->bytes = slot->bytes;
   ref->len = slot->len;
   return GDEFSTOR_OK;
+}
+
+/* Every row of a type, read once. */
+static GDEFSTOR_Result scan_inner(Scan * s, const char * type, size_t type_len,
+    InnerSet ** out) {
+  size_t i;
+  InnerSet * set;
+  char * prefix = NULL;
+  size_t prefix_len = 0;
+  char ** keys = NULL;
+  size_t * lens = NULL;
+  size_t nkeys = 0;
+  GDEFSTOR_Result rc;
+  const GDEFSTOR_Allocator * alloc = s->store->alloc;
+  for (i = 0; i < s->ninner; i++) {
+    if (s->inner[i].type_len == type_len &&
+        memcmp(s->inner[i].type, type, type_len) == 0) {
+      *out = &s->inner[i];
+      return GDEFSTOR_OK;
+    }
+  }
+  {
+    InnerSet * grown = (InnerSet *)gcu_allocator_realloc(alloc, s->inner,
+        (s->ninner + 1) * sizeof *grown);
+    if (grown == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    s->inner = grown;
+  }
+  set = &s->inner[s->ninner];
+  memset(set, 0, sizeof *set);
+  set->type = type;
+  set->type_len = type_len;
+  s->ninner += 1;
+  rc = gdefstor_projection_key_prefix(alloc, type, type_len, &prefix,
+      &prefix_len);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  rc = s->store->backend.list(s->store->backend.ctx, s->tenant, s->tenant_len,
+      prefix, prefix_len, &keys, &lens, &nkeys);
+  if (rc == GDEFSTOR_OK && nkeys > 0) {
+    set->rows = (InnerRow *)gdefstor_mem0(alloc, nkeys * sizeof *set->rows);
+    if (set->rows == NULL) {
+      rc = GDEFSTOR_ERR_OOM;
+    }
+  }
+  for (i = 0; rc == GDEFSTOR_OK && i < nkeys; i++) {
+    InnerRow * row = &set->rows[set->count];
+    if (lens[i] <= prefix_len) {
+      continue;
+    }
+    rc = gdefstor_projection_key_entity(alloc, keys[i], lens[i], prefix_len,
+        &row->entity, &row->entity_len);
+    if (rc != GDEFSTOR_OK) {
+      break;
+    }
+    rc = s->store->backend.get(s->store->backend.ctx, s->tenant, s->tenant_len,
+        keys[i], lens[i], &row->bytes, &row->len);
+    if (rc == GDEFSTOR_ERR_INVALID) {
+      gcu_allocator_free(alloc, row->entity);
+      memset(row, 0, sizeof *row);
+      rc = GDEFSTOR_OK;
+      continue;
+    }
+    if (rc != GDEFSTOR_OK) {
+      gcu_allocator_free(alloc, row->entity);
+      memset(row, 0, sizeof *row);
+      break;
+    }
+    set->count += 1;
+  }
+  for (i = 0; i < nkeys; i++) {
+    gcu_allocator_free(alloc, keys[i]);
+  }
+  gcu_allocator_free(alloc, keys);
+  gcu_allocator_free(alloc, lens);
+  gcu_allocator_free(alloc, prefix);
+  if (rc == GDEFSTOR_OK) {
+    *out = set;
+  }
+  return rc;
 }
 
 static GDEFSTOR_Result scan_eval(Scan * s, const GDEFSTOR_QueryNode * n,
@@ -1169,6 +1317,30 @@ static GDEFSTOR_Result scan_eval(Scan * s, const GDEFSTOR_QueryNode * n,
       rc = scan_eval(s, n->children[0], &r);
       *out = rc == GDEFSTOR_OK ? !r : 0;
       return rc;
+    case GDEFSTOR_QUERY_EXISTS: {
+      /* Some row of the other type satisfies the child, with this row as the
+       * outer one. The row is looked at again afterwards. */
+      InnerSet * set = NULL;
+      GDEFSTOR_QueryEnv saved = s->env;
+      rc = scan_inner(s, n->exists_type, n->exists_type_len, &set);
+      *out = 0;
+      for (i = 0; rc == GDEFSTOR_OK && i < set->count && !*out; i++) {
+        s->env = saved;
+        s->env.outer = saved.main;
+        s->env.outer_entity = saved.entity;
+        s->env.outer_entity_len = saved.entity_len;
+        s->env.main.bytes = set->rows[i].bytes;
+        s->env.main.len = set->rows[i].len;
+        s->env.entity = (const uint8_t *)set->rows[i].entity;
+        s->env.entity_len = set->rows[i].entity_len;
+        rc = scan_eval(s, n->children[0], &r);
+        if (rc == GDEFSTOR_OK && r) {
+          *out = 1;
+        }
+      }
+      s->env = saved;
+      return rc;
+    }
     default:
       break;
   }
@@ -1177,14 +1349,20 @@ static GDEFSTOR_Result scan_eval(Scan * s, const GDEFSTOR_QueryNode * n,
   s->env.right_join.bytes = NULL;
   s->env.right_join.len = 0;
   if (n->left.kind == GDEFSTOR_QUERY_COLUMN && n->left.join_type != NULL) {
+    int outer = (n->left.flags & GDEFSTOR_QUERY_OUTER) != 0;
     rc = scan_join(s, n->left.join_type, n->left.join_type_len,
+        outer ? s->env.outer_entity : s->env.entity,
+        outer ? s->env.outer_entity_len : s->env.entity_len,
         &s->env.left_join);
     if (rc != GDEFSTOR_OK) {
       return rc;
     }
   }
   if (n->right.kind == GDEFSTOR_QUERY_COLUMN && n->right.join_type != NULL) {
+    int outer = (n->right.flags & GDEFSTOR_QUERY_OUTER) != 0;
     rc = scan_join(s, n->right.join_type, n->right.join_type_len,
+        outer ? s->env.outer_entity : s->env.entity,
+        outer ? s->env.outer_entity_len : s->env.entity_len,
         &s->env.right_join);
     if (rc != GDEFSTOR_OK) {
       return rc;
@@ -1389,6 +1567,7 @@ static GDEFSTOR_Result scan_rows(GDEFSTOR_Store * store, const char * tenant,
     s.entity = NULL;
     scan_row_reset(&s);
   }
+  scan_free(&s);
   for (k = 0; k < nkeys; k++) {
     gcu_allocator_free(alloc, keys[k]);
   }

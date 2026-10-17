@@ -64,6 +64,7 @@ struct MRow {
 
 struct World {
   std::vector<MRow> rows;
+  std::vector<MRow> inner; // rows of kInner, what an EXISTS looks at
   // join type -> entity -> columns
   std::map<std::string, std::map<std::string, std::map<std::string, std::string>>> joins;
 };
@@ -71,6 +72,7 @@ struct World {
 static const char * const kType2 = "qt.rows";
 static const char * const kOther = "qt.other";
 static const char * const kJoin = "qt.state";
+static const char * const kInner = "qt.inner";
 
 static std::vector<std::string> Alphabet() {
   return {"", "a", "b", "ab", "abc", "7", "07", "10", "-3", "0", "-0",
@@ -192,6 +194,33 @@ static World MakeWorld(Rng & rng, size_t n) {
     }
     w.rows.push_back(r);
   }
+  /* The rows an EXISTS looks at: a name, two columns, and a document. */
+  for (size_t i = 0; i < n / 2; i++) {
+    MRow r;
+    r.entity = "i" + std::to_string(i);
+    r.cols["rel"] = rng.chance(80) ? "r1" : "r2";
+    if (rng.chance(85)) {
+      r.cols["c0"] = alpha[rng.below(alpha.size())];
+    }
+    if (rng.chance(60)) {
+      r.cols["c1"] = alpha[rng.below(alpha.size())];
+    }
+    if (rng.chance(70)) {
+      r.has_doc = true;
+      for (const char * field : {"a", "b"}) {
+        if (rng.chance(70)) {
+          std::vector<std::string> vals;
+          size_t nv = rng.below(3);
+          for (size_t k = 0; k < nv; k++) {
+            vals.push_back(alpha[rng.below(alpha.size())]);
+          }
+          r.doc["en"][field] = vals;
+        }
+      }
+      r.cols["lang"] = DocText(rng, r.doc);
+    }
+    w.inner.push_back(r);
+  }
   return w;
 }
 
@@ -223,6 +252,9 @@ static void Commit(GDEFSTOR_Store * store, const World & w) {
   for (const auto & r : w.rows) {
     ASSERT_EQ(GDEFSTOR_OK, PutRow(write, kType2, r.entity, r.cols));
   }
+  for (const auto & r : w.inner) {
+    ASSERT_EQ(GDEFSTOR_OK, PutRow(write, kInner, r.entity, r.cols));
+  }
   for (const auto & jt : w.joins) {
     for (const auto & e : jt.second) {
       ASSERT_EQ(GDEFSTOR_OK, PutRow(write, jt.first.c_str(), e.first, e.second));
@@ -243,6 +275,7 @@ static void Commit(GDEFSTOR_Store * store, const World & w) {
 struct QOp {
   int kind = GDEFSTOR_QUERY_CONST;
   int flags = 0;
+  bool outer = false;
   std::string col;
   std::string join;
   bool json = false;
@@ -253,6 +286,7 @@ struct QOp {
 
 struct QNode {
   int op = GDEFSTOR_QUERY_TRUE;
+  std::string exists_type;
   QOp l;
   QOp r;
   std::vector<QNode> kids;
@@ -293,7 +327,7 @@ static GDEFSTOR_QueryOperand ToOperand(Arena & a, const QOp & o) {
   GDEFSTOR_QueryOperand out;
   memset(&out, 0, sizeof out);
   out.kind = o.kind;
-  out.flags = o.flags;
+  out.flags = o.flags | (o.outer ? GDEFSTOR_QUERY_OUTER : 0);
   if (o.kind == GDEFSTOR_QUERY_COLUMN) {
     out.column = Keep(a, o.col);
     out.column_len = o.col.size();
@@ -329,6 +363,10 @@ static const GDEFSTOR_QueryNode * ToNode(Arena & a, const QNode & n) {
   node.op = n.op;
   node.left = ToOperand(a, n.l);
   node.right = ToOperand(a, n.r);
+  if (!n.exists_type.empty()) {
+    node.exists_type = Keep(a, n.exists_type);
+    node.exists_type_len = n.exists_type.size();
+  }
   if (!n.kids.empty()) {
     std::vector<const GDEFSTOR_QueryNode *> k;
     for (const auto & c : n.kids) {
@@ -382,7 +420,11 @@ static GDEFSTOR_Query ToQuery(Arena & a, const QDesc & d) {
 
 typedef std::vector<std::string> TextSet;
 
-static TextSet ModelValues(const World & w, const MRow & row, const QOp & o) {
+static TextSet ModelValues(const World & w, const MRow & row, const QOp & o,
+    const MRow * outer = NULL) {
+  if (o.outer) {
+    return ModelValues(w, *outer, [&]() { QOp plain = o; plain.outer = false; return plain; }());
+  }
   TextSet out;
   if (o.kind == GDEFSTOR_QUERY_CONST) {
     out = o.texts;
@@ -444,33 +486,41 @@ static bool ModelInt(const std::string & s, long long * v) {
   return true;
 }
 
-static bool ModelHolds(const World & w, const MRow & row, const QNode & n) {
+static bool ModelHolds(const World & w, const MRow & row, const QNode & n,
+    const MRow * outer = NULL) {
   switch (n.op) {
+    case GDEFSTOR_QUERY_EXISTS:
+      for (const auto & t : w.inner) {
+        if (ModelHolds(w, t, n.kids[0], &row)) {
+          return true;
+        }
+      }
+      return false;
     case GDEFSTOR_QUERY_TRUE:
       return true;
     case GDEFSTOR_QUERY_FALSE:
       return false;
     case GDEFSTOR_QUERY_AND:
       for (const auto & c : n.kids) {
-        if (!ModelHolds(w, row, c)) {
+        if (!ModelHolds(w, row, c, outer)) {
           return false;
         }
       }
       return true;
     case GDEFSTOR_QUERY_OR:
       for (const auto & c : n.kids) {
-        if (ModelHolds(w, row, c)) {
+        if (ModelHolds(w, row, c, outer)) {
           return true;
         }
       }
       return false;
     case GDEFSTOR_QUERY_NOT:
-      return !ModelHolds(w, row, n.kids[0]);
+      return !ModelHolds(w, row, n.kids[0], outer);
     default:
       break;
   }
-  TextSet l = ModelValues(w, row, n.l);
-  TextSet r = ModelValues(w, row, n.r);
+  TextSet l = ModelValues(w, row, n.l, outer);
+  TextSet r = ModelValues(w, row, n.r, outer);
   bool eq = false;
   for (const auto & a : l) {
     for (const auto & b : r) {
@@ -617,16 +667,16 @@ static std::string Describe(const QOp & o) {
     case GDEFSTOR_QUERY_ENTITY:
       return "entity";
     default:
-      return (o.join.empty() ? "" : o.join + ".") + o.col +
+      return std::string(o.outer ? "outer." : "") + (o.join.empty() ? "" : o.join + ".") + o.col +
              (o.json ? "[" + o.k1 + "][" + o.k2 + "]" : "") +
              ((o.flags & GDEFSTOR_QUERY_EMPTY_IF_NONE) ? "?" : "");
   }
 }
 
 static std::string Describe(const QNode & n) {
-  static const char * names[] = {"", "true", "false", "and", "or", "not", "=", "!=", "in", "<", "<=", ">", ">="};
+  static const char * names[] = {"", "true", "false", "and", "or", "not", "=", "!=", "in", "<", "<=", ">", ">=", "exists"};
   std::string s = "(" + std::string(names[n.op]);
-  if (n.op >= GDEFSTOR_QUERY_EQ) {
+  if (n.op >= GDEFSTOR_QUERY_EQ && n.op != GDEFSTOR_QUERY_EXISTS) {
     s += " " + Describe(n.l) + " " + Describe(n.r);
   }
   for (const auto & c : n.kids) {
@@ -760,9 +810,83 @@ static QOp RandOperand(Rng & rng, bool allow_const, bool allow_join = true) {
   }
 }
 
+static QOp OuterOperand(Rng & rng) {
+  std::vector<std::string> alpha = Alphabet();
+  QOp o;
+  bool empty = rng.chance(40);
+  switch (rng.below(7)) {
+    case 0:
+      o = ColumnOp("n", empty);
+      break;
+    case 1:
+      o = JsonOp(kLangs[rng.below(2)], kFields[rng.below(3)], empty);
+      break;
+    case 2:
+      o.kind = GDEFSTOR_QUERY_ENTITY;
+      break;
+    case 3:
+      o = ColumnOp("pub", false);
+      o.join = kJoin;
+      break;
+    case 4:
+      o = ColumnOp("creator", empty);
+      o.join = kJoin;
+      break;
+    case 5:
+      return ConstOp({alpha[rng.below(alpha.size())]});
+    default:
+      o = ColumnOp("t", empty);
+      break;
+  }
+  o.outer = true;
+  return o;
+}
+
+/* An EXISTS over the inner rows: the name of the relation, and some columns
+ * equal to something of the outer row. */
+static QNode RandExists(Rng & rng) {
+  QNode n;
+  QNode all;
+  n.op = GDEFSTOR_QUERY_EXISTS;
+  n.exists_type = kInner;
+  all.op = GDEFSTOR_QUERY_AND;
+  QNode rel;
+  rel.op = GDEFSTOR_QUERY_EQ;
+  rel.l = ColumnOp("rel", false);
+  rel.r = ConstOp({rng.chance(80) ? "r1" : "r2"});
+  all.kids.push_back(rel);
+  size_t k = 1 + rng.below(2);
+  for (size_t i = 0; i < k; i++) {
+    QNode leaf;
+    leaf.op = rng.chance(75) ? GDEFSTOR_QUERY_EQ : GDEFSTOR_QUERY_NE;
+    if (rng.chance(10)) {
+      leaf.op = GDEFSTOR_QUERY_LT;
+    }
+    leaf.l = rng.chance(50) ? ColumnOp(i == 0 ? "c0" : "c1", rng.chance(30))
+                            : JsonOp("en", rng.chance(50) ? "a" : "b", rng.chance(30));
+    leaf.r = OuterOperand(rng);
+    if (rng.chance(15)) {
+      QNode wrap;
+      wrap.op = GDEFSTOR_QUERY_NOT;
+      wrap.kids.push_back(leaf);
+      all.kids.push_back(wrap);
+    } else {
+      all.kids.push_back(leaf);
+    }
+  }
+  if (rng.chance(20)) {
+    all.op = GDEFSTOR_QUERY_OR;
+  }
+  n.kids.push_back(all);
+  return n;
+}
+
 static QNode RandNode(Rng & rng, int depth) {
   QNode n;
   std::vector<std::string> alpha = Alphabet();
+  if (depth > 0 && rng.chance(9)) {
+    return RandExists(rng);
+  }
   unsigned pick = (unsigned)rng.below(depth > 0 ? 10 : 6);
   if (pick >= 6) {
     n.op = pick == 9 ? GDEFSTOR_QUERY_NOT : (pick == 8 ? GDEFSTOR_QUERY_OR : GDEFSTOR_QUERY_AND);
@@ -853,6 +977,10 @@ TEST_F(Query, Generated) {
         ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_delete(write, jt.first.c_str(),
                                    jt.first.size(), e.first.data(), e.first.size()));
       }
+    }
+    for (const auto & r : w.inner) {
+      ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_delete(write, kInner, strlen(kInner),
+                                 r.entity.data(), r.entity.size()));
     }
     ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(write));
   }
@@ -1562,6 +1690,207 @@ TEST_F(Query, ANodeSharedByManyParentsIsCountedEachTime) {
   uint64_t count = 0;
   EXPECT_EQ(GDEFSTOR_ERR_LIMIT, gdefstor_projection_count(store, kTenant,
                                     strlen(kTenant), kType2, strlen(kType2), below, &count));
+}
+
+TEST_F(Query, ExistsIsASemiJoinOnTheOuterRow) {
+  World w = Simple({{{"g", "a"}}, {{"g", "b"}}, {{"g", "c"}}, {}, {{"g", "a"}}});
+  /* A relation: (name, member). The rows say who is in what. */
+  MRow r1;
+  r1.entity = "m1";
+  r1.cols = {{"rel", "mem"}, {"c0", "a"}};
+  MRow r2;
+  r2.entity = "m2";
+  r2.cols = {{"rel", "mem"}, {"c0", "c"}};
+  MRow r3;
+  r3.entity = "m3";
+  r3.cols = {{"rel", "other"}, {"c0", "b"}};
+  MRow r4;
+  r4.entity = "m4";
+  r4.cols = {{"rel", "mem"}};
+  w.inner = {r1, r2, r3, r4};
+  Commit(store, w);
+  {
+    /* A type whose hex sorts just after the inner one's: its rows say "b" is a
+     * member, and an EXISTS over the inner type must not see them. */
+    GDEFSTOR_Write * write = NULL;
+    ASSERT_EQ(GDEFSTOR_OK,
+        gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
+    ASSERT_EQ(GDEFSTOR_OK, PutRow(write, "qt.innes", "s1", {{"rel", "mem"}, {"c0", "b"}}));
+    ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(write));
+  }
+  QNode inner;
+  inner.op = GDEFSTOR_QUERY_AND;
+  inner.kids.push_back(Cmp(GDEFSTOR_QUERY_EQ, ColumnOp("rel", false), ConstOp({"mem"})));
+  QOp g = ColumnOp("g", false);
+  g.outer = true;
+  inner.kids.push_back(Cmp(GDEFSTOR_QUERY_EQ, ColumnOp("c0", false), g));
+  QNode exists;
+  exists.op = GDEFSTOR_QUERY_EXISTS;
+  exists.exists_type = kInner;
+  exists.kids.push_back(inner);
+  QDesc d;
+  d.has_where = true;
+  d.where = exists;
+  d.entity_numeric = true;
+  CheckQuery(store, w, d, "exists");
+  Arena a;
+  GDEFSTOR_Query q = ToQuery(a, d);
+  GDEFSTOR_QueryResult * r = NULL;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_query(store, kTenant, strlen(kTenant),
+                             kType2, strlen(kType2), &q, &r));
+  /* "a" and "c" are members; "b" is a member of another relation; a row with
+   * no "g" is the none, and none is equal to nothing, a row with no "c0" too. */
+  EXPECT_EQ("1,3,5,", RowsOf(r));
+  EXPECT_EQ(3u, gdefstor_query_result_total(r));
+  gdefstor_query_result_free(r);
+  QDesc not_in = d;
+  not_in.where = QNode();
+  not_in.where.op = GDEFSTOR_QUERY_NOT;
+  not_in.where.kids.push_back(exists);
+  CheckQuery(store, w, not_in, "not exists");
+  /* An EXISTS beside another predicate, and as a count. */
+  QDesc both = d;
+  both.where = QNode();
+  both.where.op = GDEFSTOR_QUERY_AND;
+  both.where.kids.push_back(exists);
+  both.where.kids.push_back(Cmp(GDEFSTOR_QUERY_NE, ColumnOp("g", false), ConstOp({"c"})));
+  CheckQuery(store, w, both, "exists and");
+}
+
+TEST_F(Query, ExistsReadsTheOuterRowsJoinedRow) {
+  World w = Simple({{{"g", "x"}}, {{"g", "y"}}, {{"g", "z"}}});
+  w.joins[kJoin]["1"] = {{"pub", "1"}, {"creator", "alice"}};
+  w.joins[kJoin]["2"] = {{"pub", "0"}, {"creator", "alice"}};
+  /* 3 has no joined row. */
+  MRow r1;
+  r1.entity = "m1";
+  r1.cols = {{"rel", "owner"}, {"c0", "alice"}};
+  MRow r2;
+  r2.entity = "m2";
+  r2.cols = {{"rel", "owner"}, {"c0", "2"}};
+  w.inner = {r1, r2};
+  Commit(store, w);
+  /* The inner row's c0 equals the creator in the outer row's joined row. */
+  QOp creator = ColumnOp("creator", false);
+  creator.outer = true;
+  creator.join = kJoin;
+  QNode exists;
+  exists.op = GDEFSTOR_QUERY_EXISTS;
+  exists.exists_type = kInner;
+  exists.kids.push_back(Cmp(GDEFSTOR_QUERY_EQ, ColumnOp("c0", false), creator));
+  QDesc d;
+  d.has_where = true;
+  d.where = exists;
+  CheckQuery(store, w, d, "outer joined");
+  Arena a;
+  uint64_t n = 0;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_count(store, kTenant, strlen(kTenant),
+                             kType2, strlen(kType2), ToNode(a, exists), &n));
+  EXPECT_EQ(2u, n);
+  /* And the outer row's entity. */
+  QOp entity;
+  entity.kind = GDEFSTOR_QUERY_ENTITY;
+  entity.outer = true;
+  QNode by_entity;
+  by_entity.op = GDEFSTOR_QUERY_EXISTS;
+  by_entity.exists_type = kInner;
+  by_entity.kids.push_back(Cmp(GDEFSTOR_QUERY_EQ, ColumnOp("c0", false), entity));
+  QDesc e;
+  e.has_where = true;
+  e.where = by_entity;
+  CheckQuery(store, w, e, "outer entity");
+  Arena b;
+  GDEFSTOR_Query qe = ToQuery(b, e);
+  GDEFSTOR_QueryResult * re = NULL;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_query(store, kTenant, strlen(kTenant),
+                             kType2, strlen(kType2), &qe, &re));
+  /* Only the outer row whose entity argument an inner row names. */
+  EXPECT_EQ("2,", RowsOf(re));
+  gdefstor_query_result_free(re);
+}
+
+TEST_F(Query, ExistsOverNothingNeverHolds) {
+  World w = Simple({{{"g", "a"}}, {{"g", "b"}}});
+  Commit(store, w);
+  QNode inner = Cmp(GDEFSTOR_QUERY_EQ, ColumnOp("c0", false), ConstOp({"a"}));
+  QNode exists;
+  exists.op = GDEFSTOR_QUERY_EXISTS;
+  exists.exists_type = "qt.nothing";
+  exists.kids.push_back(inner);
+  QDesc d;
+  d.has_where = true;
+  d.where = exists;
+  CheckQuery(store, w, d, "empty type");
+  uint64_t n = 7;
+  Arena a;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_count(store, kTenant, strlen(kTenant),
+                             kType2, strlen(kType2), ToNode(a, exists), &n));
+  EXPECT_EQ(0u, n);
+  QNode neg;
+  neg.op = GDEFSTOR_QUERY_NOT;
+  neg.kids.push_back(exists);
+  Arena b;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_count(store, kTenant, strlen(kTenant),
+                             kType2, strlen(kType2), ToNode(b, neg), &n));
+  EXPECT_EQ(2u, n);
+}
+
+TEST_F(Query, ExistsHasItsRules) {
+  World w = Simple({{{"g", "a"}}});
+  Commit(store, w);
+  auto count = [&](const QNode & node) {
+    Arena a;
+    uint64_t n = 0;
+    return gdefstor_projection_count(store, kTenant, strlen(kTenant), kType2,
+        strlen(kType2), ToNode(a, node), &n);
+  };
+  QNode leaf = Cmp(GDEFSTOR_QUERY_EQ, ColumnOp("c0", false), ConstOp({"a"}));
+  QNode ok;
+  ok.op = GDEFSTOR_QUERY_EXISTS;
+  ok.exists_type = kInner;
+  ok.kids.push_back(leaf);
+  EXPECT_EQ(GDEFSTOR_OK, count(ok));
+  /* Not inside another EXISTS. */
+  QNode nested;
+  nested.op = GDEFSTOR_QUERY_EXISTS;
+  nested.exists_type = kInner;
+  nested.kids.push_back(ok);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, count(nested));
+  /* Exactly one child, and a type to look at. */
+  QNode two = ok;
+  two.kids.push_back(leaf);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, count(two));
+  QNode none = ok;
+  none.kids.clear();
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, count(none));
+  QNode untyped = ok;
+  untyped.exists_type.clear();
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, count(untyped));
+  /* An outer operand only inside an EXISTS, and never a constant. */
+  QOp outer = ColumnOp("g", false);
+  outer.outer = true;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID,
+      count(Cmp(GDEFSTOR_QUERY_EQ, outer, ConstOp({"a"}))));
+  QNode bad_outer = ok;
+  QOp const_outer = ConstOp({"a"});
+  const_outer.outer = true;
+  bad_outer.kids[0] = Cmp(GDEFSTOR_QUERY_EQ, ColumnOp("c0", false), const_outer);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, count(bad_outer));
+  /* Nor as a sort key or a returned column. */
+  QDesc d;
+  QSort s;
+  s.key = outer;
+  d.sorts.push_back(s);
+  Arena a;
+  GDEFSTOR_Query q = ToQuery(a, d);
+  GDEFSTOR_QueryResult * r = NULL;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_projection_query(store, kTenant,
+                                      strlen(kTenant), kType2, strlen(kType2), &q, &r));
+  /* An unknown flag is refused. */
+  QOp odd = ColumnOp("g", false);
+  odd.flags = 64;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID,
+      count(Cmp(GDEFSTOR_QUERY_EQ, odd, ConstOp({"a"}))));
 }
 
 } /* namespace qt */
