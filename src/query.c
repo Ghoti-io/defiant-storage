@@ -1611,11 +1611,16 @@ static GDEFSTOR_Result run(GDEFSTOR_Store * store, const char * tenant,
                : (q->limit > GDEFSTOR_QUERY_LIMIT_MAX
                          ? GDEFSTOR_QUERY_LIMIT_MAX
                          : q->limit);
+  memset(rows, 0, sizeof *rows);
+  rc = GDEFSTOR_ERR_UNSUPPORTED;
   if (store->backend.query != NULL) {
-    memset(rows, 0, sizeof *rows);
     rc = store->backend.query(store->backend.ctx, tenant, tenant_len, &plan,
         rows);
-  } else {
+  }
+  /* A backend with no engine, or one that cannot carry this query (more
+   * values than its statement can bind), is answered by the scan. */
+  if (rc == GDEFSTOR_ERR_UNSUPPORTED) {
+    memset(rows, 0, sizeof *rows);
     rc = scan_rows(store, tenant, tenant_len, &plan, rows);
   }
   gcu_allocator_free(store->alloc, prefix);

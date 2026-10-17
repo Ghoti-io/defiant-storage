@@ -249,8 +249,11 @@ static GDEFSTOR_Result scratch_list(void * ctx, const char * tenant,
   return GDEFSTOR_OK;
 }
 
-GDEFSTOR_Result ConformanceOpen(GDEFSTOR_Store ** out,
-    const GDEFSTOR_Allocator * allocator) {
+typedef GDEFSTOR_Result (*ScratchQuery)(void * ctx, const char * tenant,
+    size_t tenant_len, const GDEFSTOR_QueryPlan * plan, GDEFSTOR_QueryRows * out);
+
+static GDEFSTOR_Result scratch_open(GDEFSTOR_Store ** out,
+    const GDEFSTOR_Allocator * allocator, ScratchQuery query) {
   const GDEFSTOR_Allocator * use =
       allocator != NULL ? allocator : gcu_allocator_default();
   Scratch * scratch;
@@ -271,11 +274,17 @@ GDEFSTOR_Result ConformanceOpen(GDEFSTOR_Store ** out,
   backend.get = scratch_get;
   backend.remove = scratch_remove;
   backend.list = scratch_list;
+  backend.query = query;
   rc = gdefstor_store_create(&backend, use, NULL, out);
   if (rc != GDEFSTOR_OK) {
     scratch_destroy(scratch);
   }
   return rc;
+}
+
+GDEFSTOR_Result ConformanceOpen(GDEFSTOR_Store ** out,
+    const GDEFSTOR_Allocator * allocator) {
+  return scratch_open(out, allocator, NULL);
 }
 
 void ConformanceClose(GDEFSTOR_Store * store) {
@@ -285,6 +294,131 @@ void ConformanceClose(GDEFSTOR_Store * store) {
 } /* extern "C" */
 
 #include "suite.inc"
+
+/* ---- a backend that answers queries itself, as the port sees one ---------- */
+
+static int g_engine_calls = 0;
+static GDEFSTOR_QueryPlan g_plan;
+static std::string g_plan_prefix;
+static GDEFSTOR_Result g_engine_answer = GDEFSTOR_ERR_UNSUPPORTED;
+
+static GDEFSTOR_Result engine_query(void * ctx, const char * tenant,
+    size_t tenant_len, const GDEFSTOR_QueryPlan * plan, GDEFSTOR_QueryRows * out) {
+  Scratch * s = (Scratch *)ctx;
+  (void)tenant;
+  (void)tenant_len;
+  g_engine_calls += 1;
+  g_plan = *plan;
+  g_plan_prefix.assign(plan->prefix, plan->prefix_len);
+  if (g_engine_answer != GDEFSTOR_OK) {
+    return g_engine_answer;
+  }
+  /* Two rows, in an order of the engine's own, and a total of nine. */
+  out->total = 9;
+  out->count = 2;
+  out->entities = (char **)gcu_allocator_calloc(s->alloc, 2, sizeof *out->entities);
+  out->entity_lens = (size_t *)gcu_allocator_calloc(s->alloc, 2, sizeof *out->entity_lens);
+  out->rows = (uint8_t **)gcu_allocator_calloc(s->alloc, 2, sizeof *out->rows);
+  out->row_lens = (size_t *)gcu_allocator_calloc(s->alloc, 2, sizeof *out->row_lens);
+  const char * names[2] = {"7", "3"};
+  for (int i = 0; i < 2; i++) {
+    /* count 1, column "n" with value names[i] */
+    uint8_t row[16] = {1, 0, 0, 0, 1, 0, 0, 0, 'n', 1, 0, 0, 0, (uint8_t)names[i][0]};
+    out->entities[i] = scratch_dup(s->alloc, names[i], 1);
+    out->entity_lens[i] = 1;
+    out->rows[i] = (uint8_t *)gcu_allocator_malloc(s->alloc, 14);
+    memcpy(out->rows[i], row, 14);
+    out->row_lens[i] = 14;
+  }
+  return GDEFSTOR_OK;
+}
+
+TEST(QueryEngine, TheBackendIsHandedTheCheckedPlan) {
+  GDEFSTOR_Store * store = NULL;
+  ASSERT_EQ(GDEFSTOR_OK, scratch_open(&store, NULL, engine_query));
+  g_engine_calls = 0;
+  g_engine_answer = GDEFSTOR_OK;
+  GDEFSTOR_QueryOperand sel;
+  memset(&sel, 0, sizeof sel);
+  sel.kind = GDEFSTOR_QUERY_COLUMN;
+  sel.column = "n";
+  sel.column_len = 1;
+  GDEFSTOR_Query q;
+  memset(&q, 0, sizeof q);
+  q.size = sizeof q;
+  q.limit = 100000;
+  q.select = &sel;
+  q.select_count = 1;
+  GDEFSTOR_QueryResult * r = NULL;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_query(store, "t", 1, "a.b", 3, &q, &r));
+  EXPECT_EQ(1, g_engine_calls);
+  /* The prefix is the type's hex and the colon; the limit was clamped. */
+  EXPECT_EQ("p:612e62:", g_plan_prefix);
+  EXPECT_EQ((uint64_t)GDEFSTOR_QUERY_LIMIT_MAX, g_plan.limit);
+  EXPECT_EQ(0, g_plan.count_only);
+  /* What it wrote is what the result holds, with the select read from the row
+   * it handed back. */
+  ASSERT_EQ(2u, gdefstor_query_result_rows(r));
+  EXPECT_EQ(9u, gdefstor_query_result_total(r));
+  const char * e = NULL;
+  size_t en = 0;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_query_result_entity(r, 1, &e, &en));
+  EXPECT_EQ("3", std::string(e, en));
+  int present = 0;
+  const uint8_t * b = NULL;
+  size_t bn = 0;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_query_result_value(r, 1, 0, &present, &b, &bn));
+  EXPECT_TRUE(present);
+  EXPECT_EQ("3", std::string((const char *)b, bn));
+  gdefstor_query_result_free(r);
+  q.limit = 0;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_query(store, "t", 1, "a.b", 3, &q, &r));
+  EXPECT_EQ(UINT64_MAX, g_plan.limit);
+  gdefstor_query_result_free(r);
+  uint64_t n = 0;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_count(store, "t", 1, "a.b", 3, NULL, &n));
+  EXPECT_EQ(1, g_plan.count_only);
+  EXPECT_EQ(9u, n);
+  /* A query the port refuses never reaches the backend. */
+  g_engine_calls = 0;
+  q.sort_count = 1;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_projection_query(store, "t", 1, "a.b", 3, &q, &r));
+  EXPECT_EQ(0, g_engine_calls);
+  gdefstor_store_destroy(store);
+}
+
+TEST(QueryEngine, AnEngineThatCannotCarryAQueryIsScanned) {
+  GDEFSTOR_Store * store = NULL;
+  ASSERT_EQ(GDEFSTOR_OK, scratch_open(&store, NULL, engine_query));
+  GDEFSTOR_Write * write = NULL;
+  GDEFSTOR_Column col;
+  memset(&col, 0, sizeof col);
+  col.name = "n";
+  col.name_len = 1;
+  col.value = (const uint8_t *)"v";
+  col.value_len = 1;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, "t", 1, NULL, &write));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_put(write, "a.b", 3, "1", 1, &col, 1));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_put(write, "a.b", 3, "2", 1, &col, 1));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(write));
+  g_engine_calls = 0;
+  g_engine_answer = GDEFSTOR_ERR_UNSUPPORTED;
+  GDEFSTOR_Query q;
+  memset(&q, 0, sizeof q);
+  q.size = sizeof q;
+  GDEFSTOR_QueryResult * r = NULL;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_query(store, "t", 1, "a.b", 3, &q, &r));
+  EXPECT_EQ(1, g_engine_calls);
+  EXPECT_EQ(2u, gdefstor_query_result_rows(r));
+  EXPECT_EQ(2u, gdefstor_query_result_total(r));
+  gdefstor_query_result_free(r);
+  r = NULL;
+  /* Any other failure of the engine is the answer, not a reason to scan. */
+  g_engine_answer = GDEFSTOR_ERR_IO;
+  EXPECT_EQ(GDEFSTOR_ERR_IO, gdefstor_projection_query(store, "t", 1, "a.b", 3, &q, &r));
+  EXPECT_TRUE(r == NULL);
+  gdefstor_store_destroy(store);
+}
 
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);

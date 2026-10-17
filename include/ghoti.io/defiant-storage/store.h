@@ -93,7 +93,9 @@ typedef struct GDEFSTOR_Backend {
    * scans the rows through `list` and `get`, which gives the reference answer.
    * A backend that sets it must give the same answers, in the same order, as
    * that scan. It writes the page and the total into @p out, its arrays and
-   * elements allocated with the allocator the store was created with.
+   * elements allocated with the allocator the store was created with. It may
+   * answer ::GDEFSTOR_ERR_UNSUPPORTED for a query it cannot carry, writing
+   * nothing; the port then scans.
    */
   GDEFSTOR_Result (*query)(void * ctx, const char * tenant, size_t tenant_len,
       const struct GDEFSTOR_QueryPlan * plan, struct GDEFSTOR_QueryRows * out);

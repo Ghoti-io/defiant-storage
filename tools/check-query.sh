@@ -18,6 +18,7 @@ shift 2
 . tools/plant-lib.sh
 plant_setup "$MAKE" "$BUILD_DIR" "$@"
 plant_control testConformance 'Query.*'
+plant_control testConformance 'QueryEngine.*'
 
 # A clause of an AND ignored: the last one cannot make it false.
 plant and-drops-last-clause src/query.c testConformance \
@@ -109,5 +110,14 @@ plant prefix-without-colon src/query.c testConformance \
       out_prefix, out_len);' \
   '"p:", type, type_len, "", 0, 0,
       out_prefix, out_len);'
+
+# A backend's answer of "unsupported" taken as the answer, not as a reason to
+# scan.
+plant no-scan-fallback src/query.c testConformance \
+  'QueryEngine.AnEngineThatCannotCarryAQueryIsScanned' \
+  '  if (rc == GDEFSTOR_ERR_UNSUPPORTED) {
+    memset(rows, 0, sizeof *rows);' \
+  '  if (rc == GDEFSTOR_ERR_UNSUPPORTED && store->backend.query == NULL) {
+    memset(rows, 0, sizeof *rows);'
 
 plant_finish
