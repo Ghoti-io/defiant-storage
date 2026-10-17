@@ -30,7 +30,7 @@ ROOT="${1:?usage: check-seams.sh <root>}"
 
 owners_of() {
   case "$1" in
-    internal.h) printf '%s\n' 'blob.c outbox.c projection.c revision.c snapshot.c store.c util.c core.c' ;;
+    internal.h) printf '%s\n' 'blob.c outbox.c projection.c query.c revision.c snapshot.c store.c util.c core.c' ;;
     *) printf '\n' ;;
   esac
 }

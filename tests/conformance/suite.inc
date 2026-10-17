@@ -1262,3 +1262,5 @@ TEST(Allocator, FailsClean) {
     EXPECT_EQ(0, count.underflow) << "allocation " << i;
   }
 }
+
+#include "query.inc"

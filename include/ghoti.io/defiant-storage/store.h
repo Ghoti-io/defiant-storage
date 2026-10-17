@@ -47,6 +47,10 @@ typedef struct GDEFSTOR_Store GDEFSTOR_Store;
 /** An uncommitted write. Opaque. One tenant. */
 typedef struct GDEFSTOR_Write GDEFSTOR_Write;
 
+/* Defined in query.h; a backend that answers queries includes that header. */
+struct GDEFSTOR_QueryPlan;
+struct GDEFSTOR_QueryRows;
+
 /**
  * @brief What a backend stores: committed bytes under a tenant and a key.
  *
@@ -83,6 +87,16 @@ typedef struct GDEFSTOR_Backend {
   GDEFSTOR_Result (*commit)(void * ctx);
   /** Drop the transaction started by `begin`. The previous bytes remain. */
   GDEFSTOR_Result (*abort)(void * ctx);
+  /**
+   * Optional: answer a query over the committed rows of one projection type
+   * (query.h). NULL when the backend has no engine of its own; the port then
+   * scans the rows through `list` and `get`, which gives the reference answer.
+   * A backend that sets it must give the same answers, in the same order, as
+   * that scan. It writes the page and the total into @p out, its arrays and
+   * elements allocated with the allocator the store was created with.
+   */
+  GDEFSTOR_Result (*query)(void * ctx, const char * tenant, size_t tenant_len,
+      const struct GDEFSTOR_QueryPlan * plan, struct GDEFSTOR_QueryRows * out);
 } GDEFSTOR_Backend;
 
 /**
