@@ -181,6 +181,21 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_type_get(GDEFSTOR_Store * store,
 /** @brief Release a declaration. NULL is ignored. */
 GDEFSTOR_API void gdefstor_type_free(GDEFSTOR_Type * type);
 
+/**
+ * @brief The type's machine name, as it was declared.
+ *
+ * A backend that keeps each type in tables of its own needs it where it is
+ * handed only the parsed declaration (GDEFSTOR_ModelBackend::type_store, the
+ * types of a GDEFSTOR_ModelPlan).
+ *
+ * @param out_name Receives the name; borrowed until the type is freed. Not
+ *   NUL-terminated by contract.
+ * @param out_len Receives its length.
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID for a NULL argument.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_type_name(const GDEFSTOR_Type * type,
+    const char ** out_name, size_t * out_len);
+
 /** @return Fields at every depth, retired ones included, in declaration order. */
 GDEFSTOR_API size_t gdefstor_type_field_count(const GDEFSTOR_Type * type);
 

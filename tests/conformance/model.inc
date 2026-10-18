@@ -811,6 +811,20 @@ TEST_F(ModelDeclare, ChangingATypeIsRefused) {
   (void)before;
 }
 
+TEST_F(ModelDeclare, ATypeKnowsItsName) {
+  ASSERT_EQ(GDEFSTOR_OK, Declare("site.note", {F("title", GDEFSTOR_FIELD_TEXT)}));
+  GDEFSTOR_Type * type = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_type_get(store, kTenant, 2, "site.note", 9,
+      &type));
+  const char * name = nullptr;
+  size_t len = 0;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_type_name(type, &name, &len));
+  EXPECT_EQ(std::string("site.note"), std::string(name, len));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_type_name(type, nullptr, &len));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_type_name(nullptr, &name, &len));
+  gdefstor_type_free(type);
+}
+
 TEST_F(ModelDeclare, AnEqualSpecWritesNothing) {
   ASSERT_EQ(GDEFSTOR_OK, Declare(kPo, PurchaseOrder()));
   std::string before = Dump(GDEFSTOR_MODEL_TRUTH);

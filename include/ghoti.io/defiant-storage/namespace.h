@@ -217,6 +217,7 @@
 #define gdefstor_type_find GHOTIIO_DEFSTOR(gdefstor_type_find)
 #define gdefstor_type_free GHOTIIO_DEFSTOR(gdefstor_type_free)
 #define gdefstor_type_get GHOTIIO_DEFSTOR(gdefstor_type_get)
+#define gdefstor_type_name GHOTIIO_DEFSTOR(gdefstor_type_name)
 
 /// @endcond
 

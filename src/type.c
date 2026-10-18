@@ -993,6 +993,16 @@ GDEFSTOR_Result gdefstor_type_get(GDEFSTOR_Store * store, const char * tenant,
       type_len, out_type);
 }
 
+GDEFSTOR_Result gdefstor_type_name(const GDEFSTOR_Type * type,
+    const char ** out_name, size_t * out_len) {
+  if (type == NULL || out_name == NULL || out_len == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  *out_name = type->name;
+  *out_len = type->name_len;
+  return GDEFSTOR_OK;
+}
+
 size_t gdefstor_type_field_count(const GDEFSTOR_Type * type) {
   return type == NULL ? 0 : type->n;
 }
