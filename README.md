@@ -10,7 +10,8 @@ and multiple fields; entities with one linear revision history each, in which
 only changed items get new rows and `valid_to` is written once; reverts as new
 revisions; drafts outside history; current tables that rebuild from the truth;
 and the query form over fields. A backend implements `model_backend.h`; the
-port decides what every write means. See `documentation/model.md`.
+port decides what every write means. See `documentation/model.md`. The key
+store port (`keystore.h`) holds subject keys and the erasure ledger.
 
 The in-memory backend is a separate library, `defiant-storage-memory`. SQLite
 is not this library. The port does not hash plaintext and does not encrypt.
@@ -30,4 +31,4 @@ make test-valgrind test-asan fuzz FUZZ_TIME=30 PREFIX=/path/to/prefix
 `make test` also runs `check-symbols`, `check-aliasing`, `check-seams`, `check-defects`, `check-query` and `check-model`.
 
 Backends run the conformance suites installed beside the port:
-`suite.inc` (key/bytes) and `model.inc` (the entity port).
+`suite.inc` (key/bytes), `model.inc` (the entity port) and `keystore.inc`.

@@ -282,11 +282,23 @@ Every backend runs the conformance suite, installed beside the port:
 `model.inc` (named cases for every rule above, the purchase-order fixture,
 and a seeded random sweep of declarations, saves, drafts, reverts, reorders,
 conflicts, state changes and queries checked against a model written apart
-from the library). `make check-model` here plants a defect
+from the library) and `keystore.inc`. `make check-model` here plants a defect
 in each rule the port decides and requires the named test to fail; a
 backend's own repository plants the defects a backend can make (a `valid_to`
 written twice, a revert that reopens old rows, a current table that drifts
 from the truth).
+
+## The key store port
+
+`keystore.h` is a port of its own, never part of the data store: subject keys
+and the erasure ledger. A subject's key is made inside the key store and
+never leaves it; callers wrap and unwrap bytes under it. Erasure destroys the
+key and appends the ledger row in one step; afterwards every wrap and unwrap
+for the subject reports it erased and no new key can be made for it. A
+ledger row learned from elsewhere (a snapshot's copy, replayed on restore) is
+appended with the same effect. A key store that seals in process is given a
+cipher (`GDEFSTOR_KeyCipher`) by the caller, so this library holds no
+cryptography. Nothing is wired to the entity port yet.
 
 ## Not built here
 
@@ -294,8 +306,7 @@ from the truth).
   item. Translations with their own revision history, and language for
   nested groups, are to be designed.
 - **Large values by content hash.** Values are stored inline, up to 1 MiB.
-- **The blind index**, and the key store, which holds subject keys and the
-  erasure ledger apart from the data store.
+- **The blind index** and every use of the key store by the entity port.
 - **Blobs, the outbox and small records in the entity transaction.** Until
   then a write is one kind or the other.
 - **Select columns** in a query: a caller reads each entity's tree.

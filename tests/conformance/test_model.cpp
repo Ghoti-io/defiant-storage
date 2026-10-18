@@ -681,6 +681,129 @@ void ModelClose(GDEFSTOR_Store * store) {
 
 #include "model.inc"
 
+/* A scratch key store over the cipher it is given, apart from the memory
+ * library's, so the port runs keystore.inc on its own. */
+namespace {
+
+struct KSub {
+  std::string key;
+  bool erased = false;
+};
+
+struct KScratch {
+  const GDEFSTOR_Allocator * alloc = nullptr;
+  GDEFSTOR_KeyCipher cipher;
+  std::map<std::string, KSub> subjects; /* tenant NUL subject */
+  std::vector<std::pair<std::string, std::pair<std::string, int64_t>>> ledger;
+};
+
+std::string KName(const char * t, size_t tl, const char * s, size_t sl) {
+  return std::string(t, tl) + std::string(1, '\0') + std::string(s, sl);
+}
+
+extern "C" {
+static void ks_destroy(void * ctx) {
+  delete static_cast<KScratch *>(ctx);
+}
+static GDEFSTOR_Result ks_create(void * ctx, const char * t, size_t tl,
+    const char * s, size_t sl) {
+  KScratch * k = static_cast<KScratch *>(ctx);
+  std::string name = KName(t, tl, s, sl);
+  if (k->subjects.count(name) != 0) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  std::string key(k->cipher.key_bytes, '\0');
+  GDEFSTOR_Result rc = k->cipher.random(k->cipher.ctx,
+      reinterpret_cast<uint8_t *>(&key[0]), key.size());
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  k->subjects[name].key = key;
+  return GDEFSTOR_OK;
+}
+static GDEFSTOR_Result ks_seal(void * ctx, int seal, const char * t, size_t tl,
+    const char * s, size_t sl, const uint8_t * in, size_t n, int * erased,
+    uint8_t ** out, size_t * out_len) {
+  KScratch * k = static_cast<KScratch *>(ctx);
+  auto it = k->subjects.find(KName(t, tl, s, sl));
+  *erased = 0;
+  if (it == k->subjects.end()) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (it->second.erased) {
+    *erased = 1;
+    return GDEFSTOR_OK;
+  }
+  const uint8_t * key = reinterpret_cast<const uint8_t *>(it->second.key.data());
+  return (seal ? k->cipher.seal : k->cipher.open)(k->cipher.ctx, k->alloc, key,
+      in, n, out, out_len);
+}
+static GDEFSTOR_Result ks_wrap(void * ctx, const char * t, size_t tl,
+    const char * s, size_t sl, const uint8_t * in, size_t n, int * erased,
+    uint8_t ** out, size_t * out_len) {
+  return ks_seal(ctx, 1, t, tl, s, sl, in, n, erased, out, out_len);
+}
+static GDEFSTOR_Result ks_unwrap(void * ctx, const char * t, size_t tl,
+    const char * s, size_t sl, const uint8_t * in, size_t n, int * erased,
+    uint8_t ** out, size_t * out_len) {
+  return ks_seal(ctx, 0, t, tl, s, sl, in, n, erased, out, out_len);
+}
+static GDEFSTOR_Result ks_erase(void * ctx, const char * t, size_t tl,
+    const char * s, size_t sl, int64_t when) {
+  KScratch * k = static_cast<KScratch *>(ctx);
+  KSub & sub = k->subjects[KName(t, tl, s, sl)];
+  if (sub.erased) {
+    return GDEFSTOR_OK;
+  }
+  sub.key.assign(sub.key.size(), '\0');
+  sub.key.clear();
+  sub.erased = true;
+  k->ledger.push_back(std::make_pair(std::string(t, tl),
+      std::make_pair(std::string(s, sl), when)));
+  return GDEFSTOR_OK;
+}
+static GDEFSTOR_Result ks_ledger(void * ctx, const char * t, size_t tl,
+    GDEFSTOR_Result (*visit)(void *, const char *, size_t, int64_t),
+    void * vctx) {
+  KScratch * k = static_cast<KScratch *>(ctx);
+  for (const auto & row : k->ledger) {
+    if (row.first == std::string(t, tl)) {
+      GDEFSTOR_Result rc = visit(vctx, row.second.first.data(),
+          row.second.first.size(), row.second.second);
+      if (rc != GDEFSTOR_OK) {
+        return rc;
+      }
+    }
+  }
+  return GDEFSTOR_OK;
+}
+}
+
+} /* namespace */
+
+GDEFSTOR_Result KeyStoreOpen(const GDEFSTOR_KeyCipher * cipher,
+    GDEFSTOR_KeyStore ** out) {
+  KScratch * k = new KScratch();
+  k->alloc = gdefstor_allocator_default();
+  k->cipher = *cipher;
+  GDEFSTOR_KeyStoreBackend b;
+  std::memset(&b, 0, sizeof b);
+  b.size = sizeof b;
+  b.ctx = k;
+  b.destroy = ks_destroy;
+  b.create = ks_create;
+  b.wrap = ks_wrap;
+  b.unwrap = ks_unwrap;
+  b.erase = ks_erase;
+  b.ledger = ks_ledger;
+  GDEFSTOR_Result rc = gdefstor_keystore_create(&b, nullptr, out);
+  if (rc != GDEFSTOR_OK) {
+    delete k;
+  }
+  return rc;
+}
+
+#include "keystore.inc"
 
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
