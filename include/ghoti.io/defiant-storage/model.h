@@ -238,6 +238,39 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_type_field(const GDEFSTOR_Type * type,
 GDEFSTOR_API GDEFSTOR_Result gdefstor_type_find(const GDEFSTOR_Type * type,
     const char * path, size_t path_len, size_t * out_index);
 
+/** What gdefstor_type_index_state() says of a field's index (AD-15). */
+typedef enum GDEFSTOR_IndexState {
+  /** The field is not declared ::GDEFSTOR_FIELD_INDEXED (or is a group). */
+  GDEFSTOR_INDEX_NONE = 0,
+  /** Declared indexed, and its index is not built yet: the field reads as
+   * "indexing". Queries on it answer exactly as they will once it is built;
+   * only their cost differs. */
+  GDEFSTOR_INDEX_INDEXING,
+  /** Declared indexed, and its index is built and serves queries. */
+  GDEFSTOR_INDEX_READY
+} GDEFSTOR_IndexState;
+
+/**
+ * @brief Whether the index of the field at a dotted path is built, as of the
+ * last commit.
+ *
+ * Declaring a field ::GDEFSTOR_FIELD_INDEXED commits at once; the index itself
+ * is built after that commit, outside the declaring write's transaction
+ * (AD-15: a build never holds a lock on a large table inside a step), and a
+ * backend may still be building it, or may have to build it again after a
+ * failed attempt. Until it is built the field reads
+ * ::GDEFSTOR_INDEX_INDEXING. A backend with no separate index (the memory
+ * backend) reads every indexed field ::GDEFSTOR_INDEX_READY.
+ *
+ * @param out_state Receives a ::GDEFSTOR_IndexState. Written only on success.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (a type never declared, a path
+ *   it does not have, a NULL argument), ::GDEFSTOR_ERR_UNSUPPORTED (a store
+ *   without the entity port), or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_type_index_state(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * type, size_t type_len,
+    const char * path, size_t path_len, int * out_state);
+
 /* ---- field trees ---------------------------------------------------------- */
 
 /**

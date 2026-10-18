@@ -53,7 +53,9 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
   GDEFSTOR_Store * store = NULL;
   GDEFSTOR_Result rc;
   if (model == NULL || out_store == NULL ||
-      model->size != sizeof(GDEFSTOR_ModelBackend) || model->destroy == NULL ||
+      (model->size != sizeof(GDEFSTOR_ModelBackend) &&
+          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V1) ||
+      model->destroy == NULL ||
       model->begin == NULL || model->commit == NULL || model->abort == NULL ||
       model->type_load == NULL || model->type_store == NULL ||
       model->entity_find == NULL || model->entity_insert == NULL ||
@@ -68,7 +70,11 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
-  store->model = *model;
+  /* A backend of the first version's size has no optional members: they
+   * read as NULL, never as bytes past what it filled. */
+  memset(&store->model, 0, sizeof store->model);
+  memcpy(&store->model, model, model->size);
+  store->model.size = sizeof store->model;
   store->has_model = 1;
   *out_store = store;
   return GDEFSTOR_OK;

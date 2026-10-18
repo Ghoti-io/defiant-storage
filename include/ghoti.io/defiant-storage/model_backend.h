@@ -196,7 +196,8 @@ typedef GDEFSTOR_Result (*GDEFSTOR_ModelScanFn)(void * ctx, const char * type,
 
 /**
  * The entity backend. A backend zeroes it, sets @ref size to
- * `sizeof(GDEFSTOR_ModelBackend)` and fills every member; all are required.
+ * `sizeof(GDEFSTOR_ModelBackend)` and fills every member; all are required,
+ * except those below @ref dump, which say they are optional.
  */
 typedef struct GDEFSTOR_ModelBackend {
   size_t size; ///< `sizeof(GDEFSTOR_ModelBackend)`.
@@ -260,7 +261,33 @@ typedef struct GDEFSTOR_ModelBackend {
    * GDEFSTOR_MODEL_CURRENT, every `entity` and current `item`. */
   GDEFSTOR_Result (*dump)(void * ctx, const char * tenant, size_t tenant_len,
       int which, const GDEFSTOR_ModelVisitor * visitor);
+  /* ---- added after the first version: optional ---------------------------
+   * A backend built against the struct that ends at @ref dump sets @ref size
+   * to that size (GDEFSTOR_MODEL_BACKEND_SIZE_V1), and the port treats every
+   * member below as NULL. */
+  /** The context @ref index_state is called with. A member of its own, not
+   * @ref ctx, so that a wrapper that copies this struct and replaces @ref ctx
+   * to intercept the other members still reaches the backend that owns the
+   * index. */
+  void * index_ctx;
+  /**
+   * The state of the index of field @p field (an index for
+   * gdefstor_type_field()) of @p type, as of the last commit: a
+   * ::GDEFSTOR_IndexState other than NONE (the port answers NONE itself for a
+   * field that is not indexed). May be NULL: every indexed field then reads
+   * ::GDEFSTOR_INDEX_READY. A backend that builds an index after the
+   * declaring write commits (AD-15) answers ::GDEFSTOR_INDEX_INDEXING until
+   * the build is done.
+   */
+  GDEFSTOR_Result (*index_state)(void * index_ctx, const char * tenant,
+      size_t tenant_len, const GDEFSTOR_Type * type, size_t field,
+      int * out_state);
 } GDEFSTOR_ModelBackend;
+
+/** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::index_ctx
+ * was added; gdefstor_store_create_model() accepts it. */
+#define GDEFSTOR_MODEL_BACKEND_SIZE_V1 \
+  offsetof(GDEFSTOR_ModelBackend, index_ctx)
 
 /**
  * @brief The reference query engine: answer @p plan over the entities

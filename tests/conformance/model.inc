@@ -825,6 +825,48 @@ TEST_F(ModelDeclare, ATypeKnowsItsName) {
   gdefstor_type_free(type);
 }
 
+/* AD-15: an index is built after the declaring write commits, and the field
+ * reads "indexing" until it is. With nothing in the way, the build is done by
+ * the time the declaring write's commit returns. */
+TEST_F(ModelDeclare, AnIndexedFieldReadsReadyOnceItsDeclarationCommits) {
+  const unsigned IX = GDEFSTOR_FIELD_INDEXED;
+  auto state = [&](const char * type, const char * path, int * out) {
+    return gdefstor_type_index_state(store, kTenant, 2, type, std::strlen(type),
+        path, std::strlen(path), out);
+  };
+  ASSERT_EQ(GDEFSTOR_OK, Declare("site.note",
+      {F("title", GDEFSTOR_FIELD_TEXT, IX), F("body", GDEFSTOR_FIELD_TEXT),
+          G("lines", GDEFSTOR_FIELD_MULTIPLE,
+              {F("sku", GDEFSTOR_FIELD_TEXT, IX),
+                  F("qty", GDEFSTOR_FIELD_INTEGER)}),
+          F("tags", GDEFSTOR_FIELD_TEXT, GDEFSTOR_FIELD_MULTIPLE | IX)}));
+  int s = -1;
+  ASSERT_EQ(GDEFSTOR_OK, state("site.note", "title", &s));
+  EXPECT_EQ(GDEFSTOR_INDEX_READY, s);
+  ASSERT_EQ(GDEFSTOR_OK, state("site.note", "lines.sku", &s));
+  EXPECT_EQ(GDEFSTOR_INDEX_READY, s);
+  ASSERT_EQ(GDEFSTOR_OK, state("site.note", "tags", &s));
+  EXPECT_EQ(GDEFSTOR_INDEX_READY, s);
+  ASSERT_EQ(GDEFSTOR_OK, state("site.note", "body", &s));
+  EXPECT_EQ(GDEFSTOR_INDEX_NONE, s);
+  ASSERT_EQ(GDEFSTOR_OK, state("site.note", "lines", &s));
+  EXPECT_EQ(GDEFSTOR_INDEX_NONE, s);
+  /* INDEXED may change: a field that becomes indexed is built in turn. */
+  ASSERT_EQ(GDEFSTOR_OK, Declare("site.note",
+      {F("title", GDEFSTOR_FIELD_TEXT, IX), F("body", GDEFSTOR_FIELD_TEXT, IX),
+          G("lines", GDEFSTOR_FIELD_MULTIPLE,
+              {F("sku", GDEFSTOR_FIELD_TEXT, IX),
+                  F("qty", GDEFSTOR_FIELD_INTEGER)}),
+          F("tags", GDEFSTOR_FIELD_TEXT, GDEFSTOR_FIELD_MULTIPLE | IX)}));
+  ASSERT_EQ(GDEFSTOR_OK, state("site.note", "body", &s));
+  EXPECT_EQ(GDEFSTOR_INDEX_READY, s);
+  s = -1;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, state("site.note", "nope", &s));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, state("site.other", "title", &s));
+  EXPECT_EQ(-1, s);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, state("site.note", "title", nullptr));
+}
+
 TEST_F(ModelDeclare, AnEqualSpecWritesNothing) {
   ASSERT_EQ(GDEFSTOR_OK, Declare(kPo, PurchaseOrder()));
   std::string before = Dump(GDEFSTOR_MODEL_TRUTH);

@@ -53,7 +53,11 @@ Money is a decimal, never a float.
   holds one value.
 - `REQUIRED`: a save must supply it; for a group or a multiple, at least one
   item. Checked on every save against the declaration as it is then.
-- `INDEXED`: a hint for the backend. It never changes an answer.
+- `INDEXED`: a hint for the backend. It never changes an answer. A backend
+  may build the index after the declaring write commits, outside its
+  transaction (AD-15); until it is built, `gdefstor_type_index_state()` reads
+  the field `GDEFSTOR_INDEX_INDEXING`, then `GDEFSTOR_INDEX_READY`, and
+  queries on it answer the same throughout.
 - `PERSONAL` (AD-19): the value is ciphertext the caller made, stored with
   the subject's public id. The port never sees a key or a plaintext and
   compares the stored bytes, so a caller that re-encrypts an unchanged
@@ -276,7 +280,12 @@ in that header: truth is append-only and `valid_to` is set once; current
 tables are derived and rebuild to the same; a read with no transaction sees
 the last commit. `query` must answer exactly as `gdefstor_model_scan()`, the
 reference engine, which a backend with no engine of its own calls from its
-`query` (the memory backend does).
+`query` (the memory backend does). One member is optional and was added
+later: `index_state`, called with `index_ctx` (so that a wrapper replacing
+`ctx` still reaches the backend), says whether an indexed field's index is
+built; a backend that leaves it NULL reads every indexed field as ready, and
+one built against the first version of the struct sets `size` to
+`GDEFSTOR_MODEL_BACKEND_SIZE_V1`.
 
 Every backend runs the conformance suite, installed beside the port:
 `model.inc` (named cases for every rule above, the purchase-order fixture,

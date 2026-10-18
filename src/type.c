@@ -1047,3 +1047,39 @@ GDEFSTOR_Result gdefstor_type_find(const GDEFSTOR_Type * type,
   }
   return GDEFSTOR_ERR_INVALID;
 }
+
+GDEFSTOR_Result gdefstor_type_index_state(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * type, size_t type_len,
+    const char * path, size_t path_len, int * out_state) {
+  GDEFSTOR_Type * t = NULL;
+  size_t at = 0;
+  int state = GDEFSTOR_INDEX_NONE;
+  GDEFSTOR_Result rc;
+  if (out_state == NULL || path == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  rc = gdefstor_type_get(store, tenant, tenant_len, type, type_len, &t);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  rc = gdefstor_type_find(t, path, path_len, &at);
+  if (rc == GDEFSTOR_OK && t->f[at].type != GDEFSTOR_FIELD_GROUP &&
+      (t->f[at].flags & GDEFSTOR_FIELD_INDEXED) != 0) {
+    /* Indexed: the backend knows whether its index is built. One that keeps
+     * none apart from its data has nothing to build. */
+    state = GDEFSTOR_INDEX_READY;
+    if (store->model.index_state != NULL) {
+      rc = store->model.index_state(store->model.index_ctx, tenant,
+          tenant_len, t, at, &state);
+      if (rc == GDEFSTOR_OK && state != GDEFSTOR_INDEX_INDEXING &&
+          state != GDEFSTOR_INDEX_READY) {
+        rc = GDEFSTOR_ERR_INTERNAL;
+      }
+    }
+  }
+  gdefstor_type_free(t);
+  if (rc == GDEFSTOR_OK) {
+    *out_state = state;
+  }
+  return rc;
+}
