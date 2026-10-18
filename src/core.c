@@ -54,6 +54,8 @@ const char * gdefstor_result_string(GDEFSTOR_Result result) {
     return "Internal error";
   case GDEFSTOR_ERR_BUSY:
     return "Writer busy";
+  case GDEFSTOR_ERR_CONFLICT:
+    return "Revision conflict";
   case GDEFSTOR_RESULT_COUNT:
   default:
     return "Unknown error";

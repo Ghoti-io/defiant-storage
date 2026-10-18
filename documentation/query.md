@@ -64,3 +64,62 @@ rows under one key each, so a query reads every row of the type. An index
 would need the columns to be stored apart from the encoded row, which is a
 change to the physical layout of every backend (AD-14's column projection) and
 is not part of this form.
+
+## Over entities
+
+`gdefstor_entity_query()` and `gdefstor_entity_count()` ask the same tree, a
+sort and a page of the current entities of one declared type (the entity
+port, `documentation/model.md`). The operators and the limits are the ones
+above; the operands are typed:
+
+| Operand | Its values on an entity | Type |
+|---|---|---|
+| `FIELD` `lines.taxes.amount` | the field's value on every current item that has one | the field's |
+| `VALUES` | the listed constants, all of one type | theirs |
+| `META` `PUBLISHED`, `DELETED` | the newest state | boolean |
+| `META` `CREATOR` | who created it (none for the system) | reference |
+| `META` `CREATED` | when | date-time |
+| `META` `REVISION` | the newest revision, 0 for none | integer |
+| `ENTITY` | its public id | reference |
+
+What it supports:
+
+- `=`, `!=` and `in` on every type; `<`, `<=`, `>`, `>=` on integers,
+  decimals, floats, dates and date-times, compared as numbers and dates.
+  Text compares by bytes. Both sides have the same type; a decimal compares
+  with a decimal of the same scale (a constant is at the field's scale).
+- **Some item matches.** A path through groups and multiples has the values
+  of every item it reaches, so `lines.sku = "A-1"` holds when some line has
+  that sku, and `!=` holds when none has. Two comparisons are decided on
+  their own: `lines.sku = "A-1" and lines.qty = 5` does not say it is the
+  same line. An absent value adds nothing; an entity with no revision has no
+  field values but still has its facts.
+- `and`, `or`, `not`, `true`, `false`, as above.
+- `EXISTS` names another declared type and holds when some entity of it
+  satisfies the child, whose `OUTER` operands read the entity being decided:
+  `EXISTS site.customer (ENTITY = OUTER customer and vip = true)`. One level;
+  a relation is one of these.
+- A sort of up to four keys, each a single scalar field of the root group, a
+  `META` fact or the public id, ascending or descending. No value sorts
+  before every value. The final tiebreak is the entity's row, ascending even
+  under a descending sort, which is creation order.
+- An offset, a limit (clamped to 1000; 0 is every match) and the total,
+  which counts every match before the offset and the limit.
+
+What it refuses, with `GDEFSTOR_ERR_INVALID` unless a limit says otherwise:
+a type never declared; a path that is not an active scalar field (a group, a
+retired field, a field that does not exist); a personal field anywhere (its
+value is ciphertext; blind-index equality is not built); sides of different
+types; an ordered comparison on text, references or booleans; `in` without a
+constant list; `COLUMN` and `CONST` (the projection form's operands); flags
+other than `OUTER`; `OUTER` outside an `EXISTS`; an `EXISTS` inside another;
+a sort on a nested or multiple field, or with `numeric`; select columns;
+`entity_numeric`. The caps above are `GDEFSTOR_ERR_LIMIT`.
+
+A backend answers through `GDEFSTOR_ModelBackend::query`, handed the checked
+query and the declaration of every type it names, and must give the answer
+`gdefstor_model_scan()` gives: the same entities, in the same order, with
+the same total. Nothing in a query reaches a statement but as a bound value,
+and every path is a declared field, so a SQL backend can compile each to an
+indexed column of a current table (`EXISTS` to a semi-join on the reference
+column) without scanning.

@@ -1,0 +1,643 @@
+/*
+ * SPDX-License-Identifier: LGPL-3.0-only
+ *
+ * Copyright (C) 2026 Corey Pennycuff
+ *
+ * This file is part of Ghoti.io Defiant Storage.
+ *
+ * Ghoti.io Defiant Storage is free software: you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public License version
+ * 3 as published by the Free Software Foundation.
+ *
+ * Ghoti.io Defiant Storage is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/**
+ * @file model.h
+ * @brief The entity port: types, entities, revisions, field trees, drafts.
+ * @stability free
+ *
+ * This is the port the entity layer speaks (AD-13, AD-14): entities of
+ * declared types, each with one linear revision history of a typed, nested
+ * field tree. It sits beside the key/bytes API of store.h, projection.h and
+ * revision.h, which keeps working unchanged until the contract story. The
+ * model, its limits and the reasons for each rule are in
+ * documentation/model.md; what follows is the contract per call.
+ *
+ * A store has this port when it was opened with gdefstor_store_create_model()
+ * (the memory backend does). On any other store every call here is
+ * ::GDEFSTOR_ERR_UNSUPPORTED.
+ *
+ * Writes take a GDEFSTOR_Write: the tenant's writer queue and one backend
+ * transaction. A write holds either key/bytes rows or entity operations, not
+ * both, until records, blobs and the outbox move onto this transaction; a
+ * mix is ::GDEFSTOR_ERR_INVALID. A call that fails before it reached the
+ * backend leaves the write as it was; one that fails after (an I/O error, a
+ * full allocator) marks the write broken, and its commit aborts and returns
+ * that error. Reads take the store and the tenant and see the last commit.
+ *
+ * Identifiers: a public id, a creator, an actor and a subject are 1 to
+ * GDEFSTOR_Limits::max_public_id_bytes bytes of `[0-9A-Za-z_-]` (an actor or a
+ * creator may also be empty: the system). Nothing here generates a public id
+ * (AD-22 is the caller's).
+ */
+
+#ifndef GHOTI_IO_GDEFSTOR_MODEL_H
+#define GHOTI_IO_GDEFSTOR_MODEL_H
+
+#include <ghoti.io/defiant-storage/macros.h>
+#include <ghoti.io/defiant-storage/core.h>
+#include <ghoti.io/defiant-storage/store.h>
+#include <ghoti.io/defiant-storage/value.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ---- limits --------------------------------------------------------------- */
+
+/** Groups nested below the root group. */
+#define GDEFSTOR_MODEL_MAX_DEPTH 8
+/** Fields of one type at every depth, retired ones included. */
+#define GDEFSTOR_MODEL_MAX_FIELDS 512
+/** Fields directly inside one group, retired ones included. */
+#define GDEFSTOR_MODEL_MAX_GROUP_FIELDS 64
+/** Bytes of a field name: `[A-Za-z0-9_]`, unique among siblings ignoring ASCII case. */
+#define GDEFSTOR_MODEL_MAX_NAME_BYTES 64
+/** Items in one tree, the root item included. */
+#define GDEFSTOR_MODEL_MAX_ITEMS 65536
+/** Bytes of one text, reference or personal value. */
+#define GDEFSTOR_MODEL_MAX_VALUE_BYTES (1024u * 1024u)
+/** Bytes of every value of one tree together. */
+#define GDEFSTOR_MODEL_MAX_TREE_BYTES (16u * 1024u * 1024u)
+/** Bytes of the reason a revision records. */
+#define GDEFSTOR_MODEL_MAX_WHY_BYTES 4096
+/** Bytes of one draft. */
+#define GDEFSTOR_MODEL_MAX_DRAFT_BYTES (32u * 1024u * 1024u)
+/** Digits after the point of a decimal field, at most. */
+#define GDEFSTOR_MODEL_MAX_SCALE 18
+/** The largest magnitude of a decimal's unscaled integer: 10^18 - 1. */
+#define GDEFSTOR_MODEL_MAX_DECIMAL INT64_C(999999999999999999)
+/**
+ * Order keys of siblings closer than this are renumbered: every sibling gets
+ * the key 1, 2, 3 ... as a new item version, in the same revision.
+ */
+#define GDEFSTOR_MODEL_ORDER_EPSILON (1.0 / 1048576.0)
+
+/* ---- the store ------------------------------------------------------------ */
+
+struct GDEFSTOR_ModelBackend;
+
+/**
+ * @brief Open a store over a key/bytes backend and an entity backend.
+ *
+ * As gdefstor_store_create(), and the entity port of this header is served by
+ * @p model (model_backend.h). Both are copied; each `ctx` is borrowed until
+ * gdefstor_store_destroy(), which destroys both.
+ *
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (a required function missing,
+ *   or a @ref GDEFSTOR_ModelBackend::size that is not this header's), or
+ *   ::GDEFSTOR_ERR_OOM.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_store_create_model(
+    const GDEFSTOR_Backend * backend, const struct GDEFSTOR_ModelBackend * model,
+    const GDEFSTOR_Allocator * allocator, const GDEFSTOR_Limits * limits,
+    GDEFSTOR_Store ** out_store);
+
+/* ---- type declarations ---------------------------------------------------- */
+
+/**
+ * @brief One field of a declaration. The caller owns every pointer for the call.
+ *
+ * @ref size is `sizeof(GDEFSTOR_FieldSpec)`.
+ */
+typedef struct GDEFSTOR_FieldSpec {
+  size_t size;              ///< `sizeof(GDEFSTOR_FieldSpec)`.
+  const char * name;        ///< `[A-Za-z0-9_]{1,64}`.
+  size_t name_len;          ///< Length of @ref name.
+  int type;                 ///< A ::GDEFSTOR_FieldType.
+  int scale;                ///< DECIMAL: digits after the point, 0 to 18. Else 0.
+  unsigned flags;           ///< ::GDEFSTOR_FIELD_MULTIPLE and the others.
+  /** PERSONAL: the name of a sibling REFERENCE field (single, not personal)
+   * whose value is the subject, or NULL for the entity's own subject. */
+  const char * subject;
+  size_t subject_len;       ///< Length of @ref subject.
+  const struct GDEFSTOR_FieldSpec * children; ///< GROUP: its fields, at least one.
+  size_t child_count;       ///< How many.
+} GDEFSTOR_FieldSpec;
+
+/** A type declaration. @ref size is `sizeof(GDEFSTOR_TypeSpec)`. */
+typedef struct GDEFSTOR_TypeSpec {
+  size_t size;                      ///< `sizeof(GDEFSTOR_TypeSpec)`.
+  const char * name;                ///< A machine name, `<module>.<name>` (AD-35).
+  size_t name_len;                  ///< Length of @ref name.
+  const GDEFSTOR_FieldSpec * fields;///< The root group's fields.
+  size_t field_count;               ///< How many.
+} GDEFSTOR_TypeSpec;
+
+/**
+ * @brief Declare a type, or change its declaration additively.
+ *
+ * The spec is the whole desired field tree. Against what is stored: a field
+ * that is new is added; a stored field the spec leaves out is retired (its
+ * data stays readable, and stays in the current tree, but nothing can write
+ * it); a retired field the spec names again, unchanged, is restored. A field
+ * whose type, scale, ::GDEFSTOR_FIELD_MULTIPLE, ::GDEFSTOR_FIELD_PERSONAL or
+ * subject differ from what is stored is refused with
+ * ::GDEFSTOR_ERR_UNSUPPORTED: that is a new field and a conversion (AD-15).
+ * REQUIRED and INDEXED may change. A spec equal to what is stored writes
+ * nothing.
+ *
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (a name, a type or a shape
+ *   that is wrong), ::GDEFSTOR_ERR_LIMIT, ::GDEFSTOR_ERR_UNSUPPORTED, or a
+ *   backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_type_declare(GDEFSTOR_Write * write,
+    const GDEFSTOR_TypeSpec * spec);
+
+/** A stored declaration. Opaque. */
+typedef struct GDEFSTOR_Type GDEFSTOR_Type;
+
+/** The parent of a field of the root group. */
+#define GDEFSTOR_TYPE_ROOT SIZE_MAX
+
+/**
+ * @brief Read a type's declaration as of the last commit.
+ *
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID for a type never declared.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_type_get(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * type, size_t type_len,
+    GDEFSTOR_Type ** out_type);
+
+/** @brief Release a declaration. NULL is ignored. */
+GDEFSTOR_API void gdefstor_type_free(GDEFSTOR_Type * type);
+
+/** @return Fields at every depth, retired ones included, in declaration order. */
+GDEFSTOR_API size_t gdefstor_type_field_count(const GDEFSTOR_Type * type);
+
+/** One field of a stored declaration. Pointers are valid until the type is freed. */
+typedef struct GDEFSTOR_FieldInfo {
+  size_t size;              ///< Set by the caller: `sizeof(GDEFSTOR_FieldInfo)`.
+  const char * name;        ///< The field's name.
+  size_t name_len;          ///< Its length.
+  const char * path;        ///< Names from the root group, joined by `.`.
+  size_t path_len;          ///< Its length.
+  int type;                 ///< A ::GDEFSTOR_FieldType.
+  int scale;                ///< DECIMAL: digits after the point.
+  unsigned flags;           ///< As declared.
+  int retired;              ///< Non-zero when it or an enclosing group is retired.
+  const char * subject;     ///< PERSONAL: the subject field, or NULL.
+  size_t subject_len;       ///< Its length.
+  size_t parent;            ///< Index of the enclosing GROUP, or ::GDEFSTOR_TYPE_ROOT.
+  uint32_t id;              ///< Stable for the life of the field; never reused.
+  /** GROUP or MULTIPLE: the group its items live in (the root group is 0).
+   * Otherwise UINT32_MAX. Stable; never reused. */
+  uint32_t group;
+  /** A single scalar: its column in the enclosing group. A multiple scalar:
+   * 0, the one column of its own group. A GROUP: UINT32_MAX. Stable. */
+  uint32_t column;
+  uint32_t in_group;        ///< The group holding the field (its parent's, or 0).
+} GDEFSTOR_FieldInfo;
+
+/**
+ * @brief Describe field @p index.
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID for an index out of range
+ *   or an @p out whose size is not this header's.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_type_field(const GDEFSTOR_Type * type,
+    size_t index, GDEFSTOR_FieldInfo * out);
+
+/**
+ * @brief The index of the field at a dotted path, retired or not.
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID when there is none.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_type_find(const GDEFSTOR_Type * type,
+    const char * path, size_t path_len, size_t * out_index);
+
+/* ---- field trees ---------------------------------------------------------- */
+
+/**
+ * @brief An entity's field tree. Opaque.
+ *
+ * Item 0 is the root item, which holds the entity's own scalar fields. Every
+ * other item sits under one field of its parent: a GROUP field (its items hold
+ * that group's fields) or a MULTIPLE scalar field (each item holds one value).
+ * Items carry an id that is stable for the life of the item. A tree built for
+ * a save names an existing item by its id and a new one with id 0; it states
+ * order by the order items are added, never by key.
+ */
+typedef struct GDEFSTOR_Tree GDEFSTOR_Tree;
+
+/**
+ * @brief An empty tree: the root item, no values.
+ * @param allocator NULL uses the default. Every allocation of the tree uses it.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_tree_create(
+    const GDEFSTOR_Allocator * allocator, GDEFSTOR_Tree ** out_tree);
+
+/** @brief Release a tree. NULL is ignored. */
+GDEFSTOR_API void gdefstor_tree_free(GDEFSTOR_Tree * tree);
+
+/**
+ * @brief Append an item under @p field of item @p parent, after its siblings.
+ *
+ * @param id 0 for a new item, or the id of an item the entity has now.
+ * @param out_item Receives the new item's index. May be NULL.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID, ::GDEFSTOR_ERR_LIMIT, or
+ *   ::GDEFSTOR_ERR_OOM. Whether @p field exists is checked by the save.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_tree_add(GDEFSTOR_Tree * tree,
+    size_t parent, const char * field, size_t field_len, uint64_t id,
+    size_t * out_item);
+
+/**
+ * @brief Set scalar @p field of item @p item, replacing what was set.
+ *
+ * For an item of a MULTIPLE scalar field, @p field_len is 0: the item's own
+ * value. A @p value of type 0 unsets. The bytes are copied.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_tree_set(GDEFSTOR_Tree * tree,
+    size_t item, const char * field, size_t field_len,
+    const GDEFSTOR_Value * value);
+
+/** @return Items, the root included. */
+GDEFSTOR_API size_t gdefstor_tree_item_count(const GDEFSTOR_Tree * tree);
+
+/** One item. Pointers are valid until the tree is freed or changed. */
+typedef struct GDEFSTOR_TreeItem {
+  size_t size;           ///< Set by the caller: `sizeof(GDEFSTOR_TreeItem)`.
+  uint64_t id;           ///< Its id; 0 for a new item of a tree being built.
+  size_t parent;         ///< Its parent's index, ::GDEFSTOR_TYPE_ROOT for the root.
+  const char * field;    ///< The field of the parent it sits under ("" for the root).
+  size_t field_len;      ///< Its length.
+  double order;          ///< A read tree: its stored order key. A built tree: 0.
+  size_t value_count;    ///< Values set on it.
+} GDEFSTOR_TreeItem;
+
+/**
+ * @brief Describe item @p index.
+ *
+ * A tree read from storage lists a parent before its children and siblings in
+ * order.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_tree_item(const GDEFSTOR_Tree * tree,
+    size_t index, GDEFSTOR_TreeItem * out);
+
+/**
+ * @brief The @p k th value set on item @p item, and its field ("" for an
+ * item's own value). Borrowed until the tree is freed or changed.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_tree_value(const GDEFSTOR_Tree * tree,
+    size_t item, size_t k, const char ** out_field, size_t * out_field_len,
+    GDEFSTOR_Value * out_value);
+
+/**
+ * @brief The value of @p field on item @p item. Sets @p out_value's type to 0
+ * when there is none. Borrowed until the tree is freed or changed.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_tree_get(const GDEFSTOR_Tree * tree,
+    size_t item, const char * field, size_t field_len,
+    GDEFSTOR_Value * out_value);
+
+/**
+ * @brief Parse a tree from its JSON form (`defiant-tree/1`, model.md), which
+ * names fields and so needs the declaration to type the values.
+ *
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_FORMAT, ::GDEFSTOR_ERR_UNSUPPORTED (a
+ *   newer version), ::GDEFSTOR_ERR_CORRUPT, ::GDEFSTOR_ERR_INVALID (a field
+ *   the type does not have, or a value of the wrong shape),
+ *   ::GDEFSTOR_ERR_LIMIT or ::GDEFSTOR_ERR_OOM.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_tree_from_json(const GDEFSTOR_Type * type,
+    const uint8_t * json, size_t len, const GDEFSTOR_Allocator * allocator,
+    GDEFSTOR_Tree ** out_tree);
+
+/**
+ * @brief Write a tree in its JSON form. Free the bytes with
+ * gdefstor_bytes_free() and the tree's allocator.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_tree_to_json(const GDEFSTOR_Type * type,
+    const GDEFSTOR_Tree * tree, uint8_t ** out_json, size_t * out_len);
+
+/* ---- entities ------------------------------------------------------------- */
+
+/**
+ * @brief Create an entity: reserve its row and record who created it and when.
+ *
+ * It has no revision until the first save. The public id must be unused in
+ * the tenant, by an entity of any type and by a draft that reserved it.
+ *
+ * @param creator The creating principal's public id, or empty for the system.
+ * @param out_row Receives the internal row. May be NULL. Never leaves the server.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (an undeclared type, a public id
+ *   that is taken or malformed), or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_create(GDEFSTOR_Write * write,
+    const char * type, size_t type_len, const char * public_id,
+    size_t public_id_len, const char * creator, size_t creator_len,
+    int64_t created_ms, uint64_t * out_row);
+
+/** An entity record. Opaque. */
+typedef struct GDEFSTOR_Entity GDEFSTOR_Entity;
+
+/** What an entity record says. Pointers are valid until it is freed. */
+typedef struct GDEFSTOR_EntityInfo {
+  size_t size;              ///< Set by the caller: `sizeof(GDEFSTOR_EntityInfo)`.
+  uint64_t row;             ///< Internal row.
+  const char * type;        ///< Its type.
+  size_t type_len;          ///< Its length.
+  const char * public_id;   ///< Its public id.
+  size_t public_id_len;     ///< Its length.
+  const char * creator;     ///< Who created it; empty for the system.
+  size_t creator_len;       ///< Its length.
+  int64_t created_ms;       ///< When.
+  uint64_t revision;        ///< The newest revision, which is the current one; 0 for none.
+  int published;            ///< The newest state.
+  int deleted;              ///< The newest state (a soft delete).
+} GDEFSTOR_EntityInfo;
+
+/**
+ * @brief Read an entity record as of the last commit.
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID when there is none.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_get(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * public_id,
+    size_t public_id_len, GDEFSTOR_Entity ** out_entity);
+
+/** @brief Describe a record. */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_info(
+    const GDEFSTOR_Entity * entity, GDEFSTOR_EntityInfo * out);
+
+/** @brief Release a record. NULL is ignored. */
+GDEFSTOR_API void gdefstor_entity_free(GDEFSTOR_Entity * entity);
+
+/**
+ * @brief Append a state change (published, soft-deleted) with its actor and time.
+ *
+ * A state equal to the newest one appends nothing.
+ *
+ * @param out_changed Set to 1 when a row was appended, 0 when not. May be NULL.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_set_state(GDEFSTOR_Write * write,
+    const char * public_id, size_t public_id_len, int published, int deleted,
+    const char * actor, size_t actor_len, int64_t when_ms, int * out_changed);
+
+/** Who, when and why for a revision. */
+typedef struct GDEFSTOR_RevisionMeta {
+  size_t size;          ///< `sizeof(GDEFSTOR_RevisionMeta)`.
+  const char * who;     ///< The principal's public id; empty for the system.
+  size_t who_len;       ///< Its length.
+  int64_t when_ms;      ///< When, by the caller's clock.
+  const char * why;     ///< Free text, UTF-8, up to 4096 bytes. May be empty.
+  size_t why_len;       ///< Its length.
+} GDEFSTOR_RevisionMeta;
+
+/**
+ * @brief Write revision N+1 of an entity from its full new field tree.
+ *
+ * @p base_revision must be the entity's newest revision (0 before the first);
+ * when the head has moved this is ::GDEFSTOR_ERR_CONFLICT and nothing is
+ * written. The tree is validated against the type as declared now. Only the
+ * items that changed are written: each gets a new version, its old one closed;
+ * an item missing from the tree is closed; an unchanged item is not touched.
+ * Moving an item changes only its order key (the midpoint of its new
+ * neighbours), unless the gap is below ::GDEFSTOR_MODEL_ORDER_EPSILON, when
+ * all its siblings are renumbered in this same revision. Retired fields keep
+ * their stored data; a tree may restate it but not change it.
+ *
+ * @param out_revision Receives N+1, or 0 when the tree equals the current one
+ *   and nothing was written. May be NULL.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_CONFLICT, ::GDEFSTOR_ERR_INVALID,
+ *   ::GDEFSTOR_ERR_LIMIT, or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_save(GDEFSTOR_Write * write,
+    const char * public_id, size_t public_id_len, uint64_t base_revision,
+    const GDEFSTOR_RevisionMeta * meta, const GDEFSTOR_Tree * tree,
+    uint64_t * out_revision);
+
+/**
+ * @brief Write a revision whose tree is revision @p to_revision's.
+ *
+ * An ordinary save, built from the past tree: items keep their ids (an item
+ * removed since comes back under its old id) and their old order keys, old
+ * rows are never touched, and every revision in between still reads as it did.
+ * Retired fields keep their current data. Reverting to the current tree writes
+ * nothing.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_revert(GDEFSTOR_Write * write,
+    const char * public_id, size_t public_id_len, uint64_t base_revision,
+    uint64_t to_revision, const GDEFSTOR_RevisionMeta * meta,
+    uint64_t * out_revision);
+
+/**
+ * @brief Read an entity's tree: the current one, from the current tables,
+ * when @p revision is 0; otherwise the tree as of that revision, from history.
+ *
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID for no such entity or
+ *   revision (an entity with no revision has no tree).
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_tree(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * public_id,
+    size_t public_id_len, uint64_t revision, GDEFSTOR_Tree ** out_tree);
+
+/** An entity's revisions and states. Opaque. */
+typedef struct GDEFSTOR_History GDEFSTOR_History;
+
+/** One revision. Pointers are valid until the history is freed. */
+typedef struct GDEFSTOR_RevisionInfo {
+  size_t size;           ///< Set by the caller: `sizeof(GDEFSTOR_RevisionInfo)`.
+  uint64_t revision;     ///< Its number, 1, 2, 3 ...
+  uint64_t commit_seq;   ///< The tenant's commit sequence of the write that made it.
+  const char * who;      ///< Who.
+  size_t who_len;        ///< Its length.
+  int64_t when_ms;       ///< When.
+  const char * why;      ///< Why.
+  size_t why_len;        ///< Its length.
+} GDEFSTOR_RevisionInfo;
+
+/** One state change. Pointers are valid until the history is freed. */
+typedef struct GDEFSTOR_StateInfo {
+  size_t size;           ///< Set by the caller: `sizeof(GDEFSTOR_StateInfo)`.
+  int published;         ///< The state from here on.
+  int deleted;           ///< The state from here on.
+  const char * actor;    ///< Who changed it.
+  size_t actor_len;      ///< Its length.
+  int64_t when_ms;       ///< When.
+} GDEFSTOR_StateInfo;
+
+/** @brief Read an entity's revisions and state changes, oldest first. */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_history(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * public_id,
+    size_t public_id_len, GDEFSTOR_History ** out_history);
+
+/** @return Revisions in the history. */
+GDEFSTOR_API size_t gdefstor_history_revision_count(const GDEFSTOR_History * h);
+
+/** @brief Describe revision @p index (0 is the oldest). */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_history_revision(
+    const GDEFSTOR_History * h, size_t index, GDEFSTOR_RevisionInfo * out);
+
+/** @return State changes in the history. */
+GDEFSTOR_API size_t gdefstor_history_state_count(const GDEFSTOR_History * h);
+
+/** @brief Describe state change @p index (0 is the oldest). */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_history_state(const GDEFSTOR_History * h,
+    size_t index, GDEFSTOR_StateInfo * out);
+
+/** @brief Release a history. NULL is ignored. */
+GDEFSTOR_API void gdefstor_history_free(GDEFSTOR_History * h);
+
+/** The difference between two revisions. Opaque. */
+typedef struct GDEFSTOR_Diff GDEFSTOR_Diff;
+
+/** What happened to an item. */
+typedef enum GDEFSTOR_DiffKind {
+  GDEFSTOR_DIFF_ADDED = 1, ///< In the later tree only.
+  GDEFSTOR_DIFF_CHANGED,   ///< In both, different.
+  GDEFSTOR_DIFF_REMOVED    ///< In the earlier tree only.
+} GDEFSTOR_DiffKind;
+
+/** A changed item's values differ. */
+#define GDEFSTOR_DIFF_VALUES 0x1u
+/** A changed item has another parent. */
+#define GDEFSTOR_DIFF_PARENT 0x2u
+/** A changed item has another order key. */
+#define GDEFSTOR_DIFF_ORDER 0x4u
+
+/** One item of a difference. Pointers are valid until the diff is freed. */
+typedef struct GDEFSTOR_DiffItem {
+  size_t size;          ///< Set by the caller: `sizeof(GDEFSTOR_DiffItem)`.
+  int kind;             ///< A ::GDEFSTOR_DiffKind.
+  unsigned what;        ///< CHANGED: ::GDEFSTOR_DIFF_VALUES and the others.
+  uint64_t item;        ///< The item's id.
+  const char * field;   ///< The path of the field it sits under ("" for the root item).
+  size_t field_len;     ///< Its length.
+} GDEFSTOR_DiffItem;
+
+/**
+ * @brief The items added, changed and removed from revision @p from to @p to.
+ *
+ * Revision 0 is the empty tree before the first. Items are listed by id.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_diff(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * public_id,
+    size_t public_id_len, uint64_t from, uint64_t to, GDEFSTOR_Diff ** out_diff);
+
+/** @return Items in the difference. */
+GDEFSTOR_API size_t gdefstor_diff_count(const GDEFSTOR_Diff * diff);
+
+/** @brief Describe item @p index of the difference. */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_diff_item(const GDEFSTOR_Diff * diff,
+    size_t index, GDEFSTOR_DiffItem * out);
+
+/** @brief Release a difference. NULL is ignored. */
+GDEFSTOR_API void gdefstor_diff_free(GDEFSTOR_Diff * diff);
+
+/* ---- drafts --------------------------------------------------------------- */
+
+/**
+ * @brief Store the draft of an entity: a JSON tree (`defiant-tree/1`) and the
+ * revision it was made from. One per entity; a second put replaces it.
+ *
+ * For an entity that exists, @p type is NULL or its type and @p base_revision
+ * is at most its newest. For a public id with no entity, the draft reserves it
+ * (gdefstor_entity_create() then refuses it): @p type is required and
+ * declared, and @p base_revision is 0. The JSON is checked to be well formed
+ * now; it is validated against the type when applied. Nothing outside the
+ * draft is written.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_put(GDEFSTOR_Write * write,
+    const char * type, size_t type_len, const char * public_id,
+    size_t public_id_len, uint64_t base_revision, const uint8_t * json,
+    size_t json_len);
+
+/** A stored draft. Opaque. */
+typedef struct GDEFSTOR_Draft GDEFSTOR_Draft;
+
+/** What a draft holds. Pointers are valid until it is freed. */
+typedef struct GDEFSTOR_DraftInfo {
+  size_t size;            ///< Set by the caller: `sizeof(GDEFSTOR_DraftInfo)`.
+  const char * type;      ///< The entity's type.
+  size_t type_len;        ///< Its length.
+  uint64_t base_revision; ///< The revision it was made from; 0 for a new entity.
+  const uint8_t * json;   ///< The tree.
+  size_t json_len;        ///< Its length.
+} GDEFSTOR_DraftInfo;
+
+/**
+ * @brief Read the draft of a public id as of the last commit.
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID when there is none.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_get(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * public_id,
+    size_t public_id_len, GDEFSTOR_Draft ** out_draft);
+
+/** @brief Describe a draft. */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_info(const GDEFSTOR_Draft * draft,
+    GDEFSTOR_DraftInfo * out);
+
+/** @brief Release a draft. NULL is ignored. */
+GDEFSTOR_API void gdefstor_draft_free(GDEFSTOR_Draft * draft);
+
+/**
+ * @brief Delete a draft. Revisions, states and the entity are not touched.
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID when there is none.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_delete(GDEFSTOR_Write * write,
+    const char * public_id, size_t public_id_len);
+
+/**
+ * @brief Apply a draft: gdefstor_entity_save() with the draft's tree and base
+ * revision, then delete the draft.
+ *
+ * For a reserved id this first creates the entity, with @p meta's who and when
+ * as its creator and creation time. When the head has moved since the draft's
+ * base this is ::GDEFSTOR_ERR_CONFLICT, nothing is written and the draft stays.
+ * A draft whose tree equals the current one writes no revision and is deleted.
+ *
+ * @param out_revision As gdefstor_entity_save().
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_apply(GDEFSTOR_Write * write,
+    const char * public_id, size_t public_id_len,
+    const GDEFSTOR_RevisionMeta * meta, uint64_t * out_revision);
+
+/* ---- derived data --------------------------------------------------------- */
+
+/**
+ * @brief Drop every current table (and every other derived lookup) of the
+ * write's tenant and rebuild it from the truth, in this write.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_model_rebuild(GDEFSTOR_Write * write);
+
+/** gdefstor_model_dump(): the truth (entities, states, revisions, every item
+ * version, declarations, drafts). */
+#define GDEFSTOR_MODEL_TRUTH 1
+/** gdefstor_model_dump(): the derived data (current items, current state). */
+#define GDEFSTOR_MODEL_CURRENT 2
+
+/**
+ * @brief A canonical text of one tenant's stored rows, for checks and
+ * diagnostics: one line per row, sorted, every value spelled exactly.
+ *
+ * Two stores hold the same rows exactly when their dumps are equal. The
+ * format (model.md) is for tests and tools, not for export (that is AD-23's).
+ * Free the bytes with gdefstor_bytes_free() and the store's allocator.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_model_dump(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, int which, uint8_t ** out_text,
+    size_t * out_len);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* GHOTI_IO_GDEFSTOR_MODEL_H */

@@ -37,5 +37,8 @@
 #include <ghoti.io/defiant-storage/query.h>
 #include <ghoti.io/defiant-storage/outbox.h>
 #include <ghoti.io/defiant-storage/snapshot.h>
+#include <ghoti.io/defiant-storage/value.h>
+#include <ghoti.io/defiant-storage/model.h>
+#include <ghoti.io/defiant-storage/model_backend.h>
 
 #endif /* GHOTI_IO_GDEFSTOR_DEFIANT_STORAGE_H */

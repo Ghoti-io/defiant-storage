@@ -175,6 +175,11 @@ GDEFSTOR_Result gdefstor_stage(GDEFSTOR_Write * write, GDEFSTOR_Pending * row) {
   if (write == NULL || row == NULL || !write->alive) {
     return GDEFSTOR_ERR_INVALID;
   }
+  /* A write that has begun entity operations commits them in the entity
+   * backend's transaction, which these rows are not part of (model.h). */
+  if (write->model_txn != NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
   if (row->key != NULL) {
     for (p = write->head; p != NULL; p = p->next) {
       if (p->key != NULL &&
@@ -685,6 +690,9 @@ void gdefstor_store_destroy(GDEFSTOR_Store * store) {
   if (store->backend.destroy != NULL) {
     store->backend.destroy(store->backend.ctx);
   }
+  if (store->has_model && store->model.destroy != NULL) {
+    store->model.destroy(store->model.ctx);
+  }
   gcu_allocator_free(store->alloc, store);
 }
 
@@ -781,6 +789,16 @@ GDEFSTOR_Result gdefstor_write_commit(GDEFSTOR_Write * write) {
     return GDEFSTOR_ERR_INVALID;
   }
   store = write->store;
+  if (write->model_txn != NULL) {
+    rc = gdefstor_model_finish(write, 1);
+    {
+      GDEFSTOR_Result done = finish_write(store, write);
+      if (done != GDEFSTOR_OK) {
+        return done;
+      }
+    }
+    return rc;
+  }
   rc = apply_pending(store, write, 0);
   if (rc != GDEFSTOR_OK) {
     free_pending_list(store->alloc, write->head);
@@ -805,6 +823,14 @@ GDEFSTOR_Result gdefstor_write_abort(GDEFSTOR_Write * write) {
     return GDEFSTOR_ERR_INVALID;
   }
   store = write->store;
+  if (write->model_txn != NULL) {
+    GDEFSTOR_Result rc = gdefstor_model_finish(write, 0);
+    GDEFSTOR_Result done = finish_write(store, write);
+    if (done != GDEFSTOR_OK) {
+      return done;
+    }
+    return rc;
+  }
   if (gdefstor_plant_keep_outbox) {
     GDEFSTOR_Result rc = apply_pending(store, write, 1);
     GDEFSTOR_Result done = finish_write(store, write);

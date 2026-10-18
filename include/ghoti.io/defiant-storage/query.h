@@ -86,6 +86,36 @@
  * The query sees the last commit. It checks no permission: the caller of the
  * port is the trusted layer, and a caller that serves a visitor puts the
  * visitor's access filter into the tree.
+ *
+ * ## Over entities
+ *
+ * gdefstor_entity_query() and gdefstor_entity_count() ask the same form of
+ * the entities of one declared type (model.h), over their current trees. The
+ * operands are typed there, and the text operands above are refused:
+ *
+ * - ::GDEFSTOR_QUERY_FIELD: a field path (`lines.taxes.amount`) to an active,
+ *   non-personal scalar field. Its set is that field's values on every current
+ *   item that has one, so a comparison on a field inside a multiple, or inside
+ *   a group inside one, holds when **some** item matches. Two comparisons are
+ *   each decided on their own: `lines.sku = 'A' and lines.qty > 5` does not
+ *   say it is the same line. An absent value adds nothing.
+ * - ::GDEFSTOR_QUERY_VALUES: typed constants (GDEFSTOR_Value), all of one type.
+ * - ::GDEFSTOR_QUERY_META: a fact of the entity record (::GDEFSTOR_QueryMeta).
+ * - ::GDEFSTOR_QUERY_ENTITY: the entity's public id, typed as a reference.
+ *
+ * The two sides of a comparison have the same type (a reference compares with
+ * a reference or the public id; a decimal with a decimal of the same scale).
+ * `=`, `!=` and `in` take any type; `<`, `<=`, `>`, `>=` take integer, decimal,
+ * float, date and date-time, and compare numbers, not text. EXISTS names
+ * another declared type; its child is a predicate over that type's entities,
+ * and an ::GDEFSTOR_QUERY_OUTER operand reads the entity EXISTS is decided
+ * for. A sort key is a single scalar field of the root group, a META fact or
+ * the public id; no value sorts before every value; text sorts by bytes. The
+ * final tiebreak is the internal row, ascending even under a descending sort,
+ * which is creation order. The total counts every match before the offset and
+ * the limit. Flags other than ::GDEFSTOR_QUERY_OUTER, a select, `numeric` on a
+ * sort and `entity_numeric` are ::GDEFSTOR_ERR_INVALID, and so is a type that
+ * was never declared.
  */
 
 #ifndef GHOTI_IO_GDEFSTOR_QUERY_H
@@ -94,6 +124,7 @@
 #include <ghoti.io/defiant-storage/macros.h>
 #include <ghoti.io/defiant-storage/store.h>
 #include <ghoti.io/defiant-storage/projection.h>
+#include <ghoti.io/defiant-storage/value.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -132,8 +163,20 @@ typedef struct GDEFSTOR_QueryText {
 typedef enum GDEFSTOR_QueryKind {
   GDEFSTOR_QUERY_CONST = 1, ///< The texts listed.
   GDEFSTOR_QUERY_COLUMN,    ///< A column, see the file comment.
-  GDEFSTOR_QUERY_ENTITY     ///< The entity argument of the row.
+  GDEFSTOR_QUERY_ENTITY,    ///< The entity argument of the row (an entity's public id).
+  GDEFSTOR_QUERY_FIELD,     ///< Entities only: the values of a field path.
+  GDEFSTOR_QUERY_VALUES,    ///< Entities only: typed constants.
+  GDEFSTOR_QUERY_META       ///< Entities only: a fact of the entity record.
 } GDEFSTOR_QueryKind;
+
+/** The facts of an entity record a ::GDEFSTOR_QUERY_META operand reads. */
+typedef enum GDEFSTOR_QueryMeta {
+  GDEFSTOR_META_PUBLISHED = 1, ///< Boolean: the newest state.
+  GDEFSTOR_META_DELETED,       ///< Boolean: the newest state (soft delete).
+  GDEFSTOR_META_CREATOR,       ///< Reference: who created it; none for the system.
+  GDEFSTOR_META_CREATED,       ///< Date-time: when.
+  GDEFSTOR_META_REVISION       ///< Integer: the newest revision, 0 for none.
+} GDEFSTOR_QueryMeta;
 
 /** One side of a comparison, a sort key or a returned column. */
 typedef struct GDEFSTOR_QueryOperand {
@@ -150,6 +193,11 @@ typedef struct GDEFSTOR_QueryOperand {
   size_t path2_len;           ///< Length of @ref path2.
   const GDEFSTOR_QueryText * texts; ///< CONST: the texts.
   size_t text_count;          ///< CONST: how many.
+  const char * field;         ///< FIELD: a dotted path of field names.
+  size_t field_len;           ///< Length of @ref field.
+  const GDEFSTOR_Value * values; ///< VALUES: the constants.
+  size_t value_count;         ///< VALUES: how many, at most ::GDEFSTOR_QUERY_MAX_TEXTS.
+  int meta;                   ///< META: a ::GDEFSTOR_QueryMeta.
 } GDEFSTOR_QueryOperand;
 
 /** What a node asks. */
@@ -263,6 +311,29 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_query_result_value(
 
 /** @brief Release a result. NULL is ignored. */
 GDEFSTOR_API void gdefstor_query_result_free(GDEFSTOR_QueryResult * r);
+
+/**
+ * @brief Run a query over the current entities of one declared type.
+ *
+ * See "Over entities" above. gdefstor_query_result_entity() gives each
+ * entity's public id; there are no select columns.
+ *
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID, ::GDEFSTOR_ERR_LIMIT,
+ *   ::GDEFSTOR_ERR_UNSUPPORTED (a store without the entity port),
+ *   ::GDEFSTOR_ERR_OOM, or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_query(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * type, size_t type_len,
+    const GDEFSTOR_Query * query, GDEFSTOR_QueryResult ** out_result);
+
+/**
+ * @brief Count the current entities of one declared type that match.
+ *
+ * The same predicate and refusals as gdefstor_entity_query().
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_count(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * type, size_t type_len,
+    const GDEFSTOR_QueryNode * where, uint64_t * out_count);
 
 /* ---- for the authors of a backend --------------------------------------- */
 

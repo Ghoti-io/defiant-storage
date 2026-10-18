@@ -41,9 +41,11 @@ extern "C" {
 /**
  * @brief Result of a storage call.
  *
- * `GDEFSTOR_ERR_BUSY` is the one code past the suite's common list: the
- * writer queue parks a fiber, and a caller that is not a fiber must not
- * block its thread.
+ * `GDEFSTOR_ERR_BUSY` and `GDEFSTOR_ERR_CONFLICT` are the codes past the
+ * suite's common list: the writer queue parks a fiber, and a caller that is
+ * not a fiber must not block its thread; and a write built on a revision that
+ * is no longer the newest is refused whole (model.h), which a caller must tell
+ * apart from a wrong argument to offer a merge.
  */
 typedef enum GDEFSTOR_Result {
   GDEFSTOR_OK = 0,          ///< Succeeded.
@@ -56,6 +58,7 @@ typedef enum GDEFSTOR_Result {
   GDEFSTOR_ERR_INVALID,     ///< A caller argument is wrong, or a missing row.
   GDEFSTOR_ERR_INTERNAL,    ///< A library invariant failed.
   GDEFSTOR_ERR_BUSY,        ///< The tenant's writer is busy and this is not a fiber.
+  GDEFSTOR_ERR_CONFLICT,    ///< A write named a base revision that is no longer the newest.
   GDEFSTOR_RESULT_COUNT     ///< Not a result. Closes the string table.
 } GDEFSTOR_Result;
 

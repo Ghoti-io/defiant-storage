@@ -51,6 +51,7 @@
 #define gdefstor_meta_add GHOTIIO_DEFSTOR(gdefstor_meta_add)
 #define gdefstor_meta_drop GHOTIIO_DEFSTOR(gdefstor_meta_drop)
 #define gdefstor_meta_find GHOTIIO_DEFSTOR(gdefstor_meta_find)
+#define gdefstor_model_finish GHOTIIO_DEFSTOR(gdefstor_model_finish)
 #define gdefstor_plant_enforce_limit GHOTIIO_DEFSTOR(gdefstor_plant_enforce_limit)
 #define gdefstor_plant_keep_outbox GHOTIIO_DEFSTOR(gdefstor_plant_keep_outbox)
 #define gdefstor_plant_see_uncommitted \
@@ -119,12 +120,21 @@ struct GDEFSTOR_Write {
   GDEFSTOR_Pending * head;
   GDEFSTOR_Pending * tail;
   int alive;
+  /* The entity port's backend transaction, opened by the first entity
+   * operation; NULL until then. A write with one stages no key/bytes rows. */
+  void * model_txn;
+  /* Set when an entity operation failed after it had written to model_txn:
+   * the commit then aborts and returns this. */
+  GDEFSTOR_Result model_broken;
 };
 
 struct GDEFSTOR_Store {
   const GDEFSTOR_Allocator * alloc;
   GDEFSTOR_Limits limits;
   GDEFSTOR_Backend backend;
+  /* The entity port (model.h); has_model is 0 for a key/bytes-only store. */
+  GDEFSTOR_ModelBackend model;
+  int has_model;
   GDEFSTOR_Gate * gates;
   GDEFSTOR_Write * opens;
   GDEFSTOR_Meta * meta;
@@ -222,5 +232,9 @@ GDEFSTOR_Result gdefstor_decode_outbox(const GDEFSTOR_Allocator * alloc,
 
 GDEFSTOR_Result gdefstor_check_payload(const GDEFSTOR_Allocator * alloc,
     const GDEFSTOR_Limits * limits, const uint8_t * payload, size_t len);
+
+/* End the entity port's transaction of a write, if it has one: commit it
+ * (when @p commit and the write is not broken) or abort it. model.c. */
+GDEFSTOR_Result gdefstor_model_finish(GDEFSTOR_Write * write, int commit);
 
 #endif /* GHOTI_IO_GDEFSTOR_SRC_INTERNAL_H */

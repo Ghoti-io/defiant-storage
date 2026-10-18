@@ -28,7 +28,7 @@
  * A backend must give the answer this file gives. The scan is the reference.
  */
 
-#include "internal.h"
+#include "model_internal.h"
 
 #include <ghoti.io/cutil/allocator.h>
 #include <string.h>
@@ -1691,6 +1691,36 @@ GDEFSTOR_Result gdefstor_query_result_value(const GDEFSTOR_QueryResult * r,
   *out_present = v->present;
   *out_bytes = v->bytes;
   *out_len = v->len;
+  return GDEFSTOR_OK;
+}
+
+GDEFSTOR_Result gdefstor_query_result_adopt(const GDEFSTOR_Allocator * alloc,
+    GDEFSTOR_ModelHits * hits, GDEFSTOR_QueryResult ** out) {
+  GDEFSTOR_QueryResult * r;
+  size_t i;
+  r = (GDEFSTOR_QueryResult *)gdefstor_mem0(alloc, sizeof *r);
+  if (r == NULL) {
+    return GDEFSTOR_ERR_OOM;
+  }
+  r->alloc = alloc;
+  r->total = hits->total;
+  if (hits->count > 0) {
+    r->entities = (char **)gdefstor_mem0(alloc, hits->count * sizeof *r->entities);
+    r->entity_lens = (size_t *)gdefstor_mem0(alloc,
+        hits->count * sizeof *r->entity_lens);
+    if (r->entities == NULL || r->entity_lens == NULL) {
+      gdefstor_query_result_free(r);
+      return GDEFSTOR_ERR_OOM;
+    }
+  }
+  /* The result owns the public ids from here on. */
+  for (i = 0; i < hits->count; i++) {
+    r->entities[i] = hits->public_ids[i];
+    r->entity_lens[i] = hits->public_id_lens[i];
+    hits->public_ids[i] = NULL;
+    r->count = i + 1;
+  }
+  *out = r;
   return GDEFSTOR_OK;
 }
 
