@@ -376,6 +376,37 @@ appended with the same effect. A key store that seals in process is given a
 cipher (`GDEFSTOR_KeyCipher`) by the caller, so this library holds no
 cryptography. Nothing is wired to the entity port yet.
 
+Besides the keys it makes, a key store keeps two things a caller seals itself:
+
+- **Sealed material** (`gdefstor_keystore_subject_put()`,
+  `gdefstor_keystore_subject_sealed()`): a subject key the caller wrapped under
+  its own keyring, kept as that subject's key. The store never opens it. It
+  goes in the same step as the ledger row when the subject is erased, and an
+  erased subject can never be given it again. A subject has a key the store
+  made or sealed material, never both, and a key the store made is never read
+  back.
+- **Tenant secrets** (`gdefstor_keystore_secret_put()`,
+  `gdefstor_keystore_secret_get()`): written once, such as the wrap of a
+  tenant's keyring. The same bytes again change nothing; other bytes are
+  refused.
+
+**The key set.** `gdefstor_keystore_export()` writes a tenant's secrets, keys,
+sealed material and ledger, with the time it was taken, as
+`defiant-keyset/1` (text: a header line, `taken <ms>`, then one line per row,
+`secret`, `key`, `sealed` and `ledger` in that order, bytes in lower-case
+hex). `gdefstor_keystore_import()` merges one back in one step: the set's
+ledger rows are replayed as erasures, a key or sealed material for a subject
+either ledger names is dropped, an equal row is kept, and a secret or key the
+tenant holds with other bytes refuses the whole import. Importing a set twice
+changes nothing. A key set holds keys: it is the key half of a backup pair,
+never inside a snapshot. The data half is a snapshot taken with
+`gdefstor_snapshot_export_at()`, whose manifest records `"taken_ms"`
+(`gdefstor_snapshot_taken()` reads it); the restore that pairs the two, and
+refuses a key set older than its data set, is core's.
+
+A backend of `GDEFSTOR_KEYSTORE_BACKEND_SIZE_V1` (without these members) is
+still accepted; every call that needs them is `GDEFSTOR_ERR_UNSUPPORTED` on it.
+
 ## Not built here
 
 - **Languages.** The port has no language axis; a field has one value per

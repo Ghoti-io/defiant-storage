@@ -863,6 +863,7 @@ namespace {
 
 struct KSub {
   std::string key;
+  std::string sealed; /* material a caller put; key is empty then */
   bool erased = false;
 };
 
@@ -870,8 +871,17 @@ struct KScratch {
   const GDEFSTOR_Allocator * alloc = nullptr;
   GDEFSTOR_KeyCipher cipher;
   std::map<std::string, KSub> subjects; /* tenant NUL subject */
+  std::map<std::string, std::string> secrets; /* tenant NUL name */
   std::vector<std::pair<std::string, std::pair<std::string, int64_t>>> ledger;
 };
+
+uint8_t * KCopy(const GDEFSTOR_Allocator * a, const std::string & s) {
+  uint8_t * p = static_cast<uint8_t *>(gcu_allocator_malloc(a, s.size()));
+  if (p != nullptr) {
+    std::memcpy(p, s.data(), s.size());
+  }
+  return p;
+}
 
 std::string KName(const char * t, size_t tl, const char * s, size_t sl) {
   return std::string(t, tl) + std::string(1, '\0') + std::string(s, sl);
@@ -910,6 +920,9 @@ static GDEFSTOR_Result ks_seal(void * ctx, int seal, const char * t, size_t tl,
     *erased = 1;
     return GDEFSTOR_OK;
   }
+  if (it->second.key.empty()) {
+    return GDEFSTOR_ERR_INVALID; /* sealed material only */
+  }
   const uint8_t * key = reinterpret_cast<const uint8_t *>(it->second.key.data());
   return (seal ? k->cipher.seal : k->cipher.open)(k->cipher.ctx, k->alloc, key,
       in, n, out, out_len);
@@ -933,6 +946,8 @@ static GDEFSTOR_Result ks_erase(void * ctx, const char * t, size_t tl,
   }
   sub.key.assign(sub.key.size(), '\0');
   sub.key.clear();
+  sub.sealed.assign(sub.sealed.size(), '\0');
+  sub.sealed.clear();
   sub.erased = true;
   k->ledger.push_back(std::make_pair(std::string(t, tl),
       std::make_pair(std::string(s, sl), when)));
@@ -953,9 +968,213 @@ static GDEFSTOR_Result ks_ledger(void * ctx, const char * t, size_t tl,
   }
   return GDEFSTOR_OK;
 }
+static GDEFSTOR_Result ks_sealed_put(void * ctx, const char * t, size_t tl,
+    const char * s, size_t sl, const uint8_t * in, size_t n) {
+  KScratch * k = static_cast<KScratch *>(ctx);
+  std::string name = KName(t, tl, s, sl);
+  if (k->subjects.count(name) != 0) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  k->subjects[name].sealed.assign(reinterpret_cast<const char *>(in), n);
+  return GDEFSTOR_OK;
+}
+static GDEFSTOR_Result ks_sealed_get(void * ctx, const char * t, size_t tl,
+    const char * s, size_t sl, int * erased, uint8_t ** out, size_t * out_len) {
+  KScratch * k = static_cast<KScratch *>(ctx);
+  auto it = k->subjects.find(KName(t, tl, s, sl));
+  *erased = 0;
+  if (it != k->subjects.end() && it->second.erased) {
+    *erased = 1;
+    return GDEFSTOR_OK;
+  }
+  if (it == k->subjects.end() || it->second.sealed.empty()) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  *out = KCopy(k->alloc, it->second.sealed);
+  *out_len = it->second.sealed.size();
+  return *out == nullptr ? GDEFSTOR_ERR_OOM : GDEFSTOR_OK;
+}
+static GDEFSTOR_Result ks_secret_put(void * ctx, const char * t, size_t tl,
+    const char * s, size_t sl, const uint8_t * in, size_t n) {
+  KScratch * k = static_cast<KScratch *>(ctx);
+  std::string name = KName(t, tl, s, sl);
+  std::string v(reinterpret_cast<const char *>(in), n);
+  auto it = k->secrets.find(name);
+  if (it != k->secrets.end()) {
+    return it->second == v ? GDEFSTOR_OK : GDEFSTOR_ERR_INVALID;
+  }
+  k->secrets[name] = v;
+  return GDEFSTOR_OK;
+}
+static GDEFSTOR_Result ks_secret_get(void * ctx, const char * t, size_t tl,
+    const char * s, size_t sl, int * found, uint8_t ** out, size_t * out_len) {
+  KScratch * k = static_cast<KScratch *>(ctx);
+  auto it = k->secrets.find(KName(t, tl, s, sl));
+  *found = 0;
+  if (it == k->secrets.end()) {
+    return GDEFSTOR_OK;
+  }
+  *found = 1;
+  *out = KCopy(k->alloc, it->second);
+  *out_len = it->second.size();
+  return *out == nullptr ? GDEFSTOR_ERR_OOM : GDEFSTOR_OK;
+}
+static GDEFSTOR_Result ks_dump(void * ctx, const char * t, size_t tl,
+    GDEFSTOR_Result (*visit)(void *, const GDEFSTOR_KeyRow *), void * vctx) {
+  KScratch * k = static_cast<KScratch *>(ctx);
+  std::string prefix = std::string(t, tl) + std::string(1, '\0');
+  std::vector<GDEFSTOR_KeyRow> rows;
+  std::vector<std::string> names;
+  names.reserve(k->secrets.size() + 2 * k->subjects.size());
+  for (int kind = GDEFSTOR_KEYROW_SECRET; kind <= GDEFSTOR_KEYROW_SEALED; kind++) {
+    if (kind == GDEFSTOR_KEYROW_SECRET) {
+      for (const auto & e : k->secrets) {
+        if (e.first.compare(0, prefix.size(), prefix) != 0) {
+          continue;
+        }
+        names.push_back(e.first.substr(prefix.size()));
+        GDEFSTOR_KeyRow r = {};
+        r.kind = kind;
+        r.name = names.back().data();
+        r.name_len = names.back().size();
+        r.bytes = reinterpret_cast<const uint8_t *>(e.second.data());
+        r.len = e.second.size();
+        rows.push_back(r);
+      }
+      continue;
+    }
+    for (const auto & e : k->subjects) {
+      const std::string & v =
+          kind == GDEFSTOR_KEYROW_KEY ? e.second.key : e.second.sealed;
+      if (e.first.compare(0, prefix.size(), prefix) != 0 || v.empty()) {
+        continue;
+      }
+      names.push_back(e.first.substr(prefix.size()));
+      GDEFSTOR_KeyRow r = {};
+      r.kind = kind;
+      r.name = names.back().data();
+      r.name_len = names.back().size();
+      r.bytes = reinterpret_cast<const uint8_t *>(v.data());
+      r.len = v.size();
+      rows.push_back(r);
+    }
+  }
+  for (const auto & row : k->ledger) {
+    if (row.first == std::string(t, tl)) {
+      GDEFSTOR_KeyRow r = {};
+      r.kind = GDEFSTOR_KEYROW_LEDGER;
+      r.name = row.second.first.data();
+      r.name_len = row.second.first.size();
+      r.when_ms = row.second.second;
+      rows.push_back(r);
+    }
+  }
+  for (const auto & r : rows) {
+    GDEFSTOR_Result rc = visit(vctx, &r);
+    if (rc != GDEFSTOR_OK) {
+      return rc;
+    }
+  }
+  return GDEFSTOR_OK;
+}
+static GDEFSTOR_Result ks_restore(void * ctx, const char * t, size_t tl,
+    const GDEFSTOR_KeyRow * rows, size_t n) {
+  KScratch * k = static_cast<KScratch *>(ctx);
+  KScratch next = *k; /* all or nothing: work on a copy */
+  for (size_t i = 0; i < n; i++) {
+    const GDEFSTOR_KeyRow & r = rows[i];
+    std::string name = KName(t, tl, r.name, r.name_len);
+    std::string v(reinterpret_cast<const char *>(r.bytes), r.len);
+    if (r.kind == GDEFSTOR_KEYROW_LEDGER) {
+      KSub & sub = next.subjects[name];
+      if (!sub.erased) {
+        sub.key.clear();
+        sub.sealed.clear();
+        sub.erased = true;
+        next.ledger.push_back(std::make_pair(std::string(t, tl),
+            std::make_pair(std::string(r.name, r.name_len), r.when_ms)));
+      }
+    } else if (r.kind == GDEFSTOR_KEYROW_SECRET) {
+      auto it = next.secrets.find(name);
+      if (it != next.secrets.end() && it->second != v) {
+        return GDEFSTOR_ERR_INVALID;
+      }
+      next.secrets[name] = v;
+    } else {
+      auto it = next.subjects.find(name);
+      if (it != next.subjects.end() && it->second.erased) {
+        continue;
+      }
+      if (it != next.subjects.end()) {
+        const std::string & have = r.kind == GDEFSTOR_KEYROW_KEY
+                                       ? it->second.key
+                                       : it->second.sealed;
+        if (have != v) {
+          return GDEFSTOR_ERR_INVALID;
+        }
+        continue;
+      }
+      if (r.kind == GDEFSTOR_KEYROW_KEY) {
+        if (r.len != k->cipher.key_bytes) {
+          return GDEFSTOR_ERR_INVALID;
+        }
+        next.subjects[name].key = v;
+      } else {
+        next.subjects[name].sealed = v;
+      }
+    }
+  }
+  *k = next;
+  return GDEFSTOR_OK;
+}
 }
 
 } /* namespace */
+
+/* A backend of the first size: the calls it cannot serve are refused as
+ * unsupported, and the rest still work. */
+TEST(KeyStorePort, AFirstSizeBackendServesWhatItHas) {
+  KScratch * k = new KScratch();
+  k->alloc = gdefstor_allocator_default();
+  std::memset(&k->cipher, 0, sizeof k->cipher);
+  GDEFSTOR_KeyStoreBackend b;
+  std::memset(&b, 0, sizeof b);
+  b.size = GDEFSTOR_KEYSTORE_BACKEND_SIZE_V1;
+  b.ctx = k;
+  b.destroy = ks_destroy;
+  b.create = ks_create;
+  b.wrap = ks_wrap;
+  b.unwrap = ks_unwrap;
+  b.erase = ks_erase;
+  b.ledger = ks_ledger;
+  GDEFSTOR_KeyStore * ks = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_create(&b, nullptr, &ks));
+  const uint8_t m[1] = {1};
+  uint8_t * out = nullptr;
+  size_t len = 0;
+  int flag = 0;
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_keystore_subject_put(ks, "t1", 2,
+      "p1", 2, m, 1));
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_keystore_subject_sealed(ks, "t1",
+      2, "p1", 2, &flag, &out, &len));
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_keystore_secret_put(ks, "t1", 2,
+      "k", 1, m, 1));
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_keystore_secret_get(ks, "t1", 2,
+      "k", 1, &flag, &out, &len));
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_keystore_export(ks, "t1", 2, 1,
+      &out, &len));
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_keystore_import(ks, "t1", 2,
+      reinterpret_cast<const uint8_t *>("defiant-keyset/1\ntaken 1\n"), 25));
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_keystore_erase(ks, "t1", 2, "p1", 2, 1));
+  gdefstor_keystore_destroy(ks);
+  /* Some of the optional members and not all is refused. */
+  KScratch * k2 = new KScratch();
+  b.ctx = k2;
+  b.size = sizeof b;
+  b.sealed_put = ks_sealed_put;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_create(&b, nullptr, &ks));
+  delete k2;
+}
 
 GDEFSTOR_Result KeyStoreOpen(const GDEFSTOR_KeyCipher * cipher,
     GDEFSTOR_KeyStore ** out) {
@@ -972,6 +1191,12 @@ GDEFSTOR_Result KeyStoreOpen(const GDEFSTOR_KeyCipher * cipher,
   b.unwrap = ks_unwrap;
   b.erase = ks_erase;
   b.ledger = ks_ledger;
+  b.sealed_put = ks_sealed_put;
+  b.sealed_get = ks_sealed_get;
+  b.secret_put = ks_secret_put;
+  b.secret_get = ks_secret_get;
+  b.dump = ks_dump;
+  b.restore = ks_restore;
   GDEFSTOR_Result rc = gdefstor_keystore_create(&b, nullptr, out);
   if (rc != GDEFSTOR_OK) {
     delete k;

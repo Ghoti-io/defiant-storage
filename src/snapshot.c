@@ -250,7 +250,8 @@ static GDEFSTOR_Result from_json(GTEXT_JSON_Status code) {
 
 static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
     size_t tenant_len, const GDEFSTOR_Limits * limits, const uint8_t * ledger,
-    size_t ledger_len, int with_ledger, uint8_t ** out_bytes, size_t * out_len) {
+    size_t ledger_len, int with_ledger, int with_taken, int64_t taken_ms,
+    uint8_t ** out_bytes, size_t * out_len) {
   GDEFSTOR_Limits cap;
   char ** keys = NULL;
   size_t * lens = NULL;
@@ -328,8 +329,22 @@ static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
   gcu_allocator_free(store->alloc, lens);
   keys = NULL;
   rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap, store->alloc,
-      "{\"format\":\"defiant-snapshot/1\",\"entries\":[",
-      strlen("{\"format\":\"defiant-snapshot/1\",\"entries\":["));
+      "{\"format\":\"defiant-snapshot/1\",",
+      strlen("{\"format\":\"defiant-snapshot/1\","));
+  if (rc == GDEFSTOR_OK && with_taken) {
+    /* When the set was taken, so a restore can pair it with a key set at
+     * least as new (keystore.h). An import does not read it. */
+    char at[48];
+    int kn = snprintf(at, sizeof at, "\"taken_ms\":%lld,", (long long)taken_ms);
+    rc = kn > 0 && (size_t)kn < sizeof at
+             ? gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
+                   store->alloc, at, (size_t)kn)
+             : GDEFSTOR_ERR_INTERNAL;
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
+        store->alloc, "\"entries\":[", strlen("\"entries\":["));
+  }
   for (i = 0; rc == GDEFSTOR_OK && i < count; i++) {
     const char * kn = kind_name(mems[i].kind);
     if (i > 0) {
@@ -474,16 +489,26 @@ static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
 GDEFSTOR_Result gdefstor_snapshot_export(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const GDEFSTOR_Limits * limits,
     uint8_t ** out_bytes, size_t * out_len) {
-  return export_zip(store, tenant, tenant_len, limits, NULL, 0, 0, out_bytes,
-      out_len);
+  return export_zip(store, tenant, tenant_len, limits, NULL, 0, 0, 0, 0,
+      out_bytes, out_len);
+}
+
+GDEFSTOR_Result gdefstor_snapshot_export_at(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const GDEFSTOR_Limits * limits,
+    int64_t taken_ms, uint8_t ** out_bytes, size_t * out_len) {
+  if (taken_ms < 0) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  return export_zip(store, tenant, tenant_len, limits, NULL, 0, 0, 1, taken_ms,
+      out_bytes, out_len);
 }
 
 GDEFSTOR_Result gdefstor_snapshot_export_ledger(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const GDEFSTOR_Limits * limits,
     const uint8_t * ledger, size_t ledger_len, uint8_t ** out_bytes,
     size_t * out_len) {
-  return export_zip(store, tenant, tenant_len, limits, ledger, ledger_len, 1,
-      out_bytes, out_len);
+  return export_zip(store, tenant, tenant_len, limits, ledger, ledger_len, 1, 0,
+      0, out_bytes, out_len);
 }
 
 static GDEFSTOR_Result read_members(GDEFSTOR_Store * store,
@@ -981,4 +1006,73 @@ GDEFSTOR_Result gdefstor_snapshot_ledger(GDEFSTOR_Store * store,
   *out_len = ledger == NULL ? 0 : ledger->len;
   free_mems(store->alloc, mems, count);
   return GDEFSTOR_OK;
+}
+
+GDEFSTOR_Result gdefstor_snapshot_taken(GDEFSTOR_Store * store,
+    const uint8_t * bytes, size_t len, const GDEFSTOR_Limits * limits,
+    int * out_found, int64_t * out_taken_ms) {
+  GDEFSTOR_Limits cap;
+  SnapMem * mems = NULL;
+  size_t count = 0;
+  SnapMem * manifest;
+  GTEXT_JSON_Parse_Options opt;
+  GTEXT_JSON_Error err;
+  GTEXT_JSON_Value * root;
+  const GTEXT_JSON_Value * taken;
+  int64_t v = 0;
+  GDEFSTOR_Result rc;
+  if (store == NULL || out_found == NULL || out_taken_ms == NULL ||
+      (bytes == NULL && len != 0)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  *out_found = 0;
+  *out_taken_ms = 0;
+  if (limits == NULL) {
+    cap = store->limits;
+  } else {
+    cap = *limits;
+  }
+  rc = read_members(store, &cap, bytes, len, &mems, &count);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  manifest = find_mem(mems, count, MANIFEST_NAME, strlen(MANIFEST_NAME));
+  if (manifest == NULL) {
+    free_mems(store->alloc, mems, count);
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  memset(&err, 0, sizeof err);
+  opt = gtext_json_parse_options_default();
+  opt.max_depth = cap.max_json_depth == 0 ? 1 : cap.max_json_depth;
+  opt.max_string_bytes = cap.max_member_bytes;
+  opt.max_total_bytes = cap.max_member_bytes;
+  opt.dupkeys = GTEXT_JSON_DUPKEY_ERROR;
+  opt.allocator = (const GTEXT_Allocator *)store->alloc;
+  opt.parse_int64 = 1;
+  root = gtext_json_parse((const char *)manifest->bytes, manifest->len, &opt,
+      &err);
+  if (root == NULL) {
+    rc = from_json(err.code);
+    gtext_json_error_free(&err);
+    free_mems(store->alloc, mems, count);
+    return rc;
+  }
+  gtext_json_error_free(&err);
+  rc = GDEFSTOR_OK;
+  taken = gtext_json_typeof(root) == GTEXT_JSON_OBJECT
+              ? gtext_json_object_get(root, "taken_ms", 8)
+              : NULL;
+  if (gtext_json_typeof(root) != GTEXT_JSON_OBJECT) {
+    rc = GDEFSTOR_ERR_CORRUPT;
+  } else if (taken != NULL) {
+    if (gtext_json_get_i64(taken, &v) != GTEXT_JSON_OK || v < 0) {
+      rc = GDEFSTOR_ERR_CORRUPT;
+    } else {
+      *out_found = 1;
+      *out_taken_ms = v;
+    }
+  }
+  gtext_json_free(root);
+  free_mems(store->alloc, mems, count);
+  return rc;
 }

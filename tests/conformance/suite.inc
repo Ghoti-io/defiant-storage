@@ -475,6 +475,57 @@ TEST_F(Snapshot, RoundTrip) {
   ConformanceClose(other);
 }
 
+/* The data half of a backup pair records when it was taken; an import reads
+ * the rows as from any snapshot, and a snapshot without a time says so. */
+TEST_F(Snapshot, TheTimeTakenIsRecordedAndReadBack) {
+  GDEFSTOR_Store * other = NULL;
+  GDEFSTOR_Write * write = NULL;
+  uint8_t * zip = NULL;
+  size_t zip_len = 0;
+  uint8_t * plain = NULL;
+  size_t plain_len = 0;
+  uint8_t * ledger = NULL;
+  size_t ledger_len = 9;
+  int found = -1;
+  int64_t taken = -1;
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
+  ASSERT_EQ(GDEFSTOR_OK, stage_all(write));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(write));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID,
+      gdefstor_snapshot_export_at(store, kTenant, strlen(kTenant), NULL, -1,
+          &zip, &zip_len));
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_snapshot_export_at(store, kTenant, strlen(kTenant), NULL,
+          1760000000123LL, &zip, &zip_len));
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_snapshot_taken(store, zip, zip_len, NULL, &found, &taken));
+  EXPECT_EQ(1, found);
+  EXPECT_EQ(1760000000123LL, taken);
+  /* No ledger member: the data set carries none. */
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_snapshot_ledger(store, zip, zip_len, NULL, &ledger, &ledger_len));
+  EXPECT_EQ(0u, ledger_len);
+  gdefstor_bytes_free(NULL, ledger);
+  ASSERT_EQ(GDEFSTOR_OK, ConformanceOpen(&other, NULL));
+  EXPECT_EQ(GDEFSTOR_OK,
+      gdefstor_snapshot_import(other, kTenant, strlen(kTenant), zip, zip_len,
+          NULL));
+  ConformanceClose(other);
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_snapshot_export(store, kTenant, strlen(kTenant), NULL, &plain,
+          &plain_len));
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_snapshot_taken(store, plain, plain_len, NULL, &found, &taken));
+  EXPECT_EQ(0, found);
+  EXPECT_EQ(0, taken);
+  EXPECT_NE(GDEFSTOR_OK,
+      gdefstor_snapshot_taken(store, (const uint8_t *)"not a zip", 9, NULL,
+          &found, &taken));
+  gdefstor_bytes_free(NULL, zip);
+  gdefstor_bytes_free(NULL, plain);
+}
+
 TEST_F(Snapshot, BadMember) {
   uint8_t * zip = NULL;
   size_t zip_len = 0;

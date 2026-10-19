@@ -75,6 +75,38 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_export_ledger(
     uint8_t ** out_bytes, size_t * out_len);
 
 /**
+ * @brief Export one tenant and record when the export was taken.
+ *
+ * The manifest gains `"taken_ms"`, milliseconds since the Unix epoch. The
+ * zip holds no `ledger` member. This is the data set of a backup pair
+ * (keystore.h: a restore refuses a key set older than the data set it pairs
+ * with); gdefstor_snapshot_taken() reads the time back, and an import does not
+ * read it. As gdefstor_snapshot_export() otherwise.
+ *
+ * @param taken_ms Not negative.
+ * @return ::GDEFSTOR_OK or an error; ::GDEFSTOR_ERR_INVALID for a negative
+ *   @p taken_ms.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_export_at(
+    GDEFSTOR_Store * store, const char * tenant, size_t tenant_len,
+    const GDEFSTOR_Limits * limits, int64_t taken_ms, uint8_t ** out_bytes,
+    size_t * out_len);
+
+/**
+ * @brief Read when a snapshot was taken, as gdefstor_snapshot_export_at()
+ * recorded it. Nothing is imported.
+ *
+ * @param out_found Set to 0, with @p out_taken_ms 0, for a snapshot whose
+ *   manifest records no time (gdefstor_snapshot_export() made it).
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_CORRUPT for a zip without a readable
+ *   manifest or with a time that is not a non-negative integer, or the
+ *   archive's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_taken(GDEFSTOR_Store * store,
+    const uint8_t * bytes, size_t len, const GDEFSTOR_Limits * limits,
+    int * out_found, int64_t * out_taken_ms);
+
+/**
  * @brief Copy the `ledger` member. A snapshot without one yields length 0.
  *
  * The copy is allocated with the default allocator, not the store's.

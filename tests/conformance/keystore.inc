@@ -257,4 +257,287 @@ TEST_F(KeyStore, ArgumentsAreChecked) {
   EXPECT_EQ(GDEFSTOR_ERR_LIMIT, rc);
 }
 
+/* ---- sealed material, tenant secrets and the key set ---------------------- */
+
+static std::string Str(const uint8_t * p, size_t n) {
+  return std::string(reinterpret_cast<const char *>(p), p == nullptr ? 0 : n);
+}
+
+static const uint8_t * U(const std::string & s) {
+  return reinterpret_cast<const uint8_t *>(s.data());
+}
+
+class KeyStoreSets : public KeyStore {
+ protected:
+  std::string Sealed(GDEFSTOR_KeyStore * k, const char * subject,
+      GDEFSTOR_Result * rc_out, int * erased_out) {
+    uint8_t * out = nullptr;
+    size_t len = 0;
+    int erased = 0;
+    *rc_out = gdefstor_keystore_subject_sealed(k, "t1", 2, subject,
+        std::strlen(subject), &erased, &out, &len);
+    *erased_out = erased;
+    std::string s = Str(out, len);
+    gdefstor_bytes_free(nullptr, out);
+    return s;
+  }
+
+  std::string Secret(GDEFSTOR_KeyStore * k, const char * name, int * found) {
+    uint8_t * out = nullptr;
+    size_t len = 0;
+    *found = -1;
+    EXPECT_EQ(GDEFSTOR_OK, gdefstor_keystore_secret_get(k, "t1", 2, name,
+        std::strlen(name), found, &out, &len));
+    std::string s = Str(out, len);
+    gdefstor_bytes_free(nullptr, out);
+    return s;
+  }
+
+  std::string Export(GDEFSTOR_KeyStore * k, int64_t taken) {
+    uint8_t * out = nullptr;
+    size_t len = 0;
+    EXPECT_EQ(GDEFSTOR_OK, gdefstor_keystore_export(k, "t1", 2, taken, &out,
+        &len));
+    std::string s = Str(out, len);
+    gdefstor_bytes_free(nullptr, out);
+    return s;
+  }
+
+  size_t LedgerRows(GDEFSTOR_KeyStore * k) {
+    GDEFSTOR_Ledger * l = nullptr;
+    EXPECT_EQ(GDEFSTOR_OK, gdefstor_keystore_ledger(k, "t1", 2, &l));
+    size_t n = gdefstor_ledger_count(l);
+    gdefstor_ledger_free(l);
+    return n;
+  }
+};
+
+TEST_F(KeyStoreSets, SealedMaterialIsKeptAndGoesWithTheErasure) {
+  const std::string m = "wrapped-under-the-callers-keyring";
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_subject_put(ks, "t1", 2, "p1", 2,
+      U(m), m.size()));
+  GDEFSTOR_Result rc;
+  int erased = 0;
+  EXPECT_EQ(m, Sealed(ks, "p1", &rc, &erased));
+  EXPECT_EQ(GDEFSTOR_OK, rc);
+  EXPECT_EQ(0, erased);
+  /* One key per subject, in one form. */
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_subject_put(ks, "t1", 2,
+      "p1", 2, U(m), m.size()));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_subject_create(ks, "t1", 2,
+      "p1", 2));
+  /* Unknown here, and per tenant. */
+  Sealed(ks, "p2", &rc, &erased);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, rc);
+  {
+    uint8_t * out = nullptr;
+    size_t len = 0;
+    EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_subject_sealed(ks, "t2",
+        2, "p1", 2, &erased, &out, &len));
+  }
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_erase(ks, "t1", 2, "p1", 2, 41));
+  EXPECT_EQ("", Sealed(ks, "p1", &rc, &erased));
+  EXPECT_EQ(GDEFSTOR_OK, rc);
+  EXPECT_EQ(1, erased);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_subject_put(ks, "t1", 2,
+      "p1", 2, U(m), m.size()));
+  /* Erased without ever having material: still erased, never given it. */
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_erase(ks, "t1", 2, "p3", 2, 42));
+  Sealed(ks, "p3", &rc, &erased);
+  EXPECT_EQ(GDEFSTOR_OK, rc);
+  EXPECT_EQ(1, erased);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_subject_put(ks, "t1", 2,
+      "p3", 2, U(m), m.size()));
+  std::string big(GDEFSTOR_KEYSTORE_MAX_MATERIAL_BYTES + 1, 'x');
+  EXPECT_EQ(GDEFSTOR_ERR_LIMIT, gdefstor_keystore_subject_put(ks, "t1", 2,
+      "p4", 2, U(big), big.size()));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_subject_put(ks, "t1", 2,
+      "p4", 2, U(m), 0));
+}
+
+TEST_F(KeyStoreSets, AKeyTheStoreMadeIsNeverReadBack) {
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_subject_create(ks, "t1", 2, "p1", 2));
+  GDEFSTOR_Result rc;
+  int erased = 0;
+  EXPECT_EQ("", Sealed(ks, "p1", &rc, &erased));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, rc);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_subject_put(ks, "t1", 2,
+      "p1", 2, U(std::string("x")), 1));
+}
+
+TEST_F(KeyStoreSets, ASecretIsWrittenOnce) {
+  const std::string w = "the-tenant-keyring-wrap";
+  int found = -1;
+  EXPECT_EQ("", Secret(ks, "keyring", &found));
+  EXPECT_EQ(0, found);
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_secret_put(ks, "t1", 2, "keyring", 7,
+      U(w), w.size()));
+  EXPECT_EQ(w, Secret(ks, "keyring", &found));
+  EXPECT_EQ(1, found);
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_keystore_secret_put(ks, "t1", 2, "keyring", 7,
+      U(w), w.size()));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_secret_put(ks, "t1", 2,
+      "keyring", 7, U(std::string("another")), 7));
+  EXPECT_EQ(w, Secret(ks, "keyring", &found));
+  {
+    uint8_t * out = nullptr;
+    size_t len = 0;
+    found = -1;
+    ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_secret_get(ks, "t2", 2, "keyring",
+        7, &found, &out, &len));
+    EXPECT_EQ(0, found);
+  }
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_secret_put(ks, "t1", 2,
+      "no spaces", 9, U(w), w.size()));
+}
+
+TEST_F(KeyStoreSets, AKeySetCarriesEveryRowAndItsTime) {
+  const std::string m = "sealed-material-of-p2";
+  const std::string w = "keyring-wrap";
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_subject_create(ks, "t1", 2, "p1", 2));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_subject_put(ks, "t1", 2, "p2", 2,
+      U(m), m.size()));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_subject_create(ks, "t1", 2, "p3", 2));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_erase(ks, "t1", 2, "p3", 2, 77));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_secret_put(ks, "t1", 2, "keyring", 7,
+      U(w), w.size()));
+  std::string a = Wrap("p1", "data key");
+  std::string set = Export(ks, 1234);
+  ASSERT_EQ(0u, set.find("defiant-keyset/1\ntaken 1234\n")) << set;
+  {
+    GDEFSTOR_KeySet * parsed = nullptr;
+    ASSERT_EQ(GDEFSTOR_OK, gdefstor_keyset_parse(nullptr, U(set), set.size(),
+        &parsed));
+    EXPECT_EQ(1234, gdefstor_keyset_taken(parsed));
+    /* the secret, p1's key, p2's material and p3's ledger row */
+    ASSERT_EQ(4u, gdefstor_keyset_count(parsed));
+    int kinds[4] = {GDEFSTOR_KEYROW_SECRET, GDEFSTOR_KEYROW_KEY,
+        GDEFSTOR_KEYROW_SEALED, GDEFSTOR_KEYROW_LEDGER};
+    for (size_t i = 0; i < 4; i++) {
+      GDEFSTOR_KeyRow row;
+      ASSERT_EQ(GDEFSTOR_OK, gdefstor_keyset_row(parsed, i, &row));
+      EXPECT_EQ(kinds[i], row.kind) << i;
+    }
+    GDEFSTOR_KeyRow last;
+    ASSERT_EQ(GDEFSTOR_OK, gdefstor_keyset_row(parsed, 3, &last));
+    EXPECT_EQ("p3", std::string(last.name, last.name_len));
+    EXPECT_EQ(77, last.when_ms);
+    gdefstor_keyset_free(parsed);
+  }
+  /* Into a key store of its own: the same keys, material, secret, ledger. */
+  GDEFSTOR_KeyStore * other = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, KeyStoreOpen(&cipher, &other));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_import(other, "t1", 2, U(set),
+      set.size()));
+  {
+    uint8_t * out = nullptr;
+    size_t len = 0;
+    int erased = 0;
+    ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_unwrap(other, "t1", 2, "p1", 2,
+        U(a), a.size(), &erased, &out, &len));
+    EXPECT_EQ("data key", Str(out, len));
+    gdefstor_bytes_free(nullptr, out);
+  }
+  GDEFSTOR_Result rc;
+  int erased = 0;
+  int found = 0;
+  EXPECT_EQ(m, Sealed(other, "p2", &rc, &erased));
+  EXPECT_EQ(GDEFSTOR_OK, rc);
+  Sealed(other, "p3", &rc, &erased);
+  EXPECT_EQ(1, erased);
+  EXPECT_EQ(w, Secret(other, "keyring", &found));
+  EXPECT_EQ(1u, LedgerRows(other));
+  /* Importing it again changes nothing: the export reads the same. */
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_import(other, "t1", 2, U(set),
+      set.size()));
+  EXPECT_EQ(set, Export(other, 1234));
+  gdefstor_keystore_destroy(other);
+}
+
+TEST_F(KeyStoreSets, AnImportNeverBringsBackAnErasedKey) {
+  const std::string m = "sealed";
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_subject_create(ks, "t1", 2, "p1", 2));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_subject_put(ks, "t1", 2, "p2", 2,
+      U(m), m.size()));
+  std::string before = Export(ks, 5);
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_erase(ks, "t1", 2, "p1", 2, 6));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_erase(ks, "t1", 2, "p2", 2, 7));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_import(ks, "t1", 2, U(before),
+      before.size()));
+  GDEFSTOR_Result rc;
+  int erased = 0;
+  Wrap("p1", "x", &rc, &erased);
+  EXPECT_EQ(GDEFSTOR_OK, rc);
+  EXPECT_EQ(1, erased);
+  Sealed(ks, "p2", &rc, &erased);
+  EXPECT_EQ(1, erased);
+  EXPECT_EQ(2u, LedgerRows(ks));
+  /* And a set whose ledger is newer erases what the store still holds. */
+  GDEFSTOR_KeyStore * other = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, KeyStoreOpen(&cipher, &other));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_import(other, "t1", 2, U(before),
+      before.size()));
+  Sealed(other, "p2", &rc, &erased);
+  ASSERT_EQ(0, erased);
+  std::string after = Export(ks, 8);
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_import(other, "t1", 2, U(after),
+      after.size()));
+  Sealed(other, "p2", &rc, &erased);
+  EXPECT_EQ(1, erased);
+  EXPECT_EQ(2u, LedgerRows(other));
+  gdefstor_keystore_destroy(other);
+}
+
+TEST_F(KeyStoreSets, AnImportWithAConflictWritesNothing) {
+  const std::string w = "wrap-one";
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_secret_put(ks, "t1", 2, "keyring", 7,
+      U(w), w.size()));
+  GDEFSTOR_KeyStore * other = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, KeyStoreOpen(&cipher, &other));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_secret_put(other, "t1", 2, "keyring",
+      7, U(std::string("wrap-two")), 8));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_subject_put(other, "t1", 2, "p9", 2,
+      U(std::string("m9")), 2));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_erase(other, "t1", 2, "p8", 2, 3));
+  std::string theirs = Export(other, 9);
+  std::string mine = Export(ks, 9);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_import(ks, "t1", 2,
+      U(theirs), theirs.size()));
+  EXPECT_EQ(mine, Export(ks, 9)) << "a refused import wrote something";
+  gdefstor_keystore_destroy(other);
+}
+
+TEST_F(KeyStoreSets, AMalformedKeySetIsRefused) {
+  std::string good = Export(ks, 1);
+  struct Bad {
+    const char * text;
+    GDEFSTOR_Result rc;
+  } bad[] = {
+      {"", GDEFSTOR_ERR_FORMAT},
+      {"defiant-snapshot/1\n", GDEFSTOR_ERR_FORMAT},
+      {"defiant-keyset/2\ntaken 1\n", GDEFSTOR_ERR_UNSUPPORTED},
+      {"defiant-keyset/1\n", GDEFSTOR_ERR_CORRUPT},
+      {"defiant-keyset/1\ntaken -1\n", GDEFSTOR_ERR_CORRUPT},
+      {"defiant-keyset/1\ntaken 1\nsealed p1 0a", GDEFSTOR_ERR_CORRUPT},
+      {"defiant-keyset/1\ntaken 1\nsealed p1 0g\n", GDEFSTOR_ERR_CORRUPT},
+      {"defiant-keyset/1\ntaken 1\nsealed p1 abc\n", GDEFSTOR_ERR_CORRUPT},
+      {"defiant-keyset/1\ntaken 1\nsealed p.1 0a\n", GDEFSTOR_ERR_CORRUPT},
+      {"defiant-keyset/1\ntaken 1\nledger p1 7\nsealed p1 0a\n",
+          GDEFSTOR_ERR_CORRUPT},
+      {"defiant-keyset/1\ntaken 1\nkey p1 0a\nsealed p1 0a\n",
+          GDEFSTOR_ERR_CORRUPT},
+      {"defiant-keyset/1\ntaken 1\nsealed p1 0a\nsealed p1 0b\n",
+          GDEFSTOR_ERR_CORRUPT},
+      {"defiant-keyset/1\ntaken 1\nwhat p1 0a\n", GDEFSTOR_ERR_CORRUPT},
+  };
+  for (const Bad & b : bad) {
+    std::string t = b.text;
+    EXPECT_EQ(b.rc, gdefstor_keystore_import(ks, "t1", 2, U(t), t.size()))
+        << t;
+  }
+  EXPECT_EQ(good, Export(ks, 1)) << "a refused key set wrote something";
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_keystore_import(ks, "t1", 2,
+      U(std::string("defiant-keyset/1\ntaken 1\nsealed p1 0a\n")), 38));
+}
+
 } /* namespace keystore_conformance */
