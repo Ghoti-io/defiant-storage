@@ -46,6 +46,9 @@
  * - **Isolation.** A call with a NULL `txn` sees the last commit, even while a
  *   transaction of the same tenant is open; a call with the open `txn` sees
  *   that transaction's own writes.
+ * - **The blind table is apart** (a backend that serves it, below). A MAC is
+ *   written only into it, only in the `apply` that writes the version it
+ *   indexes, and is read back only through it; `rebuild` leaves it alone.
  * - Strings in visited rows are borrowed for the call; the port copies them.
  *   Rows are visited in no particular order.
  */
@@ -128,6 +131,24 @@ typedef struct GDEFSTOR_ModelClose {
   uint64_t valid_from;    ///< The version's valid_from; it must be open.
 } GDEFSTOR_ModelClose;
 
+/**
+ * A blind-index row: the MAC of one personal value version (AD-14). The
+ * blind table holds these, one per value version that was written with a
+ * MAC, and nothing else does: never a group, revision or current row. They
+ * are truth while their subject exists (a rebuild leaves them alone) and are
+ * deleted per subject at erasure.
+ */
+typedef struct GDEFSTOR_ModelBlind {
+  uint64_t item;          ///< The item version it indexes: the item ...
+  uint64_t valid_from;    ///< ... and that version's valid_from.
+  uint32_t field;         ///< The personal field: its GDEFSTOR_FieldInfo::id.
+  const uint8_t * subject;///< The value's subject (its subject column).
+  size_t subject_len;     ///< Its length.
+  const uint8_t * mac;    ///< ::GDEFSTOR_BLIND_MAC_BYTES bytes.
+  uint32_t key_id;        ///< GDEFSTOR_BlindMac::key_id.
+  uint32_t version;       ///< GDEFSTOR_BlindMac::version.
+} GDEFSTOR_ModelBlind;
+
 /** One revision write, computed by the port. Applied all or nothing. */
 typedef struct GDEFSTOR_ModelApply {
   uint64_t row;                       ///< The entity.
@@ -137,6 +158,11 @@ typedef struct GDEFSTOR_ModelApply {
   size_t close_count;                 ///< How many.
   const GDEFSTOR_ModelItem * inserts; ///< New versions; valid_from is the revision, valid_to 0.
   size_t insert_count;                ///< How many.
+  /** Added with the blind index: rows for the blind table, each for a
+   * version among @ref inserts (its valid_from is the revision). Only a
+   * backend that serves the blind index is handed any. */
+  const GDEFSTOR_ModelBlind * blinds;
+  size_t blind_count;                 ///< How many.
 } GDEFSTOR_ModelApply;
 
 /** A draft row. */
@@ -165,6 +191,13 @@ typedef struct GDEFSTOR_ModelVisitor {
   GDEFSTOR_Result (*draft)(void * ctx, const GDEFSTOR_ModelDraft * d);
   GDEFSTOR_Result (*type)(void * ctx, const char * name, size_t name_len,
       const uint8_t * text, size_t text_len);
+  /** Added with the blind index: a blind row of entity @p row. A backend
+   * calls it only when it is set, and then from `items` (every blind row of
+   * the entity, which the port matches to the versions it reads), `dump`
+   * (GDEFSTOR_MODEL_TRUTH: every blind row) and the scan the reference engine
+   * is given (every blind row of each entity it visits, after the entity). */
+  GDEFSTOR_Result (*blind)(void * ctx, uint64_t row,
+      const GDEFSTOR_ModelBlind * b);
 } GDEFSTOR_ModelVisitor;
 
 /** What a backend's `query` is handed: a query the port has checked. */
@@ -190,9 +223,48 @@ typedef struct GDEFSTOR_ModelHits {
 } GDEFSTOR_ModelHits;
 
 /** gdefstor_model_scan(): visit every current entity of @p type (entity, then its
- * current items), for the reference engine. */
+ * current items, and, when the visitor's `blind` is set, its blind rows), for
+ * the reference engine. */
 typedef GDEFSTOR_Result (*GDEFSTOR_ModelScanFn)(void * ctx, const char * type,
     size_t type_len, const GDEFSTOR_ModelVisitor * visitor);
+
+/** One blind row a backend's `blind_history` found, with what the port reports
+ * of it. Strings are borrowed for the call. */
+typedef struct GDEFSTOR_ModelBlindHit {
+  uint64_t row;             ///< The entity.
+  const char * public_id;   ///< Its public id.
+  size_t public_id_len;     ///< Its length.
+  uint64_t item;            ///< The version's item ...
+  uint64_t valid_from;      ///< ... and valid_from.
+  uint64_t valid_to;        ///< That version's valid_to, or 0 while it is open.
+  const uint8_t * subject;  ///< The row's subject.
+  size_t subject_len;       ///< Its length.
+  uint32_t key_id;          ///< As stored.
+  uint32_t version;         ///< As stored.
+} GDEFSTOR_ModelBlindHit;
+
+/** Where `blind_history` hands its rows, in no particular order. */
+typedef GDEFSTOR_Result (*GDEFSTOR_ModelBlindFn)(void * ctx,
+    const GDEFSTOR_ModelBlindHit * hit);
+
+/** One personal value version a backend's `subject_lookup` found. Strings are
+ * borrowed for the call. */
+typedef struct GDEFSTOR_ModelSubjectHit {
+  const char * type;        ///< The entity's type.
+  size_t type_len;          ///< Its length.
+  uint64_t row;             ///< The entity.
+  const char * public_id;   ///< Its public id.
+  size_t public_id_len;     ///< Its length.
+  uint32_t group;           ///< The version's group ...
+  uint32_t column;          ///< ... and the personal column naming the subject.
+  uint64_t item;            ///< The item.
+  uint64_t valid_from;      ///< The version's valid_from.
+  uint64_t valid_to;        ///< Its valid_to, or 0 while it is open.
+} GDEFSTOR_ModelSubjectHit;
+
+/** Where `subject_lookup` hands its rows, in no particular order. */
+typedef GDEFSTOR_Result (*GDEFSTOR_ModelSubjectFn)(void * ctx,
+    const GDEFSTOR_ModelSubjectHit * hit);
 
 /**
  * The entity backend. A backend zeroes it, sets @ref size to
@@ -235,7 +307,9 @@ typedef struct GDEFSTOR_ModelBackend {
       size_t tenant_len, uint64_t row, const GDEFSTOR_ModelVisitor * visitor);
   /** Visit (`item`) an entity's items: with @p as_of 0, its current tables;
    * otherwise every version with valid_from <= as_of and valid_to either 0 or
-   * > as_of, from the truth. */
+   * > as_of, from the truth. When the visitor's `blind` is set (only on a
+   * backend that serves the blind index), also every blind row of the
+   * entity. */
   GDEFSTOR_Result (*items)(void * ctx, void * txn, const char * tenant,
       size_t tenant_len, uint64_t row, uint64_t as_of,
       const GDEFSTOR_ModelVisitor * visitor);
@@ -263,8 +337,9 @@ typedef struct GDEFSTOR_ModelBackend {
       int which, const GDEFSTOR_ModelVisitor * visitor);
   /* ---- added after the first version: optional ---------------------------
    * A backend built against the struct that ends at @ref dump sets @ref size
-   * to that size (GDEFSTOR_MODEL_BACKEND_SIZE_V1), and the port treats every
-   * member below as NULL. */
+   * to that size (GDEFSTOR_MODEL_BACKEND_SIZE_V1), and one built against the
+   * struct that ends at @ref index_state to GDEFSTOR_MODEL_BACKEND_SIZE_V2;
+   * the port treats every member past its size as NULL. */
   /** The context @ref index_state is called with. A member of its own, not
    * @ref ctx, so that a wrapper that copies this struct and replaces @ref ctx
    * to intercept the other members still reaches the backend that owns the
@@ -282,12 +357,44 @@ typedef struct GDEFSTOR_ModelBackend {
   GDEFSTOR_Result (*index_state)(void * index_ctx, const char * tenant,
       size_t tenant_len, const GDEFSTOR_Type * type, size_t field,
       int * out_state);
+  /* ---- the blind index (AD-14): optional, all three or none ---------------
+   * A backend that sets them keeps the blind table: it writes
+   * GDEFSTOR_ModelApply::blinds in `apply`, visits blind rows through
+   * GDEFSTOR_ModelVisitor::blind, answers ::GDEFSTOR_QUERY_BLIND in `query`
+   * and leaves the table alone in `rebuild`. One that does not is never
+   * handed a MAC: the port refuses those calls ::GDEFSTOR_ERR_UNSUPPORTED. */
+  /** The context the three below are called with, kept apart from @ref ctx
+   * for the reason @ref index_ctx is. */
+  void * blind_ctx;
+  /** Visit (@p fn) every blind row of field @p field (an index for
+   * gdefstor_type_field()) of @p type whose MAC is @p mac
+   * (::GDEFSTOR_BLIND_MAC_BYTES bytes), as of the last commit. Served by an
+   * index on the MAC, never by reading ciphertext or subjects. */
+  GDEFSTOR_Result (*blind_history)(void * blind_ctx, const char * tenant,
+      size_t tenant_len, const GDEFSTOR_Type * type, size_t field,
+      const uint8_t * mac, GDEFSTOR_ModelBlindFn fn, void * fn_ctx);
+  /** Visit (@p fn) every item version, of every type and every personal
+   * column, retired or not, whose subject column is @p subject, as of the
+   * last commit. Served by the subject columns' indexes, never by the blind
+   * table. */
+  GDEFSTOR_Result (*subject_lookup)(void * blind_ctx, const char * tenant,
+      size_t tenant_len, const uint8_t * subject, size_t subject_len,
+      GDEFSTOR_ModelSubjectFn fn, void * fn_ctx);
+  /** Delete every blind row of @p subject, of every type, in @p txn.
+   * Deleting none is success. */
+  GDEFSTOR_Result (*blind_delete)(void * blind_ctx, void * txn,
+      const uint8_t * subject, size_t subject_len);
 } GDEFSTOR_ModelBackend;
 
 /** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::index_ctx
  * was added; gdefstor_store_create_model() accepts it. */
 #define GDEFSTOR_MODEL_BACKEND_SIZE_V1 \
   offsetof(GDEFSTOR_ModelBackend, index_ctx)
+
+/** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::blind_ctx
+ * was added; gdefstor_store_create_model() accepts it. */
+#define GDEFSTOR_MODEL_BACKEND_SIZE_V2 \
+  offsetof(GDEFSTOR_ModelBackend, blind_ctx)
 
 /**
  * @brief The reference query engine: answer @p plan over the entities

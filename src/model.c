@@ -32,6 +32,7 @@
 
 #include <ghoti.io/cutil/allocator.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int same_span(const char * a, size_t an, const char * b, size_t bn) {
@@ -51,10 +52,12 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
     const GDEFSTOR_ModelBackend * model, const GDEFSTOR_Allocator * allocator,
     const GDEFSTOR_Limits * limits, GDEFSTOR_Store ** out_store) {
   GDEFSTOR_Store * store = NULL;
+  GDEFSTOR_ModelBackend copy;
   GDEFSTOR_Result rc;
   if (model == NULL || out_store == NULL ||
       (model->size != sizeof(GDEFSTOR_ModelBackend) &&
-          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V1) ||
+          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V1 &&
+          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V2) ||
       model->destroy == NULL ||
       model->begin == NULL || model->commit == NULL || model->abort == NULL ||
       model->type_load == NULL || model->type_store == NULL ||
@@ -66,18 +69,43 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
       model->rebuild == NULL || model->dump == NULL) {
     return GDEFSTOR_ERR_INVALID;
   }
+  /* A backend of an earlier version's size has fewer optional members: they
+   * read as NULL, never as bytes past what it filled. */
+  memset(&copy, 0, sizeof copy);
+  memcpy(&copy, model, model->size);
+  copy.size = sizeof copy;
+  /* The blind index is the three members together or not at all: a backend
+   * that could write blind rows and not delete them would make erasure lie. */
+  {
+    int n = (copy.blind_history != NULL) + (copy.subject_lookup != NULL) +
+            (copy.blind_delete != NULL);
+    if (n != 0 && n != 3) {
+      return GDEFSTOR_ERR_INVALID;
+    }
+  }
   rc = gdefstor_store_create(backend, allocator, limits, &store);
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
-  /* A backend of the first version's size has no optional members: they
-   * read as NULL, never as bytes past what it filled. */
-  memset(&store->model, 0, sizeof store->model);
-  memcpy(&store->model, model, model->size);
-  store->model.size = sizeof store->model;
+  store->model = copy;
   store->has_model = 1;
   *out_store = store;
   return GDEFSTOR_OK;
+}
+
+int gdefstor_model_has_blind(const GDEFSTOR_Store * store) {
+  return store != NULL && store->has_model &&
+         store->model.blind_history != NULL;
+}
+
+int gdefstor_model_has_personal(const GDEFSTOR_Type * t) {
+  size_t i;
+  for (i = 0; t != NULL && i < t->n; i++) {
+    if ((t->f[i].flags & GDEFSTOR_FIELD_PERSONAL) != 0) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 GDEFSTOR_Result gdefstor_model_txn(GDEFSTOR_Write * write, void ** out_txn) {
@@ -239,11 +267,23 @@ typedef struct Item {
   size_t nvals;
 } Item;
 
+/* A blind row the port read back: which version and field it indexes, and
+ * its MAC (the subject is the value's own, so it is not kept). */
+typedef struct IBlind {
+  uint64_t item;
+  uint64_t from;
+  uint32_t field;
+  GDEFSTOR_BlindVal b;
+} IBlind;
+
 typedef struct Items {
   const GDEFSTOR_Allocator * alloc;
   Item * v;
   size_t n;
   size_t cap;
+  IBlind * bl;  /* read only when asked: sorted by item, from, field */
+  size_t nbl;
+  size_t capbl;
 } Items;
 
 static void items_release(Items * it) {
@@ -256,9 +296,88 @@ static void items_release(Items * it) {
     gcu_allocator_free(it->alloc, it->v[i].vals);
   }
   gcu_allocator_free(it->alloc, it->v);
+  gcu_allocator_free(it->alloc, it->bl);
   it->v = NULL;
   it->n = 0;
   it->cap = 0;
+  it->bl = NULL;
+  it->nbl = 0;
+  it->capbl = 0;
+}
+
+static GDEFSTOR_Result catch_blind(void * ctx, uint64_t row,
+    const GDEFSTOR_ModelBlind * b) {
+  Items * it = (Items *)ctx;
+  IBlind * o;
+  (void)row;
+  if (b->mac == NULL || it->nbl >= GDEFSTOR_MODEL_MAX_ITEMS * 4u) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  if (it->nbl == it->capbl) {
+    size_t grown = it->capbl == 0 ? 8 : it->capbl * 2;
+    IBlind * next = (IBlind *)gcu_allocator_realloc(it->alloc, it->bl,
+        grown * sizeof *next);
+    if (next == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    it->bl = next;
+    it->capbl = grown;
+  }
+  o = &it->bl[it->nbl];
+  memset(o, 0, sizeof *o);
+  o->item = b->item;
+  o->from = b->valid_from;
+  o->field = b->field;
+  o->b.set = 1;
+  memcpy(o->b.mac, b->mac, GDEFSTOR_BLIND_MAC_BYTES);
+  o->b.key_id = b->key_id;
+  o->b.version = b->version;
+  it->nbl += 1;
+  return GDEFSTOR_OK;
+}
+
+static int blind_cmp(const IBlind * a, uint64_t item, uint64_t from,
+    uint32_t field) {
+  if (a->item != item) {
+    return a->item < item ? -1 : 1;
+  }
+  if (a->from != from) {
+    return a->from < from ? -1 : 1;
+  }
+  return a->field < field ? -1 : (a->field > field ? 1 : 0);
+}
+
+static int blind_qcmp(const void * a, const void * b) {
+  const IBlind * y = (const IBlind *)b;
+  return blind_cmp((const IBlind *)a, y->item, y->from, y->field);
+}
+
+/* Insertion order is the backend's; lookups want it sorted. No two rows
+ * share a key, so an unstable sort is enough. */
+static void blinds_sort(Items * it) {
+  if (it->nbl > 1) {
+    qsort(it->bl, it->nbl, sizeof *it->bl, blind_qcmp);
+  }
+}
+
+/* The blind row of version (item, from) for field id @p field, or NULL. */
+static const GDEFSTOR_BlindVal * blind_of(const Items * it, uint64_t item,
+    uint64_t from, uint32_t field) {
+  size_t lo = 0;
+  size_t hi = it->nbl;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    int c = blind_cmp(&it->bl[mid], item, from, field);
+    if (c == 0) {
+      return &it->bl[mid].b;
+    }
+    if (c < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return NULL;
 }
 
 static GDEFSTOR_Result catch_item(void * ctx, uint64_t row,
@@ -315,9 +434,11 @@ static GDEFSTOR_Result catch_item(void * ctx, uint64_t row,
   return GDEFSTOR_OK;
 }
 
+/* @p with_blind also reads the entity's blind rows (a backend that serves
+ * the blind index only). */
 static GDEFSTOR_Result load_items(GDEFSTOR_Store * store, void * txn,
     const char * tenant, size_t tenant_len, uint64_t row, uint64_t as_of,
-    Items * out) {
+    int with_blind, Items * out) {
   GDEFSTOR_ModelVisitor v;
   GDEFSTOR_Result rc;
   memset(out, 0, sizeof *out);
@@ -325,12 +446,17 @@ static GDEFSTOR_Result load_items(GDEFSTOR_Store * store, void * txn,
   memset(&v, 0, sizeof v);
   v.ctx = out;
   v.item = catch_item;
+  if (with_blind && gdefstor_model_has_blind(store)) {
+    v.blind = catch_blind;
+  }
   rc = store->model.items(store->model.ctx, txn, tenant, tenant_len, row,
       as_of, &v);
   if (rc != GDEFSTOR_OK) {
     items_release(out);
+    return rc;
   }
-  return rc;
+  blinds_sort(out);
+  return GDEFSTOR_OK;
 }
 
 static int cmp_u64(uint64_t a, uint64_t b) {
@@ -648,6 +774,7 @@ typedef struct Tgt {
   double order;
   int has_order;          /* a key already fixed (revert, carried) */
   GDEFSTOR_Value * cols;  /* by column; bytes borrowed from the tree or base */
+  GDEFSTOR_BlindVal * bl; /* by column, when the save keeps blind rows */
   uint32_t ncols;
   size_t base;            /* the current version it continues, or NONE */
 } Tgt;
@@ -658,6 +785,9 @@ typedef struct Save {
   const GDEFSTOR_Type * type;
   size_t id_cap;
   int revert;             /* ids from history may come back */
+  /* The type has a personal field and the backend serves the blind index:
+   * the save reads the current versions' blind rows and writes new ones. */
+  int personal;
   Tgt * t;
   size_t n;
   size_t cap;
@@ -672,14 +802,18 @@ typedef struct Save {
   size_t nclose;
   GDEFSTOR_ModelItem * inserts;
   size_t ninsert;
+  GDEFSTOR_ModelBlind * blinds;
+  size_t nblind;
 } Save;
 
 static void save_release(Save * s) {
   size_t i;
   for (i = 0; i < s->n; i++) {
     gcu_allocator_free(s->alloc, s->t[i].cols);
+    gcu_allocator_free(s->alloc, s->t[i].bl);
   }
   gcu_allocator_free(s->alloc, s->t);
+  gcu_allocator_free(s->alloc, s->blinds);
   gcu_allocator_free(s->alloc, s->base_idx);
   gcu_allocator_free(s->alloc, s->base_by_parent);
   gcu_allocator_free(s->alloc, s->used);
@@ -722,6 +856,15 @@ static GDEFSTOR_Result tgt_new(Save * s, uint64_t id, size_t field,
         x->ncols * sizeof *x->cols);
     if (x->cols == NULL) {
       return GDEFSTOR_ERR_OOM;
+    }
+    if (s->personal) {
+      x->bl = (GDEFSTOR_BlindVal *)gdefstor_mem0(s->alloc,
+          x->ncols * sizeof *x->bl);
+      if (x->bl == NULL) {
+        gcu_allocator_free(s->alloc, x->cols);
+        x->cols = NULL;
+        return GDEFSTOR_ERR_OOM;
+      }
     }
   }
   *out = s->n;
@@ -859,8 +1002,17 @@ static GDEFSTOR_Result resolve_node(Save * s, const GDEFSTOR_Tree * tree,
       col = s->type->f[cf].column;
     }
     f = &s->type->f[cf];
+    if (tv->blind.set && (f->flags & GDEFSTOR_FIELD_PERSONAL) == 0) {
+      /* A MAC indexes a personal value; on any other it would be a guess
+       * kept beside a plaintext. */
+      return GDEFSTOR_ERR_INVALID;
+    }
+    if (tv->blind.set && !gdefstor_model_has_blind(s->store)) {
+      return GDEFSTOR_ERR_UNSUPPORTED;
+    }
     if (f->eff_retired) {
-      /* Restating what is stored is allowed; changing it is not. */
+      /* Restating what is stored is allowed; changing it is not. A retired
+       * value writes no new version of its own, so a MAC on it is unused. */
       const Item * b = node_id == 0 ? NULL : base_item(s, node_id);
       GDEFSTOR_Value c = canon(f, &tv->v);
       if (b == NULL || b->group != s->t[ti].group ||
@@ -874,6 +1026,9 @@ static GDEFSTOR_Result resolve_node(Save * s, const GDEFSTOR_Tree * tree,
       return rc;
     }
     s->t[ti].cols[col] = canon(f, &tv->v);
+    if (tv->blind.set && s->t[ti].bl != NULL) {
+      s->t[ti].bl[col] = tv->blind;
+    }
   }
   for (k = 0; k < n->nkids; k++) {
     const GDEFSTOR_TreeNode * kid = &tree->items[n->kids[k]];
@@ -1003,6 +1158,11 @@ static GDEFSTOR_Result carry_retired(Save * s) {
         size_t cf = s->type->col_field[s->type->col_base[x->group] + c];
         if (s->type->f[cf].eff_retired) {
           x->cols[c] = *base_col(b, c);
+          if (x->bl != NULL) {
+            /* Whatever MAC came with the tree or a revert was of another
+             * value; carry_blind() gives this one its own. */
+            memset(&x->bl[c], 0, sizeof x->bl[c]);
+          }
         }
       }
       item = b->item;
@@ -1309,14 +1469,87 @@ static int item_same(const Save * s, const Tgt * x, const Item * b) {
   return b->nvals <= x->ncols;
 }
 
-/* The closes and inserts that take the current versions to the targets. */
+/* The field of column @p c of group @p g. */
+static const GDEFSTOR_MField * col_field(const GDEFSTOR_Type * t, uint32_t g,
+    uint32_t c) {
+  return &t->f[t->col_field[t->col_base[g] + c]];
+}
+
+/* A personal value an item carries into its next version unchanged keeps its
+ * blind row: the current version's MAC goes with it, unless the tree gave
+ * one. The value is the same ciphertext and subject, so the same plaintext,
+ * and its MAC is the same MAC. */
+static void carry_blind(Save * s) {
+  size_t i;
+  for (i = 0; i < s->n; i++) {
+    Tgt * x = &s->t[i];
+    const Item * b;
+    uint32_t c;
+    if (x->bl == NULL || x->base == GDEFSTOR_NONE) {
+      continue;
+    }
+    b = &s->base.v[x->base];
+    for (c = 0; c < x->ncols; c++) {
+      const GDEFSTOR_MField * f = col_field(s->type, x->group, c);
+      const GDEFSTOR_BlindVal * was;
+      if (x->bl[c].set || x->cols[c].type == 0 ||
+          (f->flags & GDEFSTOR_FIELD_PERSONAL) == 0 ||
+          !gdefstor_model_value_equal(&x->cols[c], base_col(b, c))) {
+        continue;
+      }
+      was = blind_of(&s->base, b->item, b->from, f->id);
+      if (was != NULL) {
+        x->bl[c] = *was;
+      }
+    }
+  }
+}
+
+/* The blind rows of one new version: one per personal value with a MAC. */
+static void blinds_of(Save * s, const Tgt * x, int count_only, size_t * n) {
+  uint32_t c;
+  for (c = 0; x->bl != NULL && c < x->ncols; c++) {
+    const GDEFSTOR_MField * f = col_field(s->type, x->group, c);
+    GDEFSTOR_ModelBlind * o;
+    if (!x->bl[c].set || x->cols[c].type == 0 ||
+        (f->flags & GDEFSTOR_FIELD_PERSONAL) == 0) {
+      continue;
+    }
+    if (count_only) {
+      *n += 1;
+      continue;
+    }
+    o = &s->blinds[s->nblind];
+    memset(o, 0, sizeof *o);
+    o->item = x->id;
+    o->field = f->id;
+    o->subject = x->cols[c].subject;
+    o->subject_len = x->cols[c].subject_len;
+    o->mac = x->bl[c].mac;
+    o->key_id = x->bl[c].key_id;
+    o->version = x->bl[c].version;
+    s->nblind += 1;
+  }
+}
+
+/* The closes and inserts that take the current versions to the targets, and
+ * the blind rows of the inserts. */
 static GDEFSTOR_Result diff_rows(Save * s) {
   size_t i;
+  size_t nbl = 0;
+  if (s->personal) {
+    carry_blind(s);
+    for (i = 0; i < s->n; i++) {
+      blinds_of(s, &s->t[i], 1, &nbl);
+    }
+  }
   s->closes = (GDEFSTOR_ModelClose *)gdefstor_mem0(s->alloc,
       (s->base.n + 1) * sizeof *s->closes);
   s->inserts = (GDEFSTOR_ModelItem *)gdefstor_mem0(s->alloc,
       (s->n + 1) * sizeof *s->inserts);
-  if (s->closes == NULL || s->inserts == NULL) {
+  s->blinds = (GDEFSTOR_ModelBlind *)gdefstor_mem0(s->alloc,
+      (nbl + 1) * sizeof *s->blinds);
+  if (s->closes == NULL || s->inserts == NULL || s->blinds == NULL) {
     return GDEFSTOR_ERR_OOM;
   }
   for (i = 0; i < s->n; i++) {
@@ -1325,6 +1558,7 @@ static GDEFSTOR_Result diff_rows(Save * s) {
     if (x->base != GDEFSTOR_NONE) {
       const Item * b = &s->base.v[x->base];
       if (item_same(s, x, b)) {
+        /* Unchanged: no new version, so no blind row either. */
         continue;
       }
       s->closes[s->nclose].group = b->group;
@@ -1340,6 +1574,7 @@ static GDEFSTOR_Result diff_rows(Save * s) {
     ins->values = x->cols;
     ins->value_count = x->ncols;
     s->ninsert += 1;
+    blinds_of(s, x, 0, NULL);
   }
   for (i = 0; i < s->base.n; i++) {
     if (!s->used[i]) {
@@ -1363,10 +1598,13 @@ static GDEFSTOR_Result save_begin(Save * s, GDEFSTOR_Store * store,
   s->alloc = store->alloc;
   s->type = type;
   s->id_cap = id_cap;
+  s->personal = gdefstor_model_has_personal(type) &&
+                gdefstor_model_has_blind(store);
   s->base.alloc = store->alloc;
   s->next_item = e->last_item;
   if (e->row != 0 && e->revision != 0) {
-    rc = load_items(store, txn, tenant, tenant_len, e->row, 0, &s->base);
+    rc = load_items(store, txn, tenant, tenant_len, e->row, 0, s->personal,
+        &s->base);
     if (rc != GDEFSTOR_OK) {
       return rc;
     }
@@ -1459,11 +1697,17 @@ static GDEFSTOR_Result save_apply(Save * s, GDEFSTOR_Write * write,
   a.close_count = s->nclose;
   a.inserts = s->inserts;
   a.insert_count = s->ninsert;
+  a.blinds = s->nblind == 0 ? NULL : s->blinds;
+  a.blind_count = s->nblind;
   {
     size_t i;
     for (i = 0; i < s->ninsert; i++) {
       s->inserts[i].valid_from = r.revision;
       s->inserts[i].valid_to = 0;
+    }
+    /* A blind row indexes the version written in this same apply. */
+    for (i = 0; i < s->nblind; i++) {
+      s->blinds[i].valid_from = r.revision;
     }
   }
   rc = write->store->model.apply(write->store->model.ctx, txn, &a);
@@ -1591,7 +1835,7 @@ GDEFSTOR_Result gdefstor_entity_revert(GDEFSTOR_Write * write,
   }
   if (rc == GDEFSTOR_OK) {
     rc = load_items(write->store, txn, write->tenant, write->tenant_len, e.row,
-        to_revision, &old);
+        to_revision, s.personal, &old);
   }
   if (rc == GDEFSTOR_OK) {
     rc = gdefstor_model_sort(s.alloc, old.n, by_parent_id, old.v, &by_parent);
@@ -1651,6 +1895,20 @@ GDEFSTOR_Result gdefstor_entity_revert(GDEFSTOR_Write * write,
       s.t[ti].order = x->order;
       for (c = 0; c < s.t[ti].ncols; c++) {
         s.t[ti].cols[c] = *base_col(x, c);
+      }
+      /* The old values come back with the blind rows they had (those of a
+       * subject erased since are gone, and are not brought back). */
+      for (c = 0; s.t[ti].bl != NULL && c < s.t[ti].ncols; c++) {
+        const GDEFSTOR_MField * f = col_field(type, x->group, c);
+        const GDEFSTOR_BlindVal * was;
+        if ((f->flags & GDEFSTOR_FIELD_PERSONAL) == 0 ||
+            s.t[ti].cols[c].type == 0) {
+          continue;
+        }
+        was = blind_of(&old, x->item, x->from, f->id);
+        if (was != NULL) {
+          s.t[ti].bl[c] = *was;
+        }
       }
       if (find_id(s.base.v, s.base_idx, s.base.n, x->item) == GDEFSTOR_NONE) {
         /* Brought back: its retired columns are not restored either. */
@@ -1910,7 +2168,7 @@ GDEFSTOR_Result gdefstor_entity_tree(GDEFSTOR_Store * store,
   }
   if (rc == GDEFSTOR_OK) {
     /* 0 reads the current tables; a number reads history. */
-    rc = load_items(store, NULL, tenant, tenant_len, e.row, revision, &it);
+    rc = load_items(store, NULL, tenant, tenant_len, e.row, revision, 0, &it);
   }
   if (rc == GDEFSTOR_OK) {
     rc = build_tree(store->alloc, type, &it, out_tree);
@@ -2212,10 +2470,10 @@ GDEFSTOR_Result gdefstor_entity_diff(GDEFSTOR_Store * store,
   }
   /* Revision 0 is the empty tree; for the backend 0 would mean "current". */
   if (rc == GDEFSTOR_OK && from > 0) {
-    rc = load_items(store, NULL, tenant, tenant_len, e.row, from, &a);
+    rc = load_items(store, NULL, tenant, tenant_len, e.row, from, 0, &a);
   }
   if (rc == GDEFSTOR_OK && to > 0) {
-    rc = load_items(store, NULL, tenant, tenant_len, e.row, to, &b);
+    rc = load_items(store, NULL, tenant, tenant_len, e.row, to, 0, &b);
   }
   if (rc == GDEFSTOR_OK) {
     rc = sort_by_id(store->alloc, a.v, a.n, &ia);
@@ -2862,6 +3120,25 @@ static GDEFSTOR_Result dump_draft(void * ctx, const GDEFSTOR_ModelDraft * d) {
   return l->rc;
 }
 
+static GDEFSTOR_Result dump_blind(void * ctx, uint64_t row,
+    const GDEFSTOR_ModelBlind * b) {
+  Lines * l = (Lines *)ctx;
+  if (b->mac == NULL) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  l_str(l, "B");
+  l_u64(l, row);
+  l_u64(l, b->item);
+  l_u64(l, b->valid_from);
+  l_u64(l, b->field);
+  l_hex(l, b->subject, b->subject_len);
+  l_hex(l, b->mac, GDEFSTOR_BLIND_MAC_BYTES);
+  l_u64(l, b->key_id);
+  l_u64(l, b->version);
+  l_end(l);
+  return l->rc;
+}
+
 static int line_cmp(const void * ctx, size_t a, size_t b) {
   const Lines * l = (const Lines *)ctx;
   size_t n = l->lens[a] < l->lens[b] ? l->lens[a] : l->lens[b];
@@ -2900,6 +3177,9 @@ GDEFSTOR_Result gdefstor_model_dump(GDEFSTOR_Store * store,
   v.revision = dump_revision;
   v.item = dump_item;
   v.draft = dump_draft;
+  if (gdefstor_model_has_blind(store)) {
+    v.blind = dump_blind;
+  }
   rc = store->model.dump(store->model.ctx, tenant, tenant_len, which, &v);
   if (rc == GDEFSTOR_OK) {
     rc = l.rc;

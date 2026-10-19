@@ -279,6 +279,29 @@ static GDEFSTOR_Result check_node(Check * c, const GDEFSTOR_QueryNode * n,
     }
     return GDEFSTOR_OK;
   }
+  case GDEFSTOR_QUERY_BLIND: {
+    /* Blind-index equality: a personal field of the entity this node is
+     * decided on, and one MAC. */
+    const GDEFSTOR_QueryOperand * l = &n->left;
+    const GDEFSTOR_QueryOperand * r = &n->right;
+    const GDEFSTOR_MField * f;
+    size_t fi;
+    if (n->child_count != 0 || l->kind != GDEFSTOR_QUERY_FIELD ||
+        l->flags != 0 || r->kind != GDEFSTOR_QUERY_CONST || r->flags != 0 ||
+        r->text_count != 1 || r->texts == NULL || r->texts[0].bytes == NULL ||
+        r->texts[0].len != GDEFSTOR_BLIND_MAC_BYTES || l->field == NULL ||
+        l->field_len == 0 ||
+        gdefstor_type_find(here, l->field, l->field_len, &fi) != GDEFSTOR_OK) {
+      return GDEFSTOR_ERR_INVALID;
+    }
+    f = &here->f[fi];
+    if (f->type == GDEFSTOR_FIELD_GROUP || f->eff_retired ||
+        (f->flags & GDEFSTOR_FIELD_PERSONAL) == 0) {
+      return GDEFSTOR_ERR_INVALID;
+    }
+    return gdefstor_model_has_blind(c->store) ? GDEFSTOR_OK
+                                              : GDEFSTOR_ERR_UNSUPPORTED;
+  }
   default:
     return GDEFSTOR_ERR_INVALID;
   }
@@ -437,9 +460,19 @@ void gdefstor_model_hits_release(const GDEFSTOR_Allocator * alloc,
 /* One entity and its current items, owned. */
 typedef struct SItem {
   uint32_t group;
+  uint64_t item;
+  uint64_t from;
   GDEFSTOR_Value * vals;
   size_t nvals;
 } SItem;
+
+/* One blind row of an entity: the version and field it indexes, its MAC. */
+typedef struct SBlind {
+  uint64_t item;
+  uint64_t from;
+  uint32_t field;
+  uint8_t mac[GDEFSTOR_BLIND_MAC_BYTES];
+} SBlind;
 
 typedef struct Snap {
   uint64_t row;
@@ -454,6 +487,9 @@ typedef struct Snap {
   SItem * items;
   size_t nitems;
   size_t capitems;
+  SBlind * blinds; /* read only when the query has a blind node */
+  size_t nblinds;
+  size_t capblinds;
 } Snap;
 
 typedef struct Hit {
@@ -498,6 +534,7 @@ static void snap_release(const GDEFSTOR_Allocator * alloc, Snap * s) {
     gcu_allocator_free(alloc, s->items[i].vals);
   }
   gcu_allocator_free(alloc, s->items);
+  gcu_allocator_free(alloc, s->blinds);
   gcu_allocator_free(alloc, s->pid);
   gcu_allocator_free(alloc, s->creator);
   memset(s, 0, sizeof *s);
@@ -638,6 +675,48 @@ static GDEFSTOR_Result eval(Engine * e, const GDEFSTOR_QueryNode * n,
     const GDEFSTOR_Type * here, const Snap * snap, const Snap * outer,
     int * out);
 
+/* Blind equality: some current item of the field's group has a value whose
+ * version (the item and its valid_from) has a blind row of this field with
+ * this MAC. A blind row of an older version of the item does not count. */
+static GDEFSTOR_Result eval_blind(const GDEFSTOR_QueryNode * n,
+    const GDEFSTOR_Type * here, const Snap * snap, int * out) {
+  const uint8_t * mac = n->right.texts[0].bytes;
+  const GDEFSTOR_MField * f;
+  uint32_t group;
+  uint32_t col;
+  size_t fi;
+  size_t i;
+  size_t k;
+  *out = 0;
+  if (gdefstor_type_find(here, n->left.field, n->left.field_len, &fi) !=
+      GDEFSTOR_OK) {
+    return GDEFSTOR_ERR_INTERNAL;
+  }
+  f = &here->f[fi];
+  if ((f->flags & GDEFSTOR_FIELD_MULTIPLE) != 0) {
+    group = f->group;
+    col = 0;
+  } else {
+    group = f->in_group;
+    col = f->column;
+  }
+  for (i = 0; i < snap->nitems && !*out; i++) {
+    const SItem * it = &snap->items[i];
+    if (it->group != group || col >= it->nvals || it->vals[col].type == 0) {
+      continue;
+    }
+    for (k = 0; k < snap->nblinds; k++) {
+      const SBlind * b = &snap->blinds[k];
+      if (b->item == it->item && b->from == it->from && b->field == f->id &&
+          memcmp(b->mac, mac, GDEFSTOR_BLIND_MAC_BYTES) == 0) {
+        *out = 1;
+        break;
+      }
+    }
+  }
+  return GDEFSTOR_OK;
+}
+
 static GDEFSTOR_Result eval_exists(Engine * e, const GDEFSTOR_QueryNode * n,
     const Snap * snap, int * out) {
   size_t k = e->exists_at;
@@ -728,6 +807,8 @@ static GDEFSTOR_Result eval(Engine * e, const GDEFSTOR_QueryNode * n,
   }
   case GDEFSTOR_QUERY_EXISTS:
     return eval_exists(e, n, snap, out);
+  case GDEFSTOR_QUERY_BLIND:
+    return eval_blind(n, here, snap, out);
   default: {
     Set l;
     Set r;
@@ -916,6 +997,8 @@ static GDEFSTOR_Result on_item(void * ctx, uint64_t row,
   it = &s->items[s->nitems];
   memset(it, 0, sizeof *it);
   it->group = i->group;
+  it->item = i->item;
+  it->from = i->valid_from;
   if (i->value_count > 0) {
     it->vals = (GDEFSTOR_Value *)gdefstor_mem0(e->alloc,
         i->value_count * sizeof *it->vals);
@@ -935,6 +1018,50 @@ static GDEFSTOR_Result on_item(void * ctx, uint64_t row,
   return GDEFSTOR_OK;
 }
 
+static GDEFSTOR_Result on_blind(void * ctx, uint64_t row,
+    const GDEFSTOR_ModelBlind * b) {
+  Engine * e = (Engine *)ctx;
+  Snap * s = &e->cur;
+  SBlind * o;
+  if (!e->have_cur || row != s->row || b->mac == NULL) {
+    return GDEFSTOR_ERR_INTERNAL;
+  }
+  if (s->nblinds == s->capblinds) {
+    size_t grown = s->capblinds == 0 ? 4 : s->capblinds * 2;
+    SBlind * next = (SBlind *)gcu_allocator_realloc(e->alloc, s->blinds,
+        grown * sizeof *next);
+    if (next == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    s->blinds = next;
+    s->capblinds = grown;
+  }
+  o = &s->blinds[s->nblinds];
+  o->item = b->item;
+  o->from = b->valid_from;
+  o->field = b->field;
+  memcpy(o->mac, b->mac, GDEFSTOR_BLIND_MAC_BYTES);
+  s->nblinds += 1;
+  return GDEFSTOR_OK;
+}
+
+/* Whether a tree asks blind equality anywhere: only then are blind rows read. */
+static int has_blind_node(const GDEFSTOR_QueryNode * n) {
+  size_t i;
+  if (n == NULL) {
+    return 0;
+  }
+  if (n->op == GDEFSTOR_QUERY_BLIND) {
+    return 1;
+  }
+  for (i = 0; i < n->child_count; i++) {
+    if (has_blind_node(n->children[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static GDEFSTOR_Result scan_type(Engine * e, const GDEFSTOR_Type * t,
     Inner * into) {
   GDEFSTOR_ModelVisitor v;
@@ -943,6 +1070,9 @@ static GDEFSTOR_Result scan_type(Engine * e, const GDEFSTOR_Type * t,
   v.ctx = e;
   v.entity = on_entity;
   v.item = on_item;
+  if (has_blind_node(e->plan->query->where)) {
+    v.blind = on_blind;
+  }
   e->into = into;
   e->have_cur = 0;
   rc = e->scan(e->scan_ctx, t->name, t->name_len, &v);

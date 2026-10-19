@@ -99,6 +99,12 @@ What it supports:
   satisfies the child, whose `OUTER` operands read the entity being decided:
   `EXISTS site.customer (ENTITY = OUTER customer and vip = true)`. One level;
   a relation is one of these.
+- `BLIND`, blind-index equality: a personal field (no `OUTER`) and one
+  `CONST` text of exactly 32 bytes, a MAC. It holds when some current item of
+  the field's group has a value whose current version has a blind row with
+  that MAC; a MAC of an older version does not match (`model.md`, "The blind
+  index and subjects"). A store whose backend keeps no blind table refuses it
+  `GDEFSTOR_ERR_UNSUPPORTED`.
 - A sort of up to four keys, each a single scalar field of the root group, a
   `META` fact or the public id, ascending or descending. No value sorts
   before every value. The final tiebreak is the entity's row, ascending even
@@ -108,10 +114,12 @@ What it supports:
 
 What it refuses, with `GDEFSTOR_ERR_INVALID` unless a limit says otherwise:
 a type never declared; a path that is not an active scalar field (a group, a
-retired field, a field that does not exist); a personal field anywhere (its
-value is ciphertext; blind-index equality is not built); sides of different
+retired field, a field that does not exist); a personal field anywhere but
+in `BLIND` (its value is ciphertext: never compared, ranged or sorted), and a
+`BLIND` on anything else or with a MAC of another length; sides of different
 types; an ordered comparison on text, references or booleans; `in` without a
-constant list; `COLUMN` and `CONST` (the projection form's operands); flags
+constant list; `COLUMN` and `CONST` (the projection form's operands) outside
+`BLIND`; flags
 other than `OUTER`; `OUTER` outside an `EXISTS`; an `EXISTS` inside another;
 a sort on a nested or multiple field, or with `numeric`; select columns;
 `entity_numeric`. The caps above are `GDEFSTOR_ERR_LIMIT`.

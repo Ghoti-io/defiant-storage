@@ -460,6 +460,9 @@ struct Node {
   uint64_t id = 0;
   std::map<std::string, Val> vals;                 /* "" is an item's own value */
   std::map<std::string, std::vector<Node>> kids;   /* by field, in order */
+  /* Blind-index MACs to give values when the tree is built; never read back,
+   * so not part of what a tree is. */
+  std::map<std::string, std::string> macs;
 
   /* An empty list of items under a field is no items: the same tree. */
   bool operator==(const Node & o) const {
@@ -483,6 +486,12 @@ struct Node {
 
   Node & Set(const std::string & field, const GDEFSTOR_Value & v) {
     vals[field] = Val::From(v);
+    macs.erase(field);
+    return *this;
+  }
+  /* Give the value of @p field its MAC (set the value first). */
+  Node & Mac(const std::string & field, const std::string & mac) {
+    macs[field] = mac;
     return *this;
   }
   Node & Add(const std::string & field, Node n) {
@@ -540,11 +549,26 @@ inline Node One(const GDEFSTOR_Value & v, uint64_t id = 0) {
   return n;
 }
 
+/* The key id and normalization version every MAC of the suite is given. */
+const uint32_t kMacKey = 7;
+const uint32_t kMacVersion = 2;
+
 inline void Emit(GDEFSTOR_Tree * t, size_t at, const Node & n) {
   for (const auto & kv : n.vals) {
     GDEFSTOR_Value v = kv.second.Lend();
     ASSERT_EQ(GDEFSTOR_OK, gdefstor_tree_set(t, at, kv.first.data(),
         kv.first.size(), &v));
+  }
+  for (const auto & kv : n.macs) {
+    GDEFSTOR_BlindMac m;
+    std::memset(&m, 0, sizeof m);
+    m.size = sizeof m;
+    m.mac = reinterpret_cast<const uint8_t *>(kv.second.data());
+    m.mac_len = kv.second.size();
+    m.key_id = kMacKey;
+    m.version = kMacVersion;
+    ASSERT_EQ(GDEFSTOR_OK, gdefstor_tree_set_blind(t, at, kv.first.data(),
+        kv.first.size(), &m));
   }
   for (const auto & kv : n.kids) {
     for (const Node & k : kv.second) {
@@ -1856,6 +1880,22 @@ struct Q {
   std::deque<std::vector<const GDEFSTOR_QueryNode *>> kids;
   std::deque<std::vector<GDEFSTOR_Value>> vals;
   std::deque<std::string> strs;
+  std::deque<GDEFSTOR_QueryText> texts;
+
+  /* The right side of a blind-equality node: one MAC. */
+  GDEFSTOR_QueryOperand Mac(const std::string & mac) {
+    strs.push_back(mac);
+    GDEFSTOR_QueryText t;
+    t.bytes = reinterpret_cast<const uint8_t *>(strs.back().data());
+    t.len = strs.back().size();
+    texts.push_back(t);
+    GDEFSTOR_QueryOperand o;
+    std::memset(&o, 0, sizeof o);
+    o.kind = GDEFSTOR_QUERY_CONST;
+    o.texts = &texts.back();
+    o.text_count = 1;
+    return o;
+  }
 
   GDEFSTOR_QueryOperand Field(const std::string & path, bool outer = false) {
     strs.push_back(path);
@@ -2327,6 +2367,907 @@ TEST_F(ModelDerived, RebuildGivesTheSameCurrentState) {
   EXPECT_EQ(Ids({"po2"}, 1), before[1]);
 }
 
+/* ---- the blind index and subjects (AD-14, AD-19) ------------------------- */
+
+/* Stands in for an HMAC-SHA-256 under a tenant key: 32 bytes that depend on
+ * the plaintext alone. Storage compares them for equality and nothing else. */
+inline std::string MacOf(const std::string & plain) {
+  std::string m(GDEFSTOR_BLIND_MAC_BYTES, '\0');
+  uint64_t h = UINT64_C(1469598103934665603);
+  for (size_t i = 0; i < m.size(); i++) {
+    for (char c : plain) {
+      h ^= static_cast<unsigned char>(c);
+      h *= UINT64_C(1099511628211);
+    }
+    h ^= i + 1;
+    h *= UINT64_C(1099511628211);
+    m[i] = static_cast<char>(h >> 56);
+  }
+  return m;
+}
+
+inline std::string HexOf(const std::string & b) {
+  static const char hex[] = "0123456789abcdef";
+  std::string out;
+  for (unsigned char c : b) {
+    out += hex[c >> 4];
+    out += hex[c & 0xF];
+  }
+  return out;
+}
+
+const char * const kMember = "site.member";
+const char * const kGift = "site.gift";
+
+/* A personal name of the entity's own subject, a plain tag, and a multiple
+ * group of contacts each holding a multiple personal field: the design's
+ * "multiples and groups" for blind equality. */
+inline std::vector<Field> MemberType() {
+  return {F("name", GDEFSTOR_FIELD_TEXT, GDEFSTOR_FIELD_PERSONAL),
+      F("tag", GDEFSTOR_FIELD_TEXT),
+      G("contacts", GDEFSTOR_FIELD_MULTIPLE,
+          {F("label", GDEFSTOR_FIELD_TEXT),
+              F("emails", GDEFSTOR_FIELD_TEXT,
+                  GDEFSTOR_FIELD_PERSONAL | GDEFSTOR_FIELD_MULTIPLE)})};
+}
+
+/* A personal note whose subject is the donor reference. */
+inline std::vector<Field> GiftType() {
+  Field note = F("note", GDEFSTOR_FIELD_TEXT, GDEFSTOR_FIELD_PERSONAL);
+  note.subject = "donor";
+  return {F("donor", GDEFSTOR_FIELD_REFERENCE), note,
+      F("amount", GDEFSTOR_FIELD_DECIMAL, 0, 2)};
+}
+
+class ModelBlind : public ModelSave {
+ protected:
+  int nonce = 0;
+
+  void SetUp() override {
+    ModelSave::SetUp();
+    ASSERT_EQ(GDEFSTOR_OK, Declare(kMember, MemberType()));
+    ASSERT_EQ(GDEFSTOR_OK, Declare(kGift, GiftType()));
+  }
+
+  /* @p plain, freshly encrypted (a new ciphertext every time, as AEAD with a
+   * fresh nonce gives), with its MAC. */
+  void Seal(Node & n, const std::string & field, const std::string & plain,
+      const std::string & subject) {
+    std::string c = "sealed:" + plain + ":" + std::to_string(++nonce);
+    n.Set(field, Personal(GDEFSTOR_FIELD_TEXT, c.c_str(), subject.c_str()));
+    n.Mac(field, MacOf(plain));
+  }
+
+  Node Email(const std::string & plain, const std::string & subject) {
+    Node e;
+    Seal(e, "", plain, subject);
+    return e;
+  }
+
+  /* m<i>: name, tag, and contacts {label: [emails]}. */
+  Node MemberTree(const std::string & name, const std::string & subject,
+      const std::string & tag,
+      const std::vector<std::pair<std::string, std::vector<std::string>>> &
+          contacts = {}) {
+    Node n;
+    if (!name.empty()) {
+      Seal(n, "name", name, subject);
+    }
+    n.Set("tag", Text(tag.c_str()));
+    for (const auto & c : contacts) {
+      Node & k = n.Add("contacts");
+      k.Set("label", Text(c.first.c_str()));
+      for (const std::string & e : c.second) {
+        k.Add("emails", Email(e, subject));
+      }
+    }
+    return n;
+  }
+
+  Node GiftTree(const std::string & donor, const std::string & note) {
+    Node n;
+    n.Set("donor", Ref(donor.c_str())).Set("amount", Decimal(100));
+    Seal(n, "note", note, donor);
+    return n;
+  }
+
+  void Put(const char * type, const std::string & pid, const Node & n,
+      uint64_t base = 0) {
+    if (base == 0) {
+      ASSERT_EQ(GDEFSTOR_OK, Create(type, pid));
+    }
+    GDEFSTOR_Tree * t = Build(n);
+    uint64_t rev = 0;
+    ASSERT_EQ(GDEFSTOR_OK, Save(pid, base, t, &rev));
+    gdefstor_tree_free(t);
+    ASSERT_EQ(base + 1, rev);
+  }
+
+  Answer Blind(const char * type, const char * field, const std::string & plain) {
+    Q q;
+    return Ask(store, type, q.Cmp(GDEFSTOR_QUERY_BLIND, q.Field(field),
+        q.Mac(MacOf(plain))));
+  }
+
+  /* "pid from-to subject" per value version, in the port's order. */
+  std::vector<std::string> History(const char * type, const char * field,
+      const std::string & plain) {
+    std::vector<std::string> out;
+    GDEFSTOR_BlindHits * h = nullptr;
+    std::string mac = MacOf(plain);
+    GDEFSTOR_Result rc = gdefstor_blind_history(store, kTenant, 2, type,
+        std::strlen(type), field, std::strlen(field),
+        reinterpret_cast<const uint8_t *>(mac.data()), mac.size(), &h);
+    EXPECT_EQ(GDEFSTOR_OK, rc);
+    for (size_t i = 0; i < gdefstor_blind_hits_count(h); i++) {
+      GDEFSTOR_BlindHit x;
+      std::memset(&x, 0, sizeof x);
+      x.size = sizeof x;
+      EXPECT_EQ(GDEFSTOR_OK, gdefstor_blind_hit(h, i, &x));
+      EXPECT_EQ(kMacKey, x.key_id);
+      EXPECT_EQ(kMacVersion, x.version);
+      out.push_back(std::string(x.public_id, x.public_id_len) + " " +
+          std::to_string(x.valid_from) + "-" + std::to_string(x.valid_to) +
+          " " + std::string(reinterpret_cast<const char *>(x.subject),
+                    x.subject_len));
+    }
+    gdefstor_blind_hits_free(h);
+    return out;
+  }
+
+  /* "type pid field from-to" per value version, in the port's order. */
+  std::vector<std::string> Subject(const std::string & subject) {
+    std::vector<std::string> out;
+    GDEFSTOR_SubjectHits * h = nullptr;
+    EXPECT_EQ(GDEFSTOR_OK, gdefstor_subject_lookup(store, kTenant, 2,
+        subject.data(), subject.size(), &h));
+    for (size_t i = 0; i < gdefstor_subject_hits_count(h); i++) {
+      GDEFSTOR_SubjectHit x;
+      std::memset(&x, 0, sizeof x);
+      x.size = sizeof x;
+      EXPECT_EQ(GDEFSTOR_OK, gdefstor_subject_hit(h, i, &x));
+      out.push_back(std::string(x.type, x.type_len) + " " +
+          std::string(x.public_id, x.public_id_len) + " " +
+          std::string(x.field, x.field_len) + " " +
+          std::to_string(x.valid_from) + "-" + std::to_string(x.valid_to));
+    }
+    gdefstor_subject_hits_free(h);
+    return out;
+  }
+
+  GDEFSTOR_Result DeleteSubject(const std::string & subject) {
+    return InWrite([&](GDEFSTOR_Write * w) {
+      return gdefstor_blind_delete_subject(w, subject.data(), subject.size());
+    });
+  }
+
+  std::vector<std::string> BlindRows() {
+    return Lines(Dump(GDEFSTOR_MODEL_TRUTH), 'B');
+  }
+
+  /* Every line of both dumps but the blind rows. */
+  std::string NotBlind() {
+    std::string out;
+    for (int which : {GDEFSTOR_MODEL_TRUTH, GDEFSTOR_MODEL_CURRENT}) {
+      std::istringstream in(Dump(which));
+      std::string line;
+      while (std::getline(in, line)) {
+        if (!line.empty() && line[0] != 'B') {
+          out += line + "\n";
+        }
+      }
+    }
+    return out;
+  }
+};
+
+TEST_F(ModelBlind, ASaveWritesOneBlindRowPerPersonalValueVersion) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x", {{"home", {"a@x", "b@x"}}}));
+  std::string truth = Dump(GDEFSTOR_MODEL_TRUTH);
+  std::vector<std::string> blind = Lines(truth, 'B');
+  /* The name and the two emails: three values, three rows. */
+  ASSERT_EQ(3u, blind.size()) << truth;
+  for (const std::string & b : blind) {
+    /* B row item from field subject mac key version */
+    std::vector<std::string> w = Words(b);
+    ASSERT_EQ(9u, w.size()) << b;
+    EXPECT_EQ("1", w[3]) << b;
+    EXPECT_EQ(HexOf("s1"), w[5]) << b;
+    EXPECT_EQ(std::to_string(kMacKey), w[7]) << b;
+    EXPECT_EQ(std::to_string(kMacVersion), w[8]) << b;
+    bool indexed = false;
+    for (const std::string & l : Lines(truth, 'I')) {
+      std::vector<std::string> v = Words(l);
+      indexed |= v[1] == w[1] && v[3] == w[2] && v[4] == w[3];
+    }
+    EXPECT_TRUE(indexed) << "a blind row without the version it indexes: " << b;
+  }
+  std::set<std::string> macs;
+  for (const std::string & b : blind) {
+    macs.insert(Words(b)[6]);
+  }
+  EXPECT_EQ((std::set<std::string>{HexOf(MacOf("ann")), HexOf(MacOf("a@x")),
+                HexOf(MacOf("b@x"))}),
+      macs);
+}
+
+TEST_F(ModelBlind, NoMacIsInARevisionGroupOrCurrentRow) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x", {{"home", {"a@x"}}}));
+  Put(kGift, "g1", GiftTree("s1", "thanks"));
+  Node now = Current("m1");
+  Seal(now, "name", "cy", "s1");
+  GDEFSTOR_Tree * t = Build(now);
+  ASSERT_EQ(GDEFSTOR_OK, Save("m1", 1, t));
+  gdefstor_tree_free(t);
+  std::string rest = NotBlind();
+  for (const char * p : {"ann", "a@x", "thanks", "cy"}) {
+    std::string mac = MacOf(p);
+    EXPECT_EQ(std::string::npos, rest.find(HexOf(mac)))
+        << "the MAC of " << p << " is outside the blind table:\n" << rest;
+    /* Nor in what a reader is handed. */
+    for (const char * pid : {"m1", "g1"}) {
+      Node n = Current(pid);
+      std::function<void(const Node &)> look = [&](const Node & x) {
+        for (const auto & kv : x.vals) {
+          EXPECT_EQ(std::string::npos, kv.second.b.find(mac)) << pid;
+        }
+        for (const auto & kv : x.kids) {
+          for (const Node & k : kv.second) {
+            look(k);
+          }
+        }
+      };
+      look(n);
+    }
+  }
+  EXPECT_EQ(4u, BlindRows().size());
+}
+
+TEST_F(ModelBlind, AFailedSaveWritesNoBlindRow) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x"));
+  std::vector<std::string> before = BlindRows();
+  std::string rest = NotBlind();
+  /* A stale base, a write that fails after its save, and a MAC on a field
+   * that is not personal each write neither the value nor its blind row. */
+  Node next = Current("m1");
+  Seal(next, "name", "bob", "s1");
+  GDEFSTOR_Tree * t = Build(next);
+  EXPECT_EQ(GDEFSTOR_ERR_CONFLICT, Save("m1", 0, t));
+  GDEFSTOR_RevisionMeta m = Meta();
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, InWrite([&](GDEFSTOR_Write * w) {
+    GDEFSTOR_Result rc = gdefstor_entity_save(w, "m1", 2, 1, &m, t, nullptr);
+    EXPECT_EQ(GDEFSTOR_OK, rc);
+    /* Then something in the same write is refused, and it aborts. */
+    return gdefstor_entity_create(w, kMember, std::strlen(kMember), "m1", 2,
+        "", 0, 1, nullptr);
+  }));
+  gdefstor_tree_free(t);
+  Node plain = Current("m1");
+  plain.Set("tag", Text("y")).Mac("tag", MacOf("y"));
+  t = Build(plain);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Save("m1", 1, t));
+  gdefstor_tree_free(t);
+  EXPECT_EQ(before, BlindRows());
+  EXPECT_EQ(rest, NotBlind());
+  EXPECT_EQ(1u, Head("m1"));
+}
+
+TEST_F(ModelBlind, AnUnchangedValueWritesNoBlindRow) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x", {{"home", {"a@x", "b@x"}}}));
+  std::string truth1 = Dump(GDEFSTOR_MODEL_TRUTH);
+  /* The same tree, read back, MACs or none: no revision, no row. */
+  Node same = Current("m1");
+  GDEFSTOR_Tree * t = Build(same);
+  uint64_t rev = 9;
+  ASSERT_EQ(GDEFSTOR_OK, Save("m1", 1, t, &rev));
+  gdefstor_tree_free(t);
+  EXPECT_EQ(0u, rev);
+  same.Mac("name", MacOf("ann"));
+  same.kids["contacts"][0].kids["emails"][0].Mac("", MacOf("a@x"));
+  t = Build(same);
+  ASSERT_EQ(GDEFSTOR_OK, Save("m1", 1, t, &rev));
+  gdefstor_tree_free(t);
+  EXPECT_EQ(0u, rev);
+  EXPECT_EQ(truth1, Dump(GDEFSTOR_MODEL_TRUTH));
+  /* The tag changes, so the root item gets a version; its name is the same
+   * value and keeps its blind row in that version. The emails are items of
+   * their own and do not change: no version, no row. */
+  Node tag = Current("m1");
+  tag.Set("tag", Text("y"));
+  t = Build(tag);
+  ASSERT_EQ(GDEFSTOR_OK, Save("m1", 1, t, &rev));
+  gdefstor_tree_free(t);
+  ASSERT_EQ(2u, rev);
+  std::string truth2 = Dump(GDEFSTOR_MODEL_TRUTH);
+  EXPECT_EQ(1u, NewRows(truth1, truth2, 'B')) << truth2;
+  for (const std::string & b : Lines(truth2, 'B')) {
+    std::vector<std::string> w = Words(b);
+    if (w[3] == "2") {
+      EXPECT_EQ(HexOf(MacOf("ann")), w[6]) << b;
+      EXPECT_EQ(std::to_string(tag.id), w[2]) << b;
+    }
+  }
+  /* A contact's label: its item changes, the emails under it do not. */
+  Node label = Current("m1");
+  label.kids["contacts"][0].Set("label", Text("work"));
+  t = Build(label);
+  ASSERT_EQ(GDEFSTOR_OK, Save("m1", 2, t, &rev));
+  gdefstor_tree_free(t);
+  ASSERT_EQ(3u, rev);
+  EXPECT_EQ(0u, NewRows(truth2, Dump(GDEFSTOR_MODEL_TRUTH), 'B'));
+  EXPECT_EQ(Ids({"m1"}, 1), Blind(kMember, "contacts.emails", "b@x"));
+}
+
+TEST_F(ModelBlind, EqualityMatchesOnlyTheCurrentVersion) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x"));
+  Put(kMember, "m2", MemberTree("bob", "s2", "x"));
+  EXPECT_EQ(Ids({"m1"}, 1), Blind(kMember, "name", "ann"));
+  EXPECT_EQ(Ids({"m2"}, 1), Blind(kMember, "name", "bob"));
+  EXPECT_EQ(Ids({}, 0), Blind(kMember, "name", "cy"));
+  Node next = Current("m1");
+  Seal(next, "name", "cy", "s1");
+  GDEFSTOR_Tree * t = Build(next);
+  ASSERT_EQ(GDEFSTOR_OK, Save("m1", 1, t));
+  gdefstor_tree_free(t);
+  /* The older version's MAC is history, not a match. */
+  EXPECT_EQ(Ids({}, 0), Blind(kMember, "name", "ann"));
+  EXPECT_EQ(Ids({"m1"}, 1), Blind(kMember, "name", "cy"));
+  uint64_t n = 9;
+  Q q;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_count(store, kTenant, 2, kMember,
+      std::strlen(kMember), q.Cmp(GDEFSTOR_QUERY_BLIND, q.Field("name"),
+          q.Mac(MacOf("ann"))), &n));
+  EXPECT_EQ(0u, n);
+  /* The history lookup finds it, with the revisions that held it. */
+  EXPECT_EQ(std::vector<std::string>({"m1 1-2 s1"}),
+      History(kMember, "name", "ann"));
+  EXPECT_EQ(std::vector<std::string>({"m1 2-0 s1"}),
+      History(kMember, "name", "cy"));
+  EXPECT_EQ(std::vector<std::string>({"m2 1-0 s2"}),
+      History(kMember, "name", "bob"));
+  EXPECT_TRUE(History(kMember, "name", "nobody").empty());
+}
+
+TEST_F(ModelBlind, MultiplesInANestedGroupMatchSomeItem) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x",
+      {{"home", {"a@x", "b@x"}}, {"work", {"c@x"}}}));
+  Put(kMember, "m2", MemberTree("bob", "s2", "x", {{"home", {"d@x"}}}));
+  EXPECT_EQ(Ids({"m1"}, 1), Blind(kMember, "contacts.emails", "b@x"));
+  EXPECT_EQ(Ids({"m1"}, 1), Blind(kMember, "contacts.emails", "c@x"));
+  EXPECT_EQ(Ids({"m2"}, 1), Blind(kMember, "contacts.emails", "d@x"));
+  /* A MAC of another field is not this field's. */
+  EXPECT_EQ(Ids({}, 0), Blind(kMember, "contacts.emails", "ann"));
+  EXPECT_EQ(Ids({}, 0), Blind(kMember, "name", "a@x"));
+  Node next = Current("m1");
+  auto & emails = next.kids["contacts"][0].kids["emails"];
+  emails.erase(emails.begin() + 1);
+  GDEFSTOR_Tree * t = Build(next);
+  ASSERT_EQ(GDEFSTOR_OK, Save("m1", 1, t));
+  gdefstor_tree_free(t);
+  EXPECT_EQ(Ids({}, 0), Blind(kMember, "contacts.emails", "b@x"));
+  EXPECT_EQ(Ids({"m1"}, 1), Blind(kMember, "contacts.emails", "a@x"));
+  EXPECT_EQ(std::vector<std::string>({"m1 1-2 s1"}),
+      History(kMember, "contacts.emails", "b@x"));
+  EXPECT_EQ(std::vector<std::string>({"m1 1-0 s1"}),
+      History(kMember, "contacts.emails", "a@x"));
+}
+
+TEST_F(ModelBlind, EqualityComposesWithEveryOtherClause) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x"));
+  Put(kMember, "m2", MemberTree("bob", "s2", "y"));
+  Put(kMember, "m3", MemberTree("ann", "s3", "y"));
+  Put(kGift, "g1", GiftTree("m1", "thanks"));
+  Put(kGift, "g2", GiftTree("m2", "thanks"));
+  Q q;
+  auto ann = [&]() {
+    return q.Cmp(GDEFSTOR_QUERY_BLIND, q.Field("name"), q.Mac(MacOf("ann")));
+  };
+  EXPECT_EQ(Ids({"m1", "m3"}, 2), Ask(store, kMember, ann()));
+  EXPECT_EQ(Ids({"m3"}, 1), Ask(store, kMember, q.Op(GDEFSTOR_QUERY_AND,
+      {ann(), q.Cmp(GDEFSTOR_QUERY_EQ, q.Field("tag"), q.Values({Text("y")}))})));
+  EXPECT_EQ(Ids({"m2"}, 1), Ask(store, kMember, q.Op(GDEFSTOR_QUERY_NOT,
+      {ann()})));
+  EXPECT_EQ(Ids({"m1", "m2", "m3"}, 3), Ask(store, kMember, q.Op(
+      GDEFSTOR_QUERY_OR, {ann(), q.Cmp(GDEFSTOR_QUERY_BLIND, q.Field("name"),
+          q.Mac(MacOf("bob")))})));
+  /* Sorted and paged like any other filter. */
+  EXPECT_EQ(Ids({"m3"}, 2), Ask(store, kMember, ann(),
+      {By(q.Field("tag"), true)}, 0, 1));
+  /* Inside a relation: gifts whose donor is a member named ann. */
+  EXPECT_EQ(Ids({"g1"}, 1), Ask(store, kGift, q.Op(GDEFSTOR_QUERY_EXISTS,
+      {q.Op(GDEFSTOR_QUERY_AND, {ann(), q.Cmp(GDEFSTOR_QUERY_EQ, q.Entity(),
+          q.Field("donor", true))})}, kMember)));
+  /* A personal field whose subject is a reference matches the same way. */
+  EXPECT_EQ(Ids({"g1", "g2"}, 2), Ask(store, kGift, q.Cmp(GDEFSTOR_QUERY_BLIND,
+      q.Field("note"), q.Mac(MacOf("thanks")))));
+}
+
+TEST_F(ModelBlind, PersonalFieldsAreMatchedOnlyBlind) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x", {{"home", {"a@x"}}}));
+  const GDEFSTOR_Result I = GDEFSTOR_ERR_INVALID;
+  Q q;
+  std::string mac = MacOf("ann");
+  /* Ciphertext is never compared, ranged or sorted. */
+  EXPECT_EQ(I, Ask(store, kMember, q.Cmp(GDEFSTOR_QUERY_EQ, q.Field("name"),
+      q.Values({Text("ann")}))).rc);
+  EXPECT_EQ(I, Ask(store, kMember, q.Cmp(GDEFSTOR_QUERY_LT, q.Field("name"),
+      q.Values({Text("ann")}))).rc);
+  EXPECT_EQ(I, Ask(store, kMember, nullptr, {By(q.Field("name"))}).rc);
+  /* Blind equality takes a personal scalar and exactly one whole MAC. */
+  EXPECT_EQ(I, Ask(store, kMember, q.Cmp(GDEFSTOR_QUERY_BLIND, q.Field("tag"),
+      q.Mac(mac))).rc);
+  EXPECT_EQ(I, Ask(store, kMember, q.Cmp(GDEFSTOR_QUERY_BLIND,
+      q.Field("contacts"), q.Mac(mac))).rc);
+  EXPECT_EQ(I, Ask(store, kMember, q.Cmp(GDEFSTOR_QUERY_BLIND, q.Field("name"),
+      q.Mac(mac.substr(1)))).rc);
+  EXPECT_EQ(I, Ask(store, kMember, q.Cmp(GDEFSTOR_QUERY_BLIND, q.Field("name"),
+      q.Values({Text("ann")}))).rc);
+  EXPECT_EQ(I, Ask(store, kMember, q.Cmp(GDEFSTOR_QUERY_BLIND, q.Field("nope"),
+      q.Mac(mac))).rc);
+  EXPECT_EQ(I, Ask(store, kGift, q.Op(GDEFSTOR_QUERY_EXISTS,
+      {q.Cmp(GDEFSTOR_QUERY_BLIND, q.Field("note", true), q.Mac(mac))},
+      kMember)).rc);
+  /* A MAC goes on a value that is set, and a whole one. */
+  GDEFSTOR_Tree * t = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_tree_create(nullptr, &t));
+  GDEFSTOR_BlindMac m;
+  std::memset(&m, 0, sizeof m);
+  m.size = sizeof m;
+  m.mac = reinterpret_cast<const uint8_t *>(mac.data());
+  m.mac_len = mac.size();
+  EXPECT_EQ(I, gdefstor_tree_set_blind(t, 0, "name", 4, &m));
+  GDEFSTOR_Value v = Personal(GDEFSTOR_FIELD_TEXT, "c", "s1");
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_tree_set(t, 0, "name", 4, &v));
+  m.mac_len = mac.size() - 1;
+  EXPECT_EQ(I, gdefstor_tree_set_blind(t, 0, "name", 4, &m));
+  m.mac_len = mac.size();
+  m.size = sizeof m - 1;
+  EXPECT_EQ(I, gdefstor_tree_set_blind(t, 0, "name", 4, &m));
+  m.size = sizeof m;
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_tree_set_blind(t, 0, "name", 4, &m));
+  gdefstor_tree_free(t);
+  /* The history lookup takes a personal field and a whole MAC. */
+  GDEFSTOR_BlindHits * h = nullptr;
+  const uint8_t * mb = reinterpret_cast<const uint8_t *>(mac.data());
+  EXPECT_EQ(I, gdefstor_blind_history(store, kTenant, 2, kMember, 11, "tag", 3,
+      mb, mac.size(), &h));
+  EXPECT_EQ(I, gdefstor_blind_history(store, kTenant, 2, kMember, 11, "name", 4,
+      mb, mac.size() - 1, &h));
+  EXPECT_EQ(I, gdefstor_blind_history(store, kTenant, 2, "site.none", 9,
+      "name", 4, mb, mac.size(), &h));
+  EXPECT_EQ(nullptr, h);
+  GDEFSTOR_SubjectHits * sh = nullptr;
+  EXPECT_EQ(I, gdefstor_subject_lookup(store, kTenant, 2, "not one", 7, &sh));
+  EXPECT_EQ(I, gdefstor_subject_lookup(store, kTenant, 2, "", 0, &sh));
+  EXPECT_EQ(nullptr, sh);
+  EXPECT_EQ(I, DeleteSubject("not one"));
+}
+
+TEST_F(ModelBlind, SubjectLookupFindsEveryValueAcrossTypesAndHistory) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x", {{"home", {"a@x"}}}));
+  Node next = Current("m1");
+  Seal(next, "name", "ann b", "s1");
+  next.kids["contacts"][0].Add("emails", Email("z@x", "s9"));
+  GDEFSTOR_Tree * t = Build(next);
+  ASSERT_EQ(GDEFSTOR_OK, Save("m1", 1, t));
+  gdefstor_tree_free(t);
+  Put(kGift, "g1", GiftTree("s1", "thanks"));
+  /* Values written with no MAC name their subject all the same. */
+  Node bare;
+  bare.Set("name", Personal(GDEFSTOR_FIELD_TEXT, "sealed", "s1"));
+  bare.Set("tag", Text("x"));
+  Put(kMember, "m2", bare);
+  EXPECT_EQ(std::vector<std::string>({"site.gift g1 note 1-0",
+                "site.member m1 name 1-2", "site.member m1 name 2-0",
+                "site.member m1 contacts.emails 1-0", "site.member m2 name 1-0"}),
+      Subject("s1"));
+  EXPECT_EQ(std::vector<std::string>({"site.member m1 contacts.emails 2-0"}),
+      Subject("s9"));
+  EXPECT_TRUE(Subject("s404").empty());
+}
+
+TEST_F(ModelBlind, DeletionRemovesASubjectsBlindRowsInEveryType) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x", {{"home", {"a@x"}}}));
+  Put(kMember, "m2", MemberTree("bob", "s2", "x", {{"home", {"b@x"}}}));
+  Put(kGift, "g1", GiftTree("s1", "thanks"));
+  Put(kGift, "g2", GiftTree("s2", "cheers"));
+  ASSERT_EQ(Ids({"m1"}, 1), Blind(kMember, "name", "ann"));
+  ASSERT_EQ(Ids({"g1"}, 1), Blind(kGift, "note", "thanks"));
+  std::string rest = NotBlind();
+  std::vector<std::string> subject = Subject("s1");
+  ASSERT_EQ(3u, subject.size());
+  ASSERT_EQ(GDEFSTOR_OK, DeleteSubject("s1"));
+  /* Neither blind equality nor history finds the subject, in either type. */
+  EXPECT_EQ(Ids({}, 0), Blind(kMember, "name", "ann"));
+  EXPECT_EQ(Ids({}, 0), Blind(kMember, "contacts.emails", "a@x"));
+  EXPECT_EQ(Ids({}, 0), Blind(kGift, "note", "thanks"));
+  EXPECT_TRUE(History(kMember, "name", "ann").empty());
+  EXPECT_TRUE(History(kMember, "contacts.emails", "a@x").empty());
+  EXPECT_TRUE(History(kGift, "note", "thanks").empty());
+  for (const std::string & b : BlindRows()) {
+    EXPECT_NE(HexOf("s1"), Words(b)[5]) << b;
+  }
+  /* Another subject's rows stay. */
+  EXPECT_EQ(Ids({"m2"}, 1), Blind(kMember, "name", "bob"));
+  EXPECT_EQ(Ids({"g2"}, 1), Blind(kGift, "note", "cheers"));
+  EXPECT_EQ(3u, BlindRows().size());
+  /* The ciphertext rows and the subject lookup are as they were. */
+  EXPECT_EQ(rest, NotBlind());
+  EXPECT_EQ(subject, Subject("s1"));
+  /* Twice is a no-op, and so is a subject with no row. */
+  std::string truth = Dump(GDEFSTOR_MODEL_TRUTH);
+  EXPECT_EQ(GDEFSTOR_OK, DeleteSubject("s1"));
+  EXPECT_EQ(GDEFSTOR_OK, DeleteSubject("s404"));
+  EXPECT_EQ(truth, Dump(GDEFSTOR_MODEL_TRUTH));
+  /* A value the subject keeps after erasure carries no row forward. */
+  Node tag = Current("m1");
+  tag.Set("tag", Text("y"));
+  GDEFSTOR_Tree * t = Build(tag);
+  ASSERT_EQ(GDEFSTOR_OK, Save("m1", 1, t));
+  gdefstor_tree_free(t);
+  EXPECT_EQ(3u, BlindRows().size());
+  EXPECT_EQ(Ids({}, 0), Blind(kMember, "name", "ann"));
+}
+
+TEST_F(ModelBlind, RebuildLeavesTheBlindTableAlone) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x", {{"home", {"a@x", "b@x"}}}));
+  Node next = Current("m1");
+  Seal(next, "name", "cy", "s1");
+  GDEFSTOR_Tree * t = Build(next);
+  ASSERT_EQ(GDEFSTOR_OK, Save("m1", 1, t));
+  gdefstor_tree_free(t);
+  Put(kGift, "g1", GiftTree("s2", "thanks"));
+  std::vector<std::string> rows = BlindRows();
+  std::vector<Answer> asks = {Blind(kMember, "name", "cy"),
+      Blind(kMember, "name", "ann"), Blind(kMember, "contacts.emails", "b@x"),
+      Blind(kGift, "note", "thanks")};
+  std::vector<std::vector<std::string>> history = {
+      History(kMember, "name", "ann"), History(kMember, "name", "cy")};
+  ASSERT_EQ(GDEFSTOR_OK, InWrite([&](GDEFSTOR_Write * w) {
+    return gdefstor_model_rebuild(w);
+  }));
+  EXPECT_EQ(rows, BlindRows());
+  EXPECT_EQ(asks[0], Blind(kMember, "name", "cy"));
+  EXPECT_EQ(asks[1], Blind(kMember, "name", "ann"));
+  EXPECT_EQ(asks[2], Blind(kMember, "contacts.emails", "b@x"));
+  EXPECT_EQ(asks[3], Blind(kGift, "note", "thanks"));
+  EXPECT_EQ(history[0], History(kMember, "name", "ann"));
+  EXPECT_EQ(history[1], History(kMember, "name", "cy"));
+  EXPECT_EQ(Ids({"m1"}, 1), asks[0]);
+}
+
+TEST_F(ModelBlind, ARevertBringsBackTheBlindRowsOfTheValuesItRestores) {
+  Put(kMember, "m1", MemberTree("ann", "s1", "x", {{"home", {"a@x"}}}));
+  Node next = Current("m1");
+  Seal(next, "name", "cy", "s1");
+  next.kids["contacts"].clear();
+  GDEFSTOR_Tree * t = Build(next);
+  ASSERT_EQ(GDEFSTOR_OK, Save("m1", 1, t));
+  gdefstor_tree_free(t);
+  ASSERT_EQ(Ids({}, 0), Blind(kMember, "name", "ann"));
+  ASSERT_EQ(GDEFSTOR_OK, Revert("m1", 2, 1));
+  EXPECT_EQ(Ids({"m1"}, 1), Blind(kMember, "name", "ann"));
+  EXPECT_EQ(Ids({"m1"}, 1), Blind(kMember, "contacts.emails", "a@x"));
+  EXPECT_EQ(Ids({}, 0), Blind(kMember, "name", "cy"));
+  EXPECT_EQ(std::vector<std::string>({"m1 1-2 s1", "m1 3-0 s1"}),
+      History(kMember, "name", "ann"));
+}
+
+/* The sweep: seeded histories of members, their names and nested emails
+ * saved, changed, carried by other changes, removed, and their subjects
+ * erased, checked against a model kept apart from the library: blind
+ * equality (on the SQL backends the compiled query is also checked against
+ * the reference scan), the history lookup and the subject lookup. */
+class ModelBlindSweep : public ModelBlind {
+ protected:
+  struct MValue {
+    std::string plain;
+    std::string subject;
+    std::string cipher;
+    uint64_t id = 0;
+  };
+  struct MContact {
+    std::string label;
+    std::vector<MValue> emails;
+    uint64_t id = 0;
+  };
+  struct MMember {
+    std::string pid;
+    bool has_name = false;
+    MValue name;
+    std::string tag;
+    std::vector<MContact> contacts;
+    uint64_t head = 0;
+    /* Per revision: field path -> (plain, subject) of each value held. */
+    std::vector<std::vector<std::pair<std::string,
+        std::pair<std::string, std::string>>>> held;
+  };
+
+  std::mt19937 rng;
+  std::vector<MMember> members;
+  std::set<std::string> erased;
+  int ops = 0;
+  int matched = 0;
+  int carried = 0;
+
+  size_t Pick(size_t n) {
+    return std::uniform_int_distribution<size_t>(0, n - 1)(rng);
+  }
+  std::string Plain() { return "p" + std::to_string(Pick(7)); }
+  std::string Live() {
+    static const char * const all[] = {"s1", "s2", "s3", "s4", "s5", "s6",
+        "s7", "s8"};
+    for (int i = 0; i < 32; i++) {
+      std::string s = all[Pick(8)];
+      if (erased.count(s) == 0) {
+        return s;
+      }
+    }
+    return "s0";
+  }
+
+  /* A changed value: a new plaintext's fresh ciphertext. */
+  MValue Fresh() {
+    MValue v;
+    v.plain = Plain();
+    v.subject = Live();
+    v.cipher = "sealed:" + v.plain + ":" + std::to_string(++nonce);
+    return v;
+  }
+
+  void Value(Node & n, const std::string & field, const MValue & v, bool mac) {
+    n.Set(field, Personal(GDEFSTOR_FIELD_TEXT, v.cipher.c_str(),
+        v.subject.c_str()));
+    /* A caller gives the MAC of a value it wrote, and may give it again for
+     * one it passes through; never for an erased subject's. */
+    if (mac && erased.count(v.subject) == 0) {
+      n.Mac(field, MacOf(v.plain));
+    }
+  }
+
+  Node TreeOf(const MMember & m, const std::set<const void *> & changed) {
+    Node n;
+    n.id = 0;
+    if (m.has_name) {
+      Value(n, "name", m.name, changed.count(&m.name) != 0 || Pick(2) == 0);
+    }
+    n.Set("tag", Text(m.tag.c_str()));
+    for (const MContact & c : m.contacts) {
+      Node & k = n.Add("contacts", Item(c.id));
+      k.Set("label", Text(c.label.c_str()));
+      for (const MValue & e : c.emails) {
+        Node & x = k.Add("emails", Item(e.id));
+        Value(x, "", e, changed.count(&e) != 0 || Pick(2) == 0);
+      }
+    }
+    return n;
+  }
+
+  void Record(MMember & m) {
+    std::vector<std::pair<std::string, std::pair<std::string, std::string>>> h;
+    if (m.has_name) {
+      h.push_back({"name", {m.name.plain, m.name.subject}});
+    }
+    for (const MContact & c : m.contacts) {
+      for (const MValue & e : c.emails) {
+        h.push_back({"contacts.emails", {e.plain, e.subject}});
+      }
+    }
+    m.held.push_back(h);
+  }
+
+  /* Read the ids the library gave back into the model, by position. */
+  void Ids_(MMember & m) {
+    Node cur = Current(m.pid);
+    auto & cs = cur.kids["contacts"];
+    ASSERT_EQ(m.contacts.size(), cs.size());
+    for (size_t i = 0; i < cs.size(); i++) {
+      m.contacts[i].id = cs[i].id;
+      auto & es = cs[i].kids["emails"];
+      ASSERT_EQ(m.contacts[i].emails.size(), es.size());
+      for (size_t k = 0; k < es.size(); k++) {
+        m.contacts[i].emails[k].id = es[k].id;
+      }
+    }
+  }
+
+  void Step() {
+    MMember & m = members[Pick(members.size())];
+    std::set<const void *> changed;
+    ops += 1;
+    switch (Pick(9)) {
+    case 0:
+    case 1:
+      m.has_name = true;
+      m.name = Fresh();
+      changed.insert(&m.name);
+      break;
+    case 2:
+      m.has_name = false;
+      break;
+    case 3:
+      /* The root item changes; the name, if any, is carried. */
+      m.tag = "t" + std::to_string(Pick(1000));
+      carried += m.has_name ? 1 : 0;
+      break;
+    case 4: {
+      MContact c;
+      c.label = "l" + std::to_string(Pick(5));
+      for (size_t i = 0, n = 1 + Pick(2); i < n; i++) {
+        c.emails.push_back(Fresh());
+      }
+      m.contacts.push_back(c);
+      for (const MValue & e : m.contacts.back().emails) {
+        changed.insert(&e);
+      }
+      break;
+    }
+    case 5:
+      if (!m.contacts.empty()) {
+        m.contacts.erase(m.contacts.begin() + static_cast<long>(
+            Pick(m.contacts.size())));
+      }
+      break;
+    case 6:
+      if (!m.contacts.empty()) {
+        MContact & c = m.contacts[Pick(m.contacts.size())];
+        if (!c.emails.empty() && Pick(2) == 0) {
+          c.emails.erase(c.emails.begin() + static_cast<long>(
+              Pick(c.emails.size())));
+        } else {
+          c.emails.push_back(Fresh());
+          changed.insert(&c.emails.back());
+        }
+      }
+      break;
+    case 7:
+      if (!m.contacts.empty()) {
+        MContact & c = m.contacts[Pick(m.contacts.size())];
+        c.label = "l" + std::to_string(Pick(1000));
+      }
+      break;
+    default: {
+      /* Erasure's data-store step for a subject someone holds. */
+      std::vector<std::string> held;
+      for (const MMember & x : members) {
+        if (x.has_name) {
+          held.push_back(x.name.subject);
+        }
+      }
+      if (!held.empty()) {
+        std::string s = held[Pick(held.size())];
+        ASSERT_EQ(GDEFSTOR_OK, DeleteSubject(s));
+        erased.insert(s);
+      }
+      return;
+    }
+    }
+    Node n = TreeOf(m, changed);
+    GDEFSTOR_Tree * t = Build(n);
+    uint64_t rev = 0;
+    ASSERT_EQ(GDEFSTOR_OK, Save(m.pid, m.head, t, &rev));
+    gdefstor_tree_free(t);
+    if (rev == 0) {
+      return; /* the tree equals the current one */
+    }
+    ASSERT_EQ(m.head + 1, rev);
+    m.head = rev;
+    Record(m);
+    Ids_(m);
+  }
+
+  void Check() {
+    for (const char * field : {"name", "contacts.emails"}) {
+      for (int p = 0; p < 7; p++) {
+        std::string plain = "p" + std::to_string(p);
+        /* Blind equality: members whose current revision holds the value,
+         * of a subject not erased. */
+        std::vector<std::string> want;
+        std::set<std::string> want_history;
+        for (const MMember & m : members) {
+          bool now = false;
+          for (size_t r = 1; r < m.held.size(); r++) {
+            for (const auto & h : m.held[r]) {
+              if (h.first == field && h.second.first == plain &&
+                  erased.count(h.second.second) == 0) {
+                want_history.insert(m.pid + " " + std::to_string(r));
+                now |= r == m.head;
+              }
+            }
+          }
+          if (now) {
+            want.push_back(m.pid);
+          }
+        }
+        matched += want.empty() ? 0 : 1;
+        EXPECT_EQ(Ids(want, want.size()), Blind(kMember, field, plain))
+            << field << " " << plain;
+        std::set<std::string> got_history;
+        for (const std::string & h : History(kMember, field, plain)) {
+          std::vector<std::string> w = Words(h);
+          size_t dash = w[1].find('-');
+          uint64_t from = std::stoull(w[1].substr(0, dash));
+          uint64_t to = std::stoull(w[1].substr(dash + 1));
+          const MMember * m = nullptr;
+          for (const MMember & x : members) {
+            m = x.pid == w[0] ? &x : m;
+          }
+          ASSERT_NE(nullptr, m) << h;
+          for (uint64_t r = from; r < (to == 0 ? m->head + 1 : to); r++) {
+            got_history.insert(w[0] + " " + std::to_string(r));
+          }
+        }
+        EXPECT_EQ(want_history, got_history) << field << " " << plain;
+      }
+    }
+    for (const char * s : {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"}) {
+      /* Every value naming the subject, erased or not. */
+      std::set<std::string> want;
+      for (const MMember & m : members) {
+        for (size_t r = 1; r < m.held.size(); r++) {
+          for (const auto & h : m.held[r]) {
+            if (h.second.second == s) {
+              want.insert(m.pid + " " + h.first + " " + std::to_string(r));
+            }
+          }
+        }
+      }
+      std::set<std::string> got;
+      for (const std::string & h : Subject(s)) {
+        std::vector<std::string> w = Words(h);
+        size_t dash = w[3].find('-');
+        uint64_t from = std::stoull(w[3].substr(0, dash));
+        uint64_t to = std::stoull(w[3].substr(dash + 1));
+        const MMember * m = nullptr;
+        for (const MMember & x : members) {
+          m = x.pid == w[1] ? &x : m;
+        }
+        ASSERT_NE(nullptr, m) << h;
+        for (uint64_t r = from; r < (to == 0 ? m->head + 1 : to); r++) {
+          got.insert(w[1] + " " + w[2] + " " + std::to_string(r));
+        }
+      }
+      EXPECT_EQ(want, got) << s;
+    }
+  }
+};
+
+TEST_F(ModelBlindSweep, SeededHistoriesAgreeWithAnIndependentModel) {
+  for (uint32_t seed : {11u, 29u, 4242u}) {
+    SCOPED_TRACE("seed " + std::to_string(seed));
+    if (seed != 11u) {
+      TearDown();
+      SetUp();
+    }
+    rng.seed(seed);
+    members.clear();
+    erased.clear();
+    for (int i = 0; i < 4; i++) {
+      MMember m;
+      m.pid = "m" + std::to_string(i);
+      m.held.emplace_back(); /* revision 0: nothing */
+      m.tag = "t";
+      ASSERT_EQ(GDEFSTOR_OK, Create(kMember, m.pid));
+      members.push_back(m);
+    }
+    for (int i = 0; i < 48; i++) {
+      Step();
+      if (HasFatalFailure()) {
+        return;
+      }
+      if (i % 8 == 7) {
+        Check();
+      }
+    }
+    Check();
+  }
+  /* A sweep that never matched, carried or erased would pass vacuously. */
+  EXPECT_GT(matched, 10);
+  EXPECT_GT(carried, 2);
+  EXPECT_FALSE(erased.empty());
+  EXPECT_GT(ops, 100);
+}
+
 /* ---- isolation and the write --------------------------------------------- */
 
 class ModelWrite : public ModelSave {};
@@ -2709,6 +3650,155 @@ TEST(ModelOom, EveryAllocationFailureIsReportedAndCleanedUp) {
     count.fail_at = i;
     GDEFSTOR_Result rc =
         OomScenario(reinterpret_cast<const GDEFSTOR_Allocator *>(&alloc));
+    EXPECT_TRUE(rc == GDEFSTOR_ERR_OOM || rc == GDEFSTOR_OK)
+        << "allocation " << i << ": " << gdefstor_result_string(rc);
+    EXPECT_EQ(0, count.live) << "allocation " << i;
+    EXPECT_EQ(0, count.underflow) << "allocation " << i;
+    if (HasFailure()) {
+      break;
+    }
+  }
+}
+
+/* Every blind-index call once, over a store whose every allocation the test
+ * controls: a save with MACs, a carried and a reverted value, blind equality
+ * and a count, the history and subject lookups, a deletion, a dump. */
+inline GDEFSTOR_Result BlindOomScenario(const GDEFSTOR_Allocator * alloc) {
+  GDEFSTOR_Store * store = nullptr;
+  GDEFSTOR_Result rc = ModelOpen(&store, alloc);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  auto in_write = [&](const std::function<GDEFSTOR_Result(GDEFSTOR_Write *)> & f) {
+    GDEFSTOR_Write * w = nullptr;
+    GDEFSTOR_Result r = gdefstor_write_begin(store, kTenant, 2, nullptr, &w);
+    if (r != GDEFSTOR_OK) {
+      return r;
+    }
+    r = f(w);
+    if (r != GDEFSTOR_OK) {
+      gdefstor_write_abort(w);
+      return r;
+    }
+    return gdefstor_write_commit(w);
+  };
+  SpecHolder member(kMember, MemberType());
+  SpecHolder gift(kGift, GiftType());
+  GDEFSTOR_RevisionMeta m = Meta();
+  std::string ann = MacOf("ann");
+  std::string cy = MacOf("cy");
+  rc = in_write([&](GDEFSTOR_Write * w) {
+    GDEFSTOR_Result r = gdefstor_type_declare(w, &member.spec);
+    if (r == GDEFSTOR_OK) {
+      r = gdefstor_type_declare(w, &gift.spec);
+    }
+    if (r == GDEFSTOR_OK) {
+      r = gdefstor_entity_create(w, kMember, std::strlen(kMember), "m1", 2, "",
+          0, 1, nullptr);
+    }
+    return r;
+  });
+  for (int step = 0; rc == GDEFSTOR_OK && step < 3; step++) {
+    /* The name, then a new name, then only the tag (the name carried). */
+    Node n;
+    n.Set("name", Personal(GDEFSTOR_FIELD_TEXT, step == 0 ? "c1" : "c2", "s1"));
+    if (step < 2) {
+      n.Mac("name", step == 0 ? ann : cy);
+    }
+    n.Set("tag", Text(step == 2 ? "y" : "x"));
+    Node & k = n.Add("contacts");
+    k.Set("label", Text("home"));
+    k.Add("emails", One(Personal(GDEFSTOR_FIELD_TEXT, "e1", "s1"))).Mac("", ann);
+    if (step > 0) {
+      /* Name the items the first save made, so they continue. */
+      GDEFSTOR_Tree * cur = nullptr;
+      rc = gdefstor_entity_tree(store, kTenant, 2, "m1", 2, 0, &cur);
+      if (rc != GDEFSTOR_OK) {
+        break;
+      }
+      Node was = Read(cur);
+      gdefstor_tree_free(cur);
+      n.id = was.id;
+      k.id = was.kids["contacts"][0].id;
+      k.kids["emails"][0].id = was.kids["contacts"][0].kids["emails"][0].id;
+    }
+    GDEFSTOR_Tree * t = Build(n);
+    rc = t == nullptr ? GDEFSTOR_ERR_OOM : in_write([&](GDEFSTOR_Write * w) {
+      return gdefstor_entity_save(w, "m1", 2, static_cast<uint64_t>(step), &m,
+          t, nullptr);
+    });
+    gdefstor_tree_free(t);
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = in_write([&](GDEFSTOR_Write * w) {
+      return gdefstor_entity_revert(w, "m1", 2, 3, 1, &m, nullptr);
+    });
+  }
+  if (rc == GDEFSTOR_OK) {
+    Q q;
+    GDEFSTOR_Query query;
+    std::memset(&query, 0, sizeof query);
+    query.size = sizeof query;
+    query.where = q.Op(GDEFSTOR_QUERY_OR, {q.Cmp(GDEFSTOR_QUERY_BLIND,
+        q.Field("name"), q.Mac(ann)), q.Cmp(GDEFSTOR_QUERY_BLIND,
+            q.Field("contacts.emails"), q.Mac(ann))});
+    GDEFSTOR_QueryResult * r = nullptr;
+    rc = gdefstor_entity_query(store, kTenant, 2, kMember, std::strlen(kMember),
+        &query, &r);
+    gdefstor_query_result_free(r);
+    uint64_t n = 0;
+    if (rc == GDEFSTOR_OK) {
+      rc = gdefstor_entity_count(store, kTenant, 2, kMember,
+          std::strlen(kMember), query.where, &n);
+    }
+  }
+  if (rc == GDEFSTOR_OK) {
+    GDEFSTOR_BlindHits * h = nullptr;
+    rc = gdefstor_blind_history(store, kTenant, 2, kMember, std::strlen(kMember),
+        "name", 4, reinterpret_cast<const uint8_t *>(ann.data()), ann.size(), &h);
+    gdefstor_blind_hits_free(h);
+  }
+  if (rc == GDEFSTOR_OK) {
+    GDEFSTOR_SubjectHits * h = nullptr;
+    rc = gdefstor_subject_lookup(store, kTenant, 2, "s1", 2, &h);
+    gdefstor_subject_hits_free(h);
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = in_write([&](GDEFSTOR_Write * w) {
+      return gdefstor_blind_delete_subject(w, "s1", 2);
+    });
+  }
+  if (rc == GDEFSTOR_OK) {
+    uint8_t * bytes = nullptr;
+    size_t len = 0;
+    rc = gdefstor_model_dump(store, kTenant, 2, GDEFSTOR_MODEL_TRUTH, &bytes,
+        &len);
+    gdefstor_bytes_free(alloc, bytes);
+  }
+  ModelClose(store);
+  return rc;
+}
+
+TEST(ModelOom, EveryBlindIndexCallReportsAnAllocationFailure) {
+  OomCount count;
+  GCU_Allocator alloc;
+  count.base = gcu_allocator_default();
+  alloc.ctx = &count;
+  alloc.malloc_fn = oom_malloc;
+  alloc.calloc_fn = oom_calloc;
+  alloc.realloc_fn = oom_realloc;
+  alloc.free_fn = oom_free;
+  ASSERT_EQ(GDEFSTOR_OK,
+      BlindOomScenario(reinterpret_cast<const GDEFSTOR_Allocator *>(&alloc)));
+  EXPECT_EQ(0, count.live);
+  long budget = count.calls;
+  ASSERT_GT(budget, 50);
+  for (long i = 1; i <= budget; i++) {
+    count = OomCount();
+    count.base = gcu_allocator_default();
+    count.fail_at = i;
+    GDEFSTOR_Result rc =
+        BlindOomScenario(reinterpret_cast<const GDEFSTOR_Allocator *>(&alloc));
     EXPECT_TRUE(rc == GDEFSTOR_ERR_OOM || rc == GDEFSTOR_OK)
         << "allocation " << i << ": " << gdefstor_result_string(rc);
     EXPECT_EQ(0, count.live) << "allocation " << i;

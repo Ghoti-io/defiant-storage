@@ -356,6 +356,45 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_tree_get(const GDEFSTOR_Tree * tree,
     size_t item, const char * field, size_t field_len,
     GDEFSTOR_Value * out_value);
 
+/** Bytes of a blind-index MAC: an HMAC-SHA-256 (AD-14, AD-19). */
+#define GDEFSTOR_BLIND_MAC_BYTES 32
+
+/**
+ * @brief The blind-index MAC of one personal value, as the caller computed it.
+ *
+ * Storage never sees a key or a plaintext (AD-19): the MAC arrives computed,
+ * under the tenant's blind-index key for the field (AD-29), over the
+ * normalized plaintext. It is opaque bytes here, compared only for equality.
+ * @ref size is `sizeof(GDEFSTOR_BlindMac)`.
+ */
+typedef struct GDEFSTOR_BlindMac {
+  size_t size;           ///< `sizeof(GDEFSTOR_BlindMac)`.
+  const uint8_t * mac;   ///< ::GDEFSTOR_BLIND_MAC_BYTES bytes. Copied.
+  size_t mac_len;        ///< Must be ::GDEFSTOR_BLIND_MAC_BYTES.
+  uint32_t key_id;       ///< The key that made it, recorded with it (AD-14).
+  uint32_t version;      ///< The normalization version, recorded with it (AD-14).
+} GDEFSTOR_BlindMac;
+
+/**
+ * @brief Give the value of @p field on item @p item its blind-index MAC.
+ *
+ * The value must be set already (gdefstor_tree_set()); setting the value again
+ * drops the MAC. For an item of a MULTIPLE field, @p field_len is 0. A save
+ * writes the MAC into the blind table, never into a revision, group or
+ * current row, as one row for each personal value that gets a new version
+ * in that save (model.md, "The blind index"); an unchanged value writes
+ * nothing. The save refuses a MAC on a field that is not personal with
+ * ::GDEFSTOR_ERR_INVALID, and on a store whose backend has no blind table
+ * with ::GDEFSTOR_ERR_UNSUPPORTED. A tree read from storage carries no MAC,
+ * and gdefstor_tree_to_json() writes none.
+ *
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID (a NULL argument, a MAC of
+ *   another length, a size that is not this header's, or no value set there).
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_tree_set_blind(GDEFSTOR_Tree * tree,
+    size_t item, const char * field, size_t field_len,
+    const GDEFSTOR_BlindMac * mac);
+
 /**
  * @brief Parse a tree from its JSON form (`defiant-tree/1`, model.md), which
  * names fields and so needs the declaration to type the values.
@@ -658,16 +697,137 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_apply(GDEFSTOR_Write * write,
     const char * public_id, size_t public_id_len,
     const GDEFSTOR_RevisionMeta * meta, uint64_t * out_revision);
 
+/* ---- the blind index and subjects (AD-14, AD-19) ------------------------- */
+
+/** What gdefstor_blind_history() found. Opaque. */
+typedef struct GDEFSTOR_BlindHits GDEFSTOR_BlindHits;
+
+/** One value version holding the MAC. Pointers are valid until the hits are freed. */
+typedef struct GDEFSTOR_BlindHit {
+  size_t size;              ///< Set by the caller: `sizeof(GDEFSTOR_BlindHit)`.
+  uint64_t row;             ///< The entity's internal row.
+  const char * public_id;   ///< The entity's public id.
+  size_t public_id_len;     ///< Its length.
+  uint64_t item;            ///< The item.
+  uint64_t valid_from;      ///< The first revision that held this value version.
+  /** The revision that superseded it, or 0 while it is current: the version
+   * held in revisions valid_from up to (not including) valid_to. */
+  uint64_t valid_to;
+  const uint8_t * subject;  ///< The value's subject.
+  size_t subject_len;       ///< Its length.
+  uint32_t key_id;          ///< As written (GDEFSTOR_BlindMac::key_id).
+  uint32_t version;         ///< As written (GDEFSTOR_BlindMac::version).
+} GDEFSTOR_BlindHit;
+
+/**
+ * @brief The history lookup: every entity of @p type with any value version
+ * of personal field @p field whose blind row holds @p mac, as of the last
+ * commit, with the revisions that held it.
+ *
+ * One hit per value version, ordered by row, item and valid_from. History is
+ * searchable while the subject exists: after gdefstor_blind_delete_subject()
+ * the subject's versions are not found. A retired field is searched too.
+ *
+ * @return ::GDEFSTOR_OK (no hit is success), ::GDEFSTOR_ERR_INVALID (a type
+ *   never declared, a path that is not a personal scalar field, a MAC that is
+ *   not ::GDEFSTOR_BLIND_MAC_BYTES bytes, a NULL argument),
+ *   ::GDEFSTOR_ERR_UNSUPPORTED (a store without the entity port or whose
+ *   backend has no blind table), ::GDEFSTOR_ERR_OOM, or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_blind_history(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * type, size_t type_len,
+    const char * field, size_t field_len, const uint8_t * mac, size_t mac_len,
+    GDEFSTOR_BlindHits ** out_hits);
+
+/** @return The hits. */
+GDEFSTOR_API size_t gdefstor_blind_hits_count(const GDEFSTOR_BlindHits * hits);
+
+/** @brief Describe hit @p index. */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_blind_hit(const GDEFSTOR_BlindHits * hits,
+    size_t index, GDEFSTOR_BlindHit * out);
+
+/** @brief Release hits. NULL is ignored. */
+GDEFSTOR_API void gdefstor_blind_hits_free(GDEFSTOR_BlindHits * hits);
+
+/** What gdefstor_subject_lookup() found. Opaque. */
+typedef struct GDEFSTOR_SubjectHits GDEFSTOR_SubjectHits;
+
+/** One value version naming the subject. Pointers are valid until freed. */
+typedef struct GDEFSTOR_SubjectHit {
+  size_t size;              ///< Set by the caller: `sizeof(GDEFSTOR_SubjectHit)`.
+  const char * type;        ///< The entity's type.
+  size_t type_len;          ///< Its length.
+  uint64_t row;             ///< The entity's internal row.
+  const char * public_id;   ///< The entity's public id.
+  size_t public_id_len;     ///< Its length.
+  const char * field;       ///< The personal field's dotted path.
+  size_t field_len;         ///< Its length.
+  uint64_t item;            ///< The item.
+  uint64_t valid_from;      ///< The first revision that held this version.
+  uint64_t valid_to;        ///< The revision that superseded it, or 0 (current).
+} GDEFSTOR_SubjectHit;
+
+/**
+ * @brief The subject lookup, "everything about this person" (AD-19): every
+ * stored personal value version that names @p subject, of every type, across
+ * history, as of the last commit.
+ *
+ * It reads the subject recorded beside each ciphertext (an indexed lookup on
+ * the subject columns), never the blind table, so it still finds every value
+ * after gdefstor_blind_delete_subject(). Retired fields are included; drafts,
+ * which are JSON outside the revision tables, are not. Ordered by type, row,
+ * field (declaration order), item and valid_from.
+ *
+ * @return ::GDEFSTOR_OK (no hit is success), ::GDEFSTOR_ERR_INVALID (a subject
+ *   that is not a public id, a NULL argument), ::GDEFSTOR_ERR_UNSUPPORTED,
+ *   ::GDEFSTOR_ERR_CORRUPT (a stored value no declared field holds),
+ *   ::GDEFSTOR_ERR_OOM, or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_subject_lookup(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * subject,
+    size_t subject_len, GDEFSTOR_SubjectHits ** out_hits);
+
+/** @return The hits. */
+GDEFSTOR_API size_t gdefstor_subject_hits_count(
+    const GDEFSTOR_SubjectHits * hits);
+
+/** @brief Describe hit @p index. */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_subject_hit(
+    const GDEFSTOR_SubjectHits * hits, size_t index, GDEFSTOR_SubjectHit * out);
+
+/** @brief Release hits. NULL is ignored. */
+GDEFSTOR_API void gdefstor_subject_hits_free(GDEFSTOR_SubjectHits * hits);
+
+/**
+ * @brief Delete every blind row of @p subject, of every type, in this write:
+ * the data-store step of erasure (AD-19), after the key store has destroyed
+ * the subject's key and appended the ledger.
+ *
+ * Idempotent: a subject with no blind row deletes nothing and succeeds, so
+ * the ledger replay may run it again. Afterwards blind equality and the
+ * history lookup find nothing of the subject's; the ciphertext rows, and so
+ * gdefstor_subject_lookup(), are unchanged.
+ *
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (a subject that is not a
+ *   public id, a write that is not usable), ::GDEFSTOR_ERR_UNSUPPORTED, or a
+ *   backend's error (which breaks the write).
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_blind_delete_subject(
+    GDEFSTOR_Write * write, const char * subject, size_t subject_len);
+
 /* ---- derived data --------------------------------------------------------- */
 
 /**
  * @brief Drop every current table (and every other derived lookup) of the
  * write's tenant and rebuild it from the truth, in this write.
+ *
+ * The blind table is not derived and is left alone: its rows are truth for as
+ * long as their subject exists.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_model_rebuild(GDEFSTOR_Write * write);
 
 /** gdefstor_model_dump(): the truth (entities, states, revisions, every item
- * version, declarations, drafts). */
+ * version, declarations, drafts, blind rows). */
 #define GDEFSTOR_MODEL_TRUTH 1
 /** gdefstor_model_dump(): the derived data (current items, current state). */
 #define GDEFSTOR_MODEL_CURRENT 2

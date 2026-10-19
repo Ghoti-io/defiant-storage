@@ -31,7 +31,7 @@ ROOT="${1:?usage: check-seams.sh <root>}"
 owners_of() {
   case "$1" in
     internal.h) printf '%s\n' 'blob.c outbox.c projection.c query.c revision.c snapshot.c store.c util.c core.c' ;;
-    model_internal.h) printf '%s\n' 'keystore.c model.c model_query.c query.c tree.c type.c value.c' ;;
+    model_internal.h) printf '%s\n' 'blind.c keystore.c model.c model_query.c query.c tree.c type.c value.c' ;;
     *) printf '\n' ;;
   esac
 }

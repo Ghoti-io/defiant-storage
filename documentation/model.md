@@ -19,6 +19,7 @@ the port hands it map one to one onto ordinary tables:
 | newest state | columns of `T` or a current table | derived, same transaction |
 | declaration | a catalog row per type, `defiant-type/1` text | replaced |
 | draft | one per entity, `defiant-tree/1` JSON and a base revision | replaced, deleted |
+| blind row | the blind table, per type: entity, item, `valid_from`, field, subject, MAC, key id, normalization version | inserted with the version it indexes; deleted per subject |
 
 Everything that decides what a write means lives in the port, once, so every
 backend stores the same rows: which items changed, item ids, order keys, the
@@ -66,7 +67,8 @@ Money is a decimal, never a float.
   from a named sibling reference field (single, not personal), in which case
   each value's subject must equal that field's value on the same item, or,
   for an item of a multiple personal field, on its parent. A personal field
-  cannot be indexed, sorted or filtered; blind-index equality is not built.
+  cannot be indexed, sorted or range-filtered; it is matched only by
+  blind-index equality (below).
 
 Declaring is additive. `gdefstor_type_declare()` takes the whole desired tree:
 
@@ -174,6 +176,64 @@ and date comparison, `and`/`or`/`not`, the `EXISTS` semi-join that relations
 are, a sort, an offset and a limit, a total, and the row as the final
 tiebreak. `documentation/query.md` says what each means and what is refused.
 
+## The blind index and subjects
+
+AD-14 and AD-19, as `ENTITY-STORAGE-DESIGN.md` ("Personal data", items 2 to
+5) decides them. Storage never sees a key or a plaintext: the caller (core)
+computes each MAC, an HMAC-SHA-256 under the tenant's per-field blind-index
+key over the normalized plaintext, and hands it over as
+`GDEFSTOR_BLIND_MAC_BYTES` (32) opaque bytes with the key's id and the
+normalization version, which are recorded beside it.
+
+**Writing.** `gdefstor_tree_set_blind()` gives a personal value of a tree its
+MAC. A save writes one *blind row* per personal value version that carries a
+MAC: the entity, the item and the `valid_from` of the version, the field's
+id, the value's subject, the MAC, the key id and the version, in the same
+transaction as the version. A value version is the item version that holds
+it, so:
+
+- an unchanged value whose item is unchanged writes no version and no row;
+- a value carried unchanged into a new version of its item (another column
+  of the item changed) keeps its row: the port copies the current version's
+  MAC into a row for the new version, unless the tree gives one (same
+  ciphertext, same plaintext, same MAC);
+- a revert brings old values back with the rows they had, unless their
+  subject's rows were deleted since;
+- a MAC on a field that is not personal is `GDEFSTOR_ERR_INVALID`, and a MAC
+  on a retired field writes nothing (a retired value gets no version of its
+  own);
+- a tree read back carries no MAC, a draft's JSON holds none, and so a draft
+  applied writes none for the values it changes.
+
+The MAC is never a column of a group, revision or current row, and a rebuild
+(`gdefstor_model_rebuild()`) leaves the blind table alone: its rows are truth
+while their subject exists.
+
+**Blind equality** is the query node `GDEFSTOR_QUERY_BLIND` (`query.h`): a
+personal field equals a MAC. It matches an entity when some current item of
+the field's group has a value whose current version has a blind row with that
+MAC, so an older version's MAC does not match, and it composes with every
+other clause. Personal fields stay refused for sorting and ranges.
+
+**The history lookup**, `gdefstor_blind_history()`: every entity of a type
+with any version of a personal field that had a given MAC, with the revisions
+each version held (`valid_from` up to `valid_to`, 0 while current).
+
+**The subject lookup**, `gdefstor_subject_lookup()`: "everything about this
+person", every personal value version of every type that names a subject,
+across history, from the subject recorded beside each ciphertext, through the
+subject columns' index. It never reads the blind table, and does not see
+drafts.
+
+**Deletion**, `gdefstor_blind_delete_subject()`: erasure's data-store step,
+after the key store has destroyed the key and appended the ledger. It deletes
+every blind row of the subject in every type, is idempotent, and leaves the
+ciphertext rows, so the subject lookup still finds every value afterwards and
+blind equality and the history lookup find none.
+
+A backend serves this through three optional members (`model_backend.h`);
+one that does not refuses every call here `GDEFSTOR_ERR_UNSUPPORTED`.
+
 ## Derived data
 
 The current tables, the newest state and the public-id lookup are derived:
@@ -194,12 +254,14 @@ S <row> <seq> <published> <deleted> <actor> <when>
 R <row> <revision> <commit seq> <who> <when> <why>
 I <row> <group> <item> <valid_from> <valid_to> <parent> <order> <n> <value>...
 D <public id> <type> <base> <json>
+B <row> <item> <valid_from> <field id> <subject> <mac> <key id> <version>
 ```
 
 A value is `v<type>`, then for a set value its integer, its double, its bytes
 and its subject. Trailing absent columns are left out, so a row written
 before a column existed and one written after with it empty read alike.
-`GDEFSTOR_MODEL_TRUTH` dumps `T`, `E`, `S`, `R`, every `I` version and `D`;
+`GDEFSTOR_MODEL_TRUTH` dumps `T`, `E`, `S`, `R`, every `I` version, `D` and
+every blind row `B`;
 `GDEFSTOR_MODEL_CURRENT` dumps `E` and the current `I` rows.
 
 ## Formats
@@ -285,7 +347,12 @@ later: `index_state`, called with `index_ctx` (so that a wrapper replacing
 `ctx` still reaches the backend), says whether an indexed field's index is
 built; a backend that leaves it NULL reads every indexed field as ready, and
 one built against the first version of the struct sets `size` to
-`GDEFSTOR_MODEL_BACKEND_SIZE_V1`.
+`GDEFSTOR_MODEL_BACKEND_SIZE_V1`. The blind index came next: `blind_ctx`,
+`blind_history`, `subject_lookup` and `blind_delete`, all three functions or
+none (`GDEFSTOR_MODEL_BACKEND_SIZE_V2` is the size before them); a backend
+that sets them also writes `GDEFSTOR_ModelApply::blinds` in `apply` and visits
+blind rows through `GDEFSTOR_ModelVisitor::blind` from `items`, `dump` and
+the reference engine's scan.
 
 Every backend runs the conformance suite, installed beside the port:
 `model.inc` (named cases for every rule above, the purchase-order fixture,
@@ -315,7 +382,8 @@ cryptography. Nothing is wired to the entity port yet.
   item. Translations with their own revision history, and language for
   nested groups, are to be designed.
 - **Large values by content hash.** Values are stored inline, up to 1 MiB.
-- **The blind index** and every use of the key store by the entity port.
+- **Every use of the key store by the entity port**: computing MACs,
+  encrypting and erasing are core's (S5b, S6).
 - **Blobs, the outbox and small records in the entity transaction.** Until
   then a write is one kind or the other.
 - **Select columns** in a query: a caller reads each entity's tree.

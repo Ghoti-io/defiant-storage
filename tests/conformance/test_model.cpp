@@ -75,6 +75,16 @@ struct State {
   int64_t when = 0;
 };
 
+struct Blind {
+  uint64_t item = 0;
+  uint64_t from = 0;
+  uint32_t field = 0;
+  std::string subject;
+  std::string mac;
+  uint32_t key_id = 0;
+  uint32_t version = 0;
+};
+
 struct Ent {
   uint64_t row = 0;
   std::string type;
@@ -86,6 +96,7 @@ struct Ent {
   std::vector<State> states;
   std::vector<Rev> revs;
   std::vector<Ver> versions; /* truth */
+  std::vector<Blind> blinds; /* truth while the subject exists */
   /* derived */
   std::vector<Ver> current;
   int published = 0;
@@ -185,6 +196,30 @@ GDEFSTOR_Result visit_item(const GDEFSTOR_ModelVisitor * v, uint64_t row,
   return v->item(v->ctx, row, &m);
 }
 
+GDEFSTOR_Result visit_blinds(const GDEFSTOR_ModelVisitor * v, const Ent & e) {
+  if (v->blind == nullptr) {
+    return GDEFSTOR_OK;
+  }
+  for (const Blind & b : e.blinds) {
+    GDEFSTOR_ModelBlind m;
+    std::memset(&m, 0, sizeof m);
+    m.item = b.item;
+    m.valid_from = b.from;
+    m.field = b.field;
+    m.subject = reinterpret_cast<const uint8_t *>(b.subject.data());
+    m.subject_len = b.subject.size();
+    m.mac = reinterpret_cast<const uint8_t *>(b.mac.data());
+    m.key_id = b.key_id;
+    m.version = b.version;
+    GDEFSTOR_Result rc = v->blind(v->ctx, e.row, &m);
+    if (rc != GDEFSTOR_OK) {
+      return rc;
+    }
+  }
+  return GDEFSTOR_OK;
+}
+
+/* The blind table is truth: derive() leaves it alone. */
 void derive(Tenant & t) {
   t.pids.clear();
   for (Ent & e : t.ents) {
@@ -380,6 +415,26 @@ static GDEFSTOR_Result s_apply(void * ctx, void * txn,
     e.versions.push_back(v);
     e.current.push_back(v);
   }
+  for (size_t i = 0; i < a->blind_count; i++) {
+    const GDEFSTOR_ModelBlind & m = a->blinds[i];
+    bool indexed = false;
+    /* A blind row indexes a version this same apply writes. */
+    for (size_t k = 0; k < a->insert_count; k++) {
+      indexed |= a->inserts[k].item == m.item;
+    }
+    if (!indexed || m.valid_from != n || m.mac == nullptr) {
+      return GDEFSTOR_ERR_INTERNAL;
+    }
+    Blind b;
+    b.item = m.item;
+    b.from = m.valid_from;
+    b.field = m.field;
+    b.subject.assign(reinterpret_cast<const char *>(m.subject), m.subject_len);
+    b.mac.assign(reinterpret_cast<const char *>(m.mac), GDEFSTOR_BLIND_MAC_BYTES);
+    b.key_id = m.key_id;
+    b.version = m.version;
+    e.blinds.push_back(b);
+  }
   if (x->seq == 0) {
     x->seq = t.commit_seq + 1;
     t.commit_seq = x->seq;
@@ -453,7 +508,7 @@ static GDEFSTOR_Result s_items(void * ctx, void * txn, const char * t,
       return rc;
     }
   }
-  return GDEFSTOR_OK;
+  return visit_blinds(v, e);
 }
 
 static GDEFSTOR_Result s_draft_put(void * ctx, void * txn,
@@ -521,6 +576,9 @@ static GDEFSTOR_Result s_scan(void * ctx, const char * type, size_t type_len,
     for (size_t k = 0; rc == GDEFSTOR_OK && k < e.current.size(); k++) {
       rc = visit_item(v, e.row, e.current[k]);
     }
+    if (rc == GDEFSTOR_OK) {
+      rc = visit_blinds(v, e);
+    }
     if (rc != GDEFSTOR_OK) {
       return rc;
     }
@@ -583,6 +641,9 @@ static GDEFSTOR_Result s_dump(void * ctx, const char * t, size_t tl, int which,
       for (size_t k = 0; rc == GDEFSTOR_OK && k < e.versions.size(); k++) {
         rc = visit_item(v, e.row, e.versions[k]);
       }
+      if (rc == GDEFSTOR_OK) {
+        rc = visit_blinds(v, e);
+      }
     } else {
       for (size_t k = 0; rc == GDEFSTOR_OK && k < e.current.size(); k++) {
         rc = visit_item(v, e.row, e.current[k]);
@@ -591,6 +652,117 @@ static GDEFSTOR_Result s_dump(void * ctx, const char * t, size_t tl, int which,
     if (rc != GDEFSTOR_OK) {
       return rc;
     }
+  }
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_blind_history(void * ctx, const char * t, size_t tl,
+    const GDEFSTOR_Type * type, size_t field, const uint8_t * mac,
+    GDEFSTOR_ModelBlindFn fn, void * fn_ctx) {
+  Tenant * ten = view(static_cast<Scratch *>(ctx), nullptr, t, tl);
+  const char * name = nullptr;
+  size_t name_len = 0;
+  GDEFSTOR_FieldInfo f;
+  std::memset(&f, 0, sizeof f);
+  f.size = sizeof f;
+  if (gdefstor_type_name(type, &name, &name_len) != GDEFSTOR_OK ||
+      gdefstor_type_field(type, field, &f) != GDEFSTOR_OK) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (ten == nullptr) {
+    return GDEFSTOR_OK;
+  }
+  std::string want(name, name_len);
+  std::string m(reinterpret_cast<const char *>(mac), GDEFSTOR_BLIND_MAC_BYTES);
+  for (const Ent & e : ten->ents) {
+    if (e.type != want) {
+      continue;
+    }
+    for (const Blind & b : e.blinds) {
+      if (b.field != f.id || b.mac != m) {
+        continue;
+      }
+      uint64_t to = UINT64_MAX;
+      for (const Ver & x : e.versions) {
+        if (x.item == b.item && x.from == b.from) {
+          to = x.to;
+        }
+      }
+      if (to == UINT64_MAX) {
+        return GDEFSTOR_ERR_CORRUPT; /* a blind row with no version */
+      }
+      GDEFSTOR_ModelBlindHit h;
+      std::memset(&h, 0, sizeof h);
+      h.row = e.row;
+      h.public_id = e.pid.data();
+      h.public_id_len = e.pid.size();
+      h.item = b.item;
+      h.valid_from = b.from;
+      h.valid_to = to;
+      h.subject = reinterpret_cast<const uint8_t *>(b.subject.data());
+      h.subject_len = b.subject.size();
+      h.key_id = b.key_id;
+      h.version = b.version;
+      GDEFSTOR_Result rc = fn(fn_ctx, &h);
+      if (rc != GDEFSTOR_OK) {
+        return rc;
+      }
+    }
+  }
+  return GDEFSTOR_OK;
+}
+
+/* Every version's subject columns: a personal value is the one kind that
+ * carries a subject. */
+static GDEFSTOR_Result s_subject_lookup(void * ctx, const char * t, size_t tl,
+    const uint8_t * subject, size_t subject_len, GDEFSTOR_ModelSubjectFn fn,
+    void * fn_ctx) {
+  Tenant * ten = view(static_cast<Scratch *>(ctx), nullptr, t, tl);
+  if (ten == nullptr) {
+    return GDEFSTOR_OK;
+  }
+  std::string want(reinterpret_cast<const char *>(subject), subject_len);
+  for (const Ent & e : ten->ents) {
+    for (const Ver & x : e.versions) {
+      for (size_t k = 0; k < x.vals.size(); k++) {
+        if (x.vals[k].type == 0 || x.vals[k].subject != want) {
+          continue;
+        }
+        GDEFSTOR_ModelSubjectHit h;
+        std::memset(&h, 0, sizeof h);
+        h.type = e.type.data();
+        h.type_len = e.type.size();
+        h.row = e.row;
+        h.public_id = e.pid.data();
+        h.public_id_len = e.pid.size();
+        h.group = x.group;
+        h.column = static_cast<uint32_t>(k);
+        h.item = x.item;
+        h.valid_from = x.from;
+        h.valid_to = x.to;
+        GDEFSTOR_Result rc = fn(fn_ctx, &h);
+        if (rc != GDEFSTOR_OK) {
+          return rc;
+        }
+      }
+    }
+  }
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_blind_delete(void * ctx, void * txn,
+    const uint8_t * subject, size_t subject_len) {
+  (void)ctx;
+  Tenant & t = static_cast<Txn *>(txn)->copy;
+  std::string want(reinterpret_cast<const char *>(subject), subject_len);
+  for (Ent & e : t.ents) {
+    std::vector<Blind> kept;
+    for (const Blind & b : e.blinds) {
+      if (b.subject != want) {
+        kept.push_back(b);
+      }
+    }
+    e.blinds = kept;
   }
   return GDEFSTOR_OK;
 }
@@ -668,6 +840,10 @@ GDEFSTOR_Result ModelOpen(GDEFSTOR_Store ** out,
   mb.query = s_query;
   mb.rebuild = s_rebuild;
   mb.dump = s_dump;
+  mb.blind_ctx = s;
+  mb.blind_history = s_blind_history;
+  mb.subject_lookup = s_subject_lookup;
+  mb.blind_delete = s_blind_delete;
   GDEFSTOR_Result rc = gdefstor_store_create_model(&kb, &mb, alloc, nullptr, out);
   if (rc != GDEFSTOR_OK) {
     delete s;

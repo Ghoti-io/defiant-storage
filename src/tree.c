@@ -185,6 +185,8 @@ GDEFSTOR_Result gdefstor_model_tree_put(GDEFSTOR_Tree * tree, size_t item,
     tree->bytes -= n->vals[k].v.len + n->vals[k].v.subject_len;
     gdefstor_model_value_clear(tree->alloc, &n->vals[k].v);
     n->vals[k].v = copy;
+    /* A MAC was of the value it replaces. */
+    memset(&n->vals[k].blind, 0, sizeof n->vals[k].blind);
     tree->bytes += copy.len + copy.subject_len;
     return GDEFSTOR_OK;
   }
@@ -206,6 +208,7 @@ GDEFSTOR_Result gdefstor_model_tree_put(GDEFSTOR_Tree * tree, size_t item,
   }
   n->vals[n->nvals].field_len = field_len;
   n->vals[n->nvals].v = copy;
+  memset(&n->vals[n->nvals].blind, 0, sizeof n->vals[n->nvals].blind);
   n->nvals += 1;
   tree->bytes += copy.len + copy.subject_len;
   return GDEFSTOR_OK;
@@ -227,6 +230,30 @@ GDEFSTOR_Result gdefstor_tree_set(GDEFSTOR_Tree * tree, size_t item,
     return GDEFSTOR_ERR_LIMIT;
   }
   return gdefstor_model_tree_put(tree, item, field, field_len, value);
+}
+
+GDEFSTOR_Result gdefstor_tree_set_blind(GDEFSTOR_Tree * tree, size_t item,
+    const char * field, size_t field_len, const GDEFSTOR_BlindMac * mac) {
+  GDEFSTOR_TreeNode * n;
+  size_t k;
+  if (tree == NULL || mac == NULL || mac->size != sizeof *mac ||
+      item >= tree->n || (field == NULL && field_len != 0) ||
+      mac->mac == NULL || mac->mac_len != GDEFSTOR_BLIND_MAC_BYTES) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  n = &tree->items[item];
+  for (k = 0; k < n->nvals; k++) {
+    if (same_span(n->vals[k].field, n->vals[k].field_len, field, field_len)) {
+      GDEFSTOR_BlindVal * b = &n->vals[k].blind;
+      b->set = 1;
+      memcpy(b->mac, mac->mac, GDEFSTOR_BLIND_MAC_BYTES);
+      b->key_id = mac->key_id;
+      b->version = mac->version;
+      return GDEFSTOR_OK;
+    }
+  }
+  /* A MAC is of a value: there is none here to give it to. */
+  return GDEFSTOR_ERR_INVALID;
 }
 
 /* ---- reading ------------------------------------------------------------- */

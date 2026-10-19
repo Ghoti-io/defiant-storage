@@ -116,6 +116,18 @@
  * the limit. Flags other than ::GDEFSTOR_QUERY_OUTER, a select, `numeric` on a
  * sort and `entity_numeric` are ::GDEFSTOR_ERR_INVALID, and so is a type that
  * was never declared.
+ *
+ * A personal field holds ciphertext, so the comparisons above refuse it; it is
+ * matched only by ::GDEFSTOR_QUERY_BLIND, blind-index equality: the left
+ * operand a FIELD naming an active personal scalar field (no OUTER), the
+ * right a ::GDEFSTOR_QUERY_CONST of exactly one text of
+ * ::GDEFSTOR_BLIND_MAC_BYTES bytes. It holds when some current item of the
+ * field's group has a value whose current version has a blind row with that
+ * MAC (gdefstor_tree_set_blind()), so "some item matches" for multiples and
+ * groups, and an older version's MAC does not match. It composes with every
+ * other node, inside an EXISTS too. A personal field is never a sort key and
+ * never compared by range. On a store whose backend has no blind table the
+ * node is ::GDEFSTOR_ERR_UNSUPPORTED.
  */
 
 #ifndef GHOTI_IO_GDEFSTOR_QUERY_H
@@ -214,7 +226,12 @@ typedef enum GDEFSTOR_QueryOp {
   GDEFSTOR_QUERY_LE,       ///< Some integer pair, left <= right.
   GDEFSTOR_QUERY_GT,       ///< Some integer pair, left > right.
   GDEFSTOR_QUERY_GE,       ///< Some integer pair, left >= right.
-  GDEFSTOR_QUERY_EXISTS    ///< Some row of another type satisfies the child.
+  GDEFSTOR_QUERY_EXISTS,   ///< Some row of another type satisfies the child.
+  /** Entities only: blind-index equality. Left is a FIELD naming a personal
+   * field, right a CONST of one text, the ::GDEFSTOR_BLIND_MAC_BYTES bytes of
+   * a MAC: holds when some current value version of the field has a blind
+   * row with that MAC ("Over entities"). */
+  GDEFSTOR_QUERY_BLIND
 } GDEFSTOR_QueryOp;
 
 /** A node of the predicate tree. */

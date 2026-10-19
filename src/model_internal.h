@@ -56,6 +56,8 @@
 #define gdefstor_model_txn GHOTIIO_DEFSTOR(gdefstor_model_txn)
 #define gdefstor_model_break GHOTIIO_DEFSTOR(gdefstor_model_break)
 #define gdefstor_model_type_text GHOTIIO_DEFSTOR(gdefstor_model_type_text)
+#define gdefstor_model_has_blind GHOTIIO_DEFSTOR(gdefstor_model_has_blind)
+#define gdefstor_model_has_personal GHOTIIO_DEFSTOR(gdefstor_model_has_personal)
 
 /* "No field": the parent of a root-group field, an unset index. */
 #define GDEFSTOR_NONE SIZE_MAX
@@ -100,11 +102,21 @@ struct GDEFSTOR_Type {
   size_t * col_field;     /* the field of each column of each group */
 };
 
+/* A blind-index MAC, held by value (no allocation): a tree's, or one read
+ * back from a backend's blind row. */
+typedef struct GDEFSTOR_BlindVal {
+  int set;
+  uint8_t mac[GDEFSTOR_BLIND_MAC_BYTES];
+  uint32_t key_id;
+  uint32_t version;
+} GDEFSTOR_BlindVal;
+
 /* One value set on an item. Its bytes and subject are owned. */
 typedef struct GDEFSTOR_TreeVal {
   char * field;
   size_t field_len;
   GDEFSTOR_Value v;
+  GDEFSTOR_BlindVal blind; /* gdefstor_tree_set_blind(); dropped by a set */
 } GDEFSTOR_TreeVal;
 
 typedef struct GDEFSTOR_TreeNode {
@@ -222,5 +234,11 @@ GDEFSTOR_Result gdefstor_model_break(GDEFSTOR_Write * write,
 /* The canonical stored text of a declaration. */
 GDEFSTOR_Result gdefstor_model_type_text(const GDEFSTOR_Type * t,
     char ** out, size_t * out_len);
+
+/* Whether the store's backend serves the blind index (model_backend.h). */
+int gdefstor_model_has_blind(const GDEFSTOR_Store * store);
+
+/* Whether a declaration has a personal field, retired ones included. */
+int gdefstor_model_has_personal(const GDEFSTOR_Type * t);
 
 #endif /* GHOTI_IO_GDEFSTOR_SRC_MODEL_INTERNAL_H */
