@@ -108,4 +108,20 @@ plant no-tiebreak src/model_query.c testModel \
   '  return x->row < y->row ? -1 : (x->row > y->row ? 1 : 0);' \
   '  return 0;'
 
+# A blind row written for an unchanged value: an item the save leaves as it
+# is gets a row for a version that is never written (story S5a).
+plant blind-row-for-unchanged src/model.c testModel \
+  'ModelBlind.AnUnchangedValueWritesNoBlindRow' \
+  '        /* Unchanged: no new version, so no blind row either. */
+        continue;' \
+  '        blinds_of(s, x, 0, NULL);
+        continue;'
+
+# Blind equality in the reference engine matching an older version: a row is
+# taken for the item, whichever version of it the row indexes.
+plant blind-older-version src/model_query.c testModel \
+  'ModelBlind.EqualityMatchesOnlyTheCurrentVersion ModelBlind.ARevertBringsBackTheBlindRowsOfTheValuesItRestores' \
+  '      if (b->item == it->item && b->from == it->from && b->field == f->id &&' \
+  '      if (b->item == it->item && b->field == f->id &&'
+
 plant_finish
