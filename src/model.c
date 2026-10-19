@@ -57,7 +57,8 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
   if (model == NULL || out_store == NULL ||
       (model->size != sizeof(GDEFSTOR_ModelBackend) &&
           model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V1 &&
-          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V2) ||
+          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V2 &&
+          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V3) ||
       model->destroy == NULL ||
       model->begin == NULL || model->commit == NULL || model->abort == NULL ||
       model->type_load == NULL || model->type_store == NULL ||
@@ -83,6 +84,20 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
       return GDEFSTOR_ERR_INVALID;
     }
   }
+  /* Records, counters and the outbox together or not at all: a backend that
+   * kept rows it could not list, or claimed rows it could not delete, would
+   * answer half a contract. */
+  {
+    int n = (copy.record_put != NULL) + (copy.record_delete != NULL) +
+            (copy.record_get != NULL) + (copy.record_list != NULL) +
+            (copy.counter_next != NULL) + (copy.counter_get != NULL) +
+            (copy.outbox_insert != NULL) + (copy.outbox_claim != NULL) +
+            (copy.outbox_delete != NULL) + (copy.outbox_fail != NULL) +
+            (copy.outbox_parked != NULL);
+    if (n != 0 && n != 11) {
+      return GDEFSTOR_ERR_INVALID;
+    }
+  }
   rc = gdefstor_store_create(backend, allocator, limits, &store);
   if (rc != GDEFSTOR_OK) {
     return rc;
@@ -96,6 +111,10 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
 int gdefstor_model_has_blind(const GDEFSTOR_Store * store) {
   return store != NULL && store->has_model &&
          store->model.blind_history != NULL;
+}
+
+int gdefstor_model_has_sys(const GDEFSTOR_Store * store) {
+  return store != NULL && store->has_model && store->model.record_put != NULL;
 }
 
 int gdefstor_model_has_personal(const GDEFSTOR_Type * t) {
@@ -3139,6 +3158,56 @@ static GDEFSTOR_Result dump_blind(void * ctx, uint64_t row,
   return l->rc;
 }
 
+static GDEFSTOR_Result dump_record(void * ctx, const GDEFSTOR_ModelRecord * r) {
+  Lines * l = (Lines *)ctx;
+  if (r == NULL || (r->bytes == NULL && r->len != 0)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  l_str(l, "K");
+  l_hex(l, r->ns, r->ns_len);
+  l_hex(l, r->key, r->key_len);
+  l_hex(l, r->bytes, r->len);
+  l_end(l);
+  return l->rc;
+}
+
+/* A counter never advanced reads 0 and is not a row: a backend that keeps a
+ * row for its floor alone lists it at 0, which is left out. */
+static GDEFSTOR_Result dump_counter(void * ctx, int kind, const char * name,
+    size_t name_len, uint64_t value) {
+  Lines * l = (Lines *)ctx;
+  if (kind != GDEFSTOR_MODEL_COUNTER && kind != GDEFSTOR_MODEL_STREAM) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  if (value == 0) {
+    return GDEFSTOR_OK;
+  }
+  l_str(l, "C");
+  l_u64(l, (uint64_t)kind);
+  l_hex(l, name, name_len);
+  l_u64(l, value);
+  l_end(l);
+  return l->rc;
+}
+
+static GDEFSTOR_Result dump_outbox(void * ctx, const GDEFSTOR_ModelOutbox * o) {
+  Lines * l = (Lines *)ctx;
+  if (o == NULL || (o->payload == NULL && o->payload_len != 0)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  l_str(l, "O");
+  l_hex(l, o->stream, o->stream_len);
+  l_u64(l, o->seq);
+  l_hex(l, o->public_id, o->public_id_len);
+  l_hex(l, o->format, o->format_len);
+  l_hex(l, o->payload, o->payload_len);
+  l_i64(l, o->lease_until_ms);
+  l_u64(l, o->failures);
+  l_u64(l, (uint64_t)(o->parked != 0));
+  l_end(l);
+  return l->rc;
+}
+
 static int line_cmp(const void * ctx, size_t a, size_t b) {
   const Lines * l = (const Lines *)ctx;
   size_t n = l->lens[a] < l->lens[b] ? l->lens[a] : l->lens[b];
@@ -3179,6 +3248,11 @@ GDEFSTOR_Result gdefstor_model_dump(GDEFSTOR_Store * store,
   v.draft = dump_draft;
   if (gdefstor_model_has_blind(store)) {
     v.blind = dump_blind;
+  }
+  if (gdefstor_model_has_sys(store)) {
+    v.record = dump_record;
+    v.counter = dump_counter;
+    v.outbox = dump_outbox;
   }
   rc = store->model.dump(store->model.ctx, tenant, tenant_len, which, &v);
   if (rc == GDEFSTOR_OK) {

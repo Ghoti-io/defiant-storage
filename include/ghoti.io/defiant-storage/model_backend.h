@@ -49,8 +49,16 @@
  * - **The blind table is apart** (a backend that serves it, below). A MAC is
  *   written only into it, only in the `apply` that writes the version it
  *   indexes, and is read back only through it; `rebuild` leaves it alone.
+ * - **Records, counters and outbox rows are truth** (a backend that serves
+ *   them, below). They are written only in a transaction, `rebuild` leaves
+ *   them alone, and they are visited by `dump` (GDEFSTOR_MODEL_TRUTH).
+ * - **A counter's advance outlives its transaction's abort.** A value
+ *   `counter_next` returned for a ::GDEFSTOR_MODEL_COUNTER is never returned
+ *   again for that tenant and name, even when the transaction aborts (`abort`,
+ *   or a `commit` that fails): the backend keeps a floor apart from the
+ *   committed value, which is what `counter_get` and `dump` read.
  * - Strings in visited rows are borrowed for the call; the port copies them.
- *   Rows are visited in no particular order.
+ *   Rows are visited in no particular order, except where a member says.
  */
 
 #ifndef GHOTI_IO_GDEFSTOR_MODEL_BACKEND_H
@@ -165,6 +173,39 @@ typedef struct GDEFSTOR_ModelApply {
   size_t blind_count;                 ///< How many.
 } GDEFSTOR_ModelApply;
 
+/** A record row: non-revisioned bytes under a namespace and a key (model.h). */
+typedef struct GDEFSTOR_ModelRecord {
+  const char * ns;        ///< The namespace.
+  size_t ns_len;          ///< Its length.
+  const char * key;       ///< The key.
+  size_t key_len;         ///< Its length.
+  const uint8_t * bytes;  ///< The value; may be NULL when @ref len is 0.
+  size_t len;             ///< Its length.
+} GDEFSTOR_ModelRecord;
+
+/** GDEFSTOR_ModelBackend::counter_next: a caller's counter (model.h), whose
+ * advance outlives an abort. */
+#define GDEFSTOR_MODEL_COUNTER 1
+/** GDEFSTOR_ModelBackend::counter_next: an outbox stream's last sequence,
+ * named by the stream, whose advance is undone with its transaction. */
+#define GDEFSTOR_MODEL_STREAM 2
+
+/** An outbox row (AD-33). */
+typedef struct GDEFSTOR_ModelOutbox {
+  const char * stream;      ///< Its stream.
+  size_t stream_len;        ///< Its length.
+  uint64_t seq;             ///< Its sequence in the stream, from the port.
+  const char * public_id;   ///< Its public id, unique in the tenant.
+  size_t public_id_len;     ///< Its length.
+  const char * format;      ///< Its payload's format name.
+  size_t format_len;        ///< Its length.
+  const uint8_t * payload;  ///< Opaque; may be NULL when @ref payload_len is 0.
+  size_t payload_len;       ///< Its length.
+  int64_t lease_until_ms;   ///< 0 until claimed; then where the lease ends.
+  uint32_t failures;        ///< Failed deliveries counted.
+  int parked;               ///< Non-zero once parked: never claimed, never deleted.
+} GDEFSTOR_ModelOutbox;
+
 /** A draft row. */
 typedef struct GDEFSTOR_ModelDraft {
   const char * public_id; ///< The entity, or the id it reserves.
@@ -198,6 +239,17 @@ typedef struct GDEFSTOR_ModelVisitor {
    * is given (every blind row of each entity it visits, after the entity). */
   GDEFSTOR_Result (*blind)(void * ctx, uint64_t row,
       const GDEFSTOR_ModelBlind * b);
+  /** Added with records: a record, from `record_get`, `record_list` and
+   * `dump` (GDEFSTOR_MODEL_TRUTH, every record). Called only when set. */
+  GDEFSTOR_Result (*record)(void * ctx, const GDEFSTOR_ModelRecord * r);
+  /** Added with counters: a counter of @p kind and its committed value, from
+   * `dump` (GDEFSTOR_MODEL_TRUTH, every counter of both kinds; the port
+   * leaves out a value of 0). Called only when set. */
+  GDEFSTOR_Result (*counter)(void * ctx, int kind, const char * name,
+      size_t name_len, uint64_t value);
+  /** Added with the outbox: an outbox row, from `outbox_claim` and `dump`
+   * (GDEFSTOR_MODEL_TRUTH, every row, parked or not). Called only when set. */
+  GDEFSTOR_Result (*outbox)(void * ctx, const GDEFSTOR_ModelOutbox * o);
 } GDEFSTOR_ModelVisitor;
 
 /** What a backend's `query` is handed: a query the port has checked. */
@@ -338,8 +390,9 @@ typedef struct GDEFSTOR_ModelBackend {
   /* ---- added after the first version: optional ---------------------------
    * A backend built against the struct that ends at @ref dump sets @ref size
    * to that size (GDEFSTOR_MODEL_BACKEND_SIZE_V1), and one built against the
-   * struct that ends at @ref index_state to GDEFSTOR_MODEL_BACKEND_SIZE_V2;
-   * the port treats every member past its size as NULL. */
+   * struct that ends at @ref index_state to GDEFSTOR_MODEL_BACKEND_SIZE_V2,
+   * and at @ref blind_delete to GDEFSTOR_MODEL_BACKEND_SIZE_V3; the port
+   * treats every member past its size as NULL. */
   /** The context @ref index_state is called with. A member of its own, not
    * @ref ctx, so that a wrapper that copies this struct and replaces @ref ctx
    * to intercept the other members still reaches the backend that owns the
@@ -384,6 +437,79 @@ typedef struct GDEFSTOR_ModelBackend {
    * Deleting none is success. */
   GDEFSTOR_Result (*blind_delete)(void * blind_ctx, void * txn,
       const uint8_t * subject, size_t subject_len);
+  /* ---- records, counters and the outbox (model.h; AD-31, AD-33): optional,
+   * all of them or none -----------------------------------------------------
+   * A backend that sets them keeps three more kinds of truth beside the
+   * entities, written in the same transactions. One that does not is never
+   * asked: the port answers those calls ::GDEFSTOR_ERR_UNSUPPORTED. The port
+   * validates every name and value before it calls; a backend only stores. */
+  /** The context the members below are called with, kept apart from
+   * @ref ctx for the reason @ref index_ctx is. */
+  void * sys_ctx;
+  /** Insert record (@p r->ns, @p r->key), or replace its value, in @p txn. */
+  GDEFSTOR_Result (*record_put)(void * sys_ctx, void * txn,
+      const GDEFSTOR_ModelRecord * r);
+  /** Delete record (@p ns, @p key) in @p txn: `*out_deleted` 1 when there was
+   * one, 0 when not (which is success). */
+  GDEFSTOR_Result (*record_delete)(void * sys_ctx, void * txn, const char * ns,
+      size_t ns_len, const char * key, size_t key_len, int * out_deleted);
+  /** Visit (`record`) record (@p ns, @p key) as @p txn sees it (NULL: the
+   * last commit); visit nothing when there is none. */
+  GDEFSTOR_Result (*record_get)(void * sys_ctx, void * txn,
+      const char * tenant, size_t tenant_len, const char * ns, size_t ns_len,
+      const char * key, size_t key_len, const GDEFSTOR_ModelVisitor * visitor);
+  /** Visit (`record`), as of the last commit and in ascending byte order of
+   * key, the records of @p ns whose key begins with @p prefix (every key when
+   * @p prefix_len is 0), skipping the first @p offset and visiting at most
+   * @p limit. */
+  GDEFSTOR_Result (*record_list)(void * sys_ctx, const char * tenant,
+      size_t tenant_len, const char * ns, size_t ns_len, const char * prefix,
+      size_t prefix_len, uint64_t offset, size_t limit,
+      const GDEFSTOR_ModelVisitor * visitor);
+  /** Advance counter (@p kind, @p name) in @p txn and return its new value:
+   * one more than the larger of its value and its floor (both 0 for a counter
+   * never advanced), which becomes its value. ::GDEFSTOR_ERR_LIMIT when that
+   * would pass INT64_MAX. For ::GDEFSTOR_MODEL_COUNTER the value is also kept
+   * as the floor whatever becomes of @p txn (the rules above); for
+   * ::GDEFSTOR_MODEL_STREAM it is undone with the rest of an aborted
+   * transaction. */
+  GDEFSTOR_Result (*counter_next)(void * sys_ctx, void * txn, int kind,
+      const char * name, size_t name_len, uint64_t * out_value);
+  /** A counter's committed value as of the last commit, 0 when none. */
+  GDEFSTOR_Result (*counter_get)(void * sys_ctx, const char * tenant,
+      size_t tenant_len, int kind, const char * name, size_t name_len,
+      uint64_t * out_value);
+  /** Insert an outbox row in @p txn, as the port made it (sequence, no
+   * lease, no failure, not parked). ::GDEFSTOR_ERR_INVALID when its public id
+   * is a row's already. */
+  GDEFSTOR_Result (*outbox_insert)(void * sys_ctx, void * txn,
+      const GDEFSTOR_ModelOutbox * o);
+  /** In @p txn: when a row of @p stream that is not parked has
+   * `lease_until_ms > now_ms`, do nothing; otherwise take the stream's rows
+   * that are not parked in ascending sequence, at most @p max of them, set
+   * each one's `lease_until_ms` to @p until_ms, and visit (`outbox`) each, as
+   * it is now, in that order. */
+  GDEFSTOR_Result (*outbox_claim)(void * sys_ctx, void * txn,
+      const char * stream, size_t stream_len, int64_t now_ms, int64_t until_ms,
+      size_t max, const GDEFSTOR_ModelVisitor * visitor);
+  /** Delete the row with this public id in @p txn, unless it is parked:
+   * `*out_deleted` 1 when it was deleted, 0 when there is none or it is
+   * parked (both success). */
+  GDEFSTOR_Result (*outbox_delete)(void * sys_ctx, void * txn,
+      const char * public_id, size_t public_id_len, int * out_deleted);
+  /** In @p txn, for the row with this public id: when it is parked, change
+   * nothing; otherwise count one more failure and, when the count reaches
+   * @p park_at, park it (its lease cleared to 0), else end its lease at
+   * @p now_ms. `*out_found` 0 when there is no such row; `*out_parked` its
+   * parked flag afterwards. */
+  GDEFSTOR_Result (*outbox_fail)(void * sys_ctx, void * txn,
+      const char * public_id, size_t public_id_len, int64_t now_ms,
+      uint32_t park_at, int * out_found, int * out_parked);
+  /** How many rows of @p stream (every stream when @p stream_len is 0) are
+   * parked, as of the last commit. */
+  GDEFSTOR_Result (*outbox_parked)(void * sys_ctx, const char * tenant,
+      size_t tenant_len, const char * stream, size_t stream_len,
+      uint64_t * out_count);
 } GDEFSTOR_ModelBackend;
 
 /** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::index_ctx
@@ -395,6 +521,11 @@ typedef struct GDEFSTOR_ModelBackend {
  * was added; gdefstor_store_create_model() accepts it. */
 #define GDEFSTOR_MODEL_BACKEND_SIZE_V2 \
   offsetof(GDEFSTOR_ModelBackend, blind_ctx)
+
+/** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::sys_ctx
+ * was added; gdefstor_store_create_model() accepts it. */
+#define GDEFSTOR_MODEL_BACKEND_SIZE_V3 \
+  offsetof(GDEFSTOR_ModelBackend, sys_ctx)
 
 /**
  * @brief The reference query engine: answer @p plan over the entities

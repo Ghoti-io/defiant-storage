@@ -58,6 +58,7 @@
 #define gdefstor_model_type_text GHOTIIO_DEFSTOR(gdefstor_model_type_text)
 #define gdefstor_model_has_blind GHOTIIO_DEFSTOR(gdefstor_model_has_blind)
 #define gdefstor_model_has_personal GHOTIIO_DEFSTOR(gdefstor_model_has_personal)
+#define gdefstor_model_has_sys GHOTIIO_DEFSTOR(gdefstor_model_has_sys)
 
 /* "No field": the parent of a root-group field, an unset index. */
 #define GDEFSTOR_NONE SIZE_MAX
@@ -237,6 +238,10 @@ GDEFSTOR_Result gdefstor_model_type_text(const GDEFSTOR_Type * t,
 
 /* Whether the store's backend serves the blind index (model_backend.h). */
 int gdefstor_model_has_blind(const GDEFSTOR_Store * store);
+
+/* Whether the store's backend keeps records, counters and the outbox
+ * (model_backend.h). */
+int gdefstor_model_has_sys(const GDEFSTOR_Store * store);
 
 /* Whether a declaration has a personal field, retired ones included. */
 int gdefstor_model_has_personal(const GDEFSTOR_Type * t);

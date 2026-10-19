@@ -4752,4 +4752,7 @@ TEST_F(ModelSweep, RandomHistoriesMatchAnIndependentModel) {
   EXPECT_GE(all.nested_paths, 20);
 }
 
+/* Records, counters and the outbox (story S6a), in this namespace. */
+#include "system.inc"
+
 } /* namespace model_conformance */

@@ -234,6 +234,69 @@ blind equality and the history lookup find none.
 A backend serves this through three optional members (`model_backend.h`);
 one that does not refuses every call here `GDEFSTOR_ERR_UNSUPPORTED`.
 
+## Records, counters and the outbox
+
+Core writes more than entities in one transaction: system records (installed
+and enabled modules, machine-name maps), the config epoch (AD-31) and outbox
+rows (AD-33). These three families live in the entity write, so one
+`GDEFSTOR_Write` commits an entity save, a record put, a counter's next value
+and an outbox append together, or none of them. They are entity operations:
+a write that holds key/bytes rows refuses them, and the reverse.
+
+Names are machine-name-like text that compares by bytes: a record's
+namespace, a counter's name and an outbox stream are 1 to 128 bytes of
+`[A-Za-z0-9_.:-]`, a record's key 1 to 256 bytes of the same, an outbox
+format 1 to 128 bytes of the same or `/` (`<name>/<version>`, AD-34).
+
+**Records** are `(namespace, key) -> bytes`, at most 1 MiB, with no history:
+`gdefstor_record_put()` inserts or replaces, `gdefstor_record_delete()`
+deletes (a missing record deletes nothing and says so), `gdefstor_record_get()`
+reads, and a missing record is `GDEFSTOR_OK` with `found` 0, never an error,
+and distinct from an empty value. `gdefstor_record_list()` lists one
+namespace's records whose key starts with a prefix (empty for all), ordered
+by key bytes, with an offset and a limit of 1 to 1000. A record holds no
+personal value: it has no subject column, so erasure could not find one;
+personal data is a personal field of an entity.
+
+**Counters** are named, per tenant, and monotonic. `gdefstor_counter_next()`
+takes the counter's value plus one and stores it in the write; the first
+value is 1; `gdefstor_counter_peek()` reads the last committed value (0 for
+none). A value is never handed out twice: a write that took a value and then
+aborted (an abort, a broken write, a failed commit) leaves the value taken,
+so the next write takes the one after it and committed values may have gaps.
+A backend keeps a floor apart from the committed value for this.
+
+**The outbox** follows AD-33. `gdefstor_model_outbox_append()` adds a row to a
+stream in the write: a public id unique in the tenant, a format name and an
+opaque payload of at most 1 MiB, which the port never reads. The row takes
+the stream's next sequence (1, 2, 3 ... per tenant and stream) in the write;
+it appears when the write commits and never when it aborts, and an aborted
+write's sequence numbers are given back with it. A public id already used is
+refused, and since the sequence was taken by then the write is broken.
+
+The calls that deliver run each in a write of their own, so they wait for the
+tenant's open write as a write does:
+
+- `gdefstor_model_outbox_claim(stream, lease, now, max)` takes rows for
+  delivery under a lease ending at `now + lease` (the caller's clock). A
+  stream has at most one live claim: while any of its rows that is not
+  parked holds a lease that has not ended, a claim takes nothing. Otherwise
+  it takes the lowest-sequence rows that are not parked, in order, at most
+  `max` (1 to 1000): rows never claimed and rows whose lease ended without a
+  delivery. So delivery is at least once and in order within a stream, and
+  sinks deduplicate by public id.
+- `gdefstor_model_outbox_delivered(ids)` deletes delivered rows; one that is
+  gone already is skipped.
+- `gdefstor_model_outbox_failed(id, now)` counts a failed delivery and ends the
+  row's lease at `now`. The fifth failure (`GDEFSTOR_OUTBOX_PARK_FAILURES`)
+  parks the row: it is never claimed again and never deleted, by a delivery or
+  anything else, and `gdefstor_model_outbox_parked()` counts parked rows of a
+  stream or of every stream, for the admin.
+
+All three families are truth: `gdefstor_model_rebuild()` never touches them,
+`gdefstor_model_dump()` lists them, and a snapshot export includes records
+(the format is the export's, AD-23).
+
 ## Derived data
 
 The current tables, the newest state and the public-id lookup are derived:
@@ -255,13 +318,19 @@ R <row> <revision> <commit seq> <who> <when> <why>
 I <row> <group> <item> <valid_from> <valid_to> <parent> <order> <n> <value>...
 D <public id> <type> <base> <json>
 B <row> <item> <valid_from> <field id> <subject> <mac> <key id> <version>
+K <namespace> <key> <value>
+C <kind> <name> <value>
+O <stream> <seq> <public id> <format> <payload> <lease until> <failures> <parked>
 ```
 
 A value is `v<type>`, then for a set value its integer, its double, its bytes
 and its subject. Trailing absent columns are left out, so a row written
 before a column existed and one written after with it empty read alike.
-`GDEFSTOR_MODEL_TRUTH` dumps `T`, `E`, `S`, `R`, every `I` version, `D` and
-every blind row `B`;
+`GDEFSTOR_MODEL_TRUTH` dumps `T`, `E`, `S`, `R`, every `I` version, `D`,
+every blind row `B`, every record `K`, every counter `C` with a committed
+value above 0 (kind 1 a counter, kind 2 an outbox stream's last sequence; a
+counter's floor is not listed, so an aborted write leaves the dump as it was)
+and every outbox row `O`, parked or not;
 `GDEFSTOR_MODEL_CURRENT` dumps `E` and the current `I` rows.
 
 ## Formats
@@ -330,7 +399,9 @@ key/bytes rows (blobs, the outbox, projections, revision documents) or entity
 operations, not both: the two go to different backends and nothing commits
 across two. An operation refused before it reached the backend leaves the
 write usable; one that failed after (an I/O error, a full allocator) marks it
-broken, and its commit aborts and returns that error.
+broken, and its commit aborts and returns that error. Records, counters and
+outbox appends are entity operations; the outbox's claim, delivery and
+failure calls each open a write of their own.
 
 ## For the authors of a backend
 
@@ -352,13 +423,21 @@ one built against the first version of the struct sets `size` to
 none (`GDEFSTOR_MODEL_BACKEND_SIZE_V2` is the size before them); a backend
 that sets them also writes `GDEFSTOR_ModelApply::blinds` in `apply` and visits
 blind rows through `GDEFSTOR_ModelVisitor::blind` from `items`, `dump` and
-the reference engine's scan.
+the reference engine's scan. Records, counters and the outbox came after:
+`sys_ctx` and eleven functions, all or none (`GDEFSTOR_MODEL_BACKEND_SIZE_V3`
+is the size before them). They keep those rows in the same transactions as
+the entities, leave them alone in `rebuild`, list them in `dump` through the
+visitor's `record`, `counter` and `outbox`, and keep each counter's floor so
+that an aborted transaction's value is never returned again
+(`model_backend.h` says each member's contract; the port checks names,
+values and what each answer holds).
 
 Every backend runs the conformance suite, installed beside the port:
 `model.inc` (named cases for every rule above, the purchase-order fixture,
 and a seeded random sweep of declarations, saves, drafts, reverts, reorders,
 conflicts, state changes and queries checked against a model written apart
-from the library) and `keystore.inc`. `make check-model` here plants a defect
+from the library), `system.inc` (records, counters and the outbox, which
+`model.inc` includes, with a seeded sweep of their own) and `keystore.inc`. `make check-model` here plants a defect
 in each rule the port decides and requires the named test to fail; a
 backend's own repository plants the defects a backend can make (a `valid_to`
 written twice, a revert that reopens old rows, a current table that drifts
@@ -415,8 +494,11 @@ still accepted; every call that needs them is `GDEFSTOR_ERR_UNSUPPORTED` on it.
 - **Large values by content hash.** Values are stored inline, up to 1 MiB.
 - **Every use of the key store by the entity port**: computing MACs,
   encrypting and erasing are core's (S5b, S6).
-- **Blobs, the outbox and small records in the entity transaction.** Until
-  then a write is one kind or the other.
+- **Blobs in the entity transaction.** Until then a write that holds blobs
+  holds no entity operation.
+- **Reading a record or a counter inside a write.** Reads see the last
+  commit; the backend members take a transaction already, so the port call
+  can be added.
 - **Select columns** in a query: a caller reads each entity's tree.
 - **Correlated conditions on nested fields** ("the same line has sku A and
   quantity 5"): each comparison on a path is decided on its own.

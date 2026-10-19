@@ -109,12 +109,25 @@ struct Draft {
   std::string json;
 };
 
+struct Ob {
+  std::string pid;
+  std::string format;
+  std::string payload;
+  int64_t until = 0;
+  uint32_t fails = 0;
+  int parked = 0;
+};
+
 struct Tenant {
   std::map<std::string, std::string> types;
   std::vector<Ent> ents;                 /* row - 1 */
   std::map<std::string, uint64_t> pids;  /* derived */
   std::map<std::string, Draft> drafts;
   uint64_t commit_seq = 0;
+  /* Records, counters and the outbox: truth, which derive() leaves alone. */
+  std::map<std::string, std::map<std::string, std::string>> recs; /* ns, key */
+  std::map<std::pair<int, std::string>, uint64_t> counters;
+  std::map<std::pair<std::string, uint64_t>, Ob> outbox; /* stream, seq */
 };
 
 struct Txn {
@@ -127,6 +140,9 @@ struct Scratch {
   const GDEFSTOR_Allocator * alloc = nullptr;
   std::map<std::string, Tenant> tenants;
   std::map<std::string, Txn *> open;
+  /* Each counter's floor, kept apart from every transaction: the values an
+   * aborted write took stay taken. */
+  std::map<std::string, std::map<std::string, uint64_t>> floors;
 };
 
 Tenant * view(Scratch * s, void * txn, const char * t, size_t tl) {
@@ -599,6 +615,9 @@ static GDEFSTOR_Result s_rebuild(void * ctx, void * txn) {
   return GDEFSTOR_OK;
 }
 
+static GDEFSTOR_Result s_dump_system(Tenant * ten,
+    const GDEFSTOR_ModelVisitor * v);
+
 static GDEFSTOR_Result s_dump(void * ctx, const char * t, size_t tl, int which,
     const GDEFSTOR_ModelVisitor * v) {
   Tenant * ten = view(static_cast<Scratch *>(ctx), nullptr, t, tl);
@@ -607,6 +626,10 @@ static GDEFSTOR_Result s_dump(void * ctx, const char * t, size_t tl, int which,
     return GDEFSTOR_OK;
   }
   if (which == GDEFSTOR_MODEL_TRUTH) {
+    rc = s_dump_system(ten, v);
+    if (rc != GDEFSTOR_OK) {
+      return rc;
+    }
     for (const auto & kv : ten->types) {
       rc = v->type(v->ctx, kv.first.data(), kv.first.size(),
           reinterpret_cast<const uint8_t *>(kv.second.data()), kv.second.size());
@@ -767,6 +790,279 @@ static GDEFSTOR_Result s_blind_delete(void * ctx, void * txn,
   return GDEFSTOR_OK;
 }
 
+/* ---- records, counters and the outbox ---------------------------------- */
+
+static GDEFSTOR_Result visit_record(const GDEFSTOR_ModelVisitor * v,
+    const std::string & ns, const std::string & key, const std::string & b) {
+  GDEFSTOR_ModelRecord r;
+  std::memset(&r, 0, sizeof r);
+  r.ns = ns.data();
+  r.ns_len = ns.size();
+  r.key = key.data();
+  r.key_len = key.size();
+  r.bytes = b.empty() ? nullptr : reinterpret_cast<const uint8_t *>(b.data());
+  r.len = b.size();
+  return v->record(v->ctx, &r);
+}
+
+static GDEFSTOR_Result visit_outbox(const GDEFSTOR_ModelVisitor * v,
+    const std::string & stream, uint64_t seq, const Ob & o) {
+  GDEFSTOR_ModelOutbox m;
+  std::memset(&m, 0, sizeof m);
+  m.stream = stream.data();
+  m.stream_len = stream.size();
+  m.seq = seq;
+  m.public_id = o.pid.data();
+  m.public_id_len = o.pid.size();
+  m.format = o.format.data();
+  m.format_len = o.format.size();
+  m.payload = o.payload.empty() ? nullptr
+                                : reinterpret_cast<const uint8_t *>(o.payload.data());
+  m.payload_len = o.payload.size();
+  m.lease_until_ms = o.until;
+  m.failures = o.fails;
+  m.parked = o.parked;
+  return v->outbox(v->ctx, &m);
+}
+
+static GDEFSTOR_Result s_record_put(void * ctx, void * txn,
+    const GDEFSTOR_ModelRecord * r) {
+  (void)ctx;
+  Tenant & t = static_cast<Txn *>(txn)->copy;
+  t.recs[std::string(r->ns, r->ns_len)][std::string(r->key, r->key_len)] =
+      std::string(reinterpret_cast<const char *>(r->bytes), r->len);
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_record_delete(void * ctx, void * txn, const char * ns,
+    size_t ns_len, const char * key, size_t key_len, int * out) {
+  (void)ctx;
+  Tenant & t = static_cast<Txn *>(txn)->copy;
+  auto it = t.recs.find(std::string(ns, ns_len));
+  *out = it != t.recs.end() && it->second.erase(std::string(key, key_len)) == 1;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_record_get(void * ctx, void * txn, const char * tn,
+    size_t tl, const char * ns, size_t ns_len, const char * key,
+    size_t key_len, const GDEFSTOR_ModelVisitor * v) {
+  Tenant * t = view(static_cast<Scratch *>(ctx), txn, tn, tl);
+  if (t == nullptr) {
+    return GDEFSTOR_OK;
+  }
+  auto it = t->recs.find(std::string(ns, ns_len));
+  if (it == t->recs.end()) {
+    return GDEFSTOR_OK;
+  }
+  auto k = it->second.find(std::string(key, key_len));
+  if (k == it->second.end()) {
+    return GDEFSTOR_OK;
+  }
+  return visit_record(v, it->first, k->first, k->second);
+}
+
+static GDEFSTOR_Result s_record_list(void * ctx, const char * tn, size_t tl,
+    const char * ns, size_t ns_len, const char * prefix, size_t prefix_len,
+    uint64_t offset, size_t limit, const GDEFSTOR_ModelVisitor * v) {
+  Tenant * t = view(static_cast<Scratch *>(ctx), nullptr, tn, tl);
+  if (t == nullptr) {
+    return GDEFSTOR_OK;
+  }
+  auto it = t->recs.find(std::string(ns, ns_len));
+  if (it == t->recs.end()) {
+    return GDEFSTOR_OK;
+  }
+  std::string p(prefix == nullptr ? "" : prefix, prefix_len);
+  uint64_t skipped = 0;
+  size_t given = 0;
+  for (auto k = it->second.lower_bound(p);
+       k != it->second.end() && k->first.compare(0, p.size(), p) == 0 &&
+       given < limit;
+       ++k) {
+    if (skipped < offset) {
+      skipped++;
+      continue;
+    }
+    GDEFSTOR_Result rc = visit_record(v, it->first, k->first, k->second);
+    if (rc != GDEFSTOR_OK) {
+      return rc;
+    }
+    given++;
+  }
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_counter_next(void * ctx, void * txn, int kind,
+    const char * name, size_t name_len, uint64_t * out) {
+  Scratch * s = static_cast<Scratch *>(ctx);
+  Txn * x = static_cast<Txn *>(txn);
+  std::string n(name, name_len);
+  uint64_t cur = x->copy.counters[std::make_pair(kind, n)];
+  uint64_t fl = kind == GDEFSTOR_MODEL_COUNTER ? s->floors[x->tenant][n] : 0;
+  uint64_t base = cur > fl ? cur : fl;
+  if (base >= static_cast<uint64_t>(INT64_MAX)) {
+    return GDEFSTOR_ERR_LIMIT;
+  }
+  x->copy.counters[std::make_pair(kind, n)] = base + 1;
+  if (kind == GDEFSTOR_MODEL_COUNTER) {
+    s->floors[x->tenant][n] = base + 1;
+  }
+  *out = base + 1;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_counter_get(void * ctx, const char * tn, size_t tl,
+    int kind, const char * name, size_t name_len, uint64_t * out) {
+  Tenant * t = view(static_cast<Scratch *>(ctx), nullptr, tn, tl);
+  *out = 0;
+  if (t != nullptr) {
+    auto it = t->counters.find(std::make_pair(kind, std::string(name, name_len)));
+    *out = it == t->counters.end() ? 0 : it->second;
+  }
+  return GDEFSTOR_OK;
+}
+
+static Ob * find_ob(Tenant & t, const char * pid, size_t len) {
+  for (auto & kv : t.outbox) {
+    if (kv.second.pid == std::string(pid, len)) {
+      return &kv.second;
+    }
+  }
+  return nullptr;
+}
+
+static GDEFSTOR_Result s_outbox_insert(void * ctx, void * txn,
+    const GDEFSTOR_ModelOutbox * o) {
+  (void)ctx;
+  Tenant & t = static_cast<Txn *>(txn)->copy;
+  if (find_ob(t, o->public_id, o->public_id_len) != nullptr) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  Ob b;
+  b.pid.assign(o->public_id, o->public_id_len);
+  b.format.assign(o->format, o->format_len);
+  b.payload.assign(reinterpret_cast<const char *>(o->payload), o->payload_len);
+  t.outbox[std::make_pair(std::string(o->stream, o->stream_len), o->seq)] = b;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_outbox_claim(void * ctx, void * txn,
+    const char * stream, size_t stream_len, int64_t now, int64_t until,
+    size_t max, const GDEFSTOR_ModelVisitor * v) {
+  (void)ctx;
+  Tenant & t = static_cast<Txn *>(txn)->copy;
+  std::string st(stream, stream_len);
+  for (const auto & kv : t.outbox) {
+    if (kv.first.first == st && !kv.second.parked && kv.second.until > now) {
+      return GDEFSTOR_OK; /* a live claim holds the stream */
+    }
+  }
+  size_t n = 0;
+  for (auto & kv : t.outbox) {
+    if (kv.first.first != st || kv.second.parked) {
+      continue;
+    }
+    if (n == max) {
+      break;
+    }
+    kv.second.until = until;
+    GDEFSTOR_Result rc = visit_outbox(v, kv.first.first, kv.first.second,
+        kv.second);
+    if (rc != GDEFSTOR_OK) {
+      return rc;
+    }
+    n++;
+  }
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_outbox_delete(void * ctx, void * txn, const char * pid,
+    size_t pid_len, int * out) {
+  (void)ctx;
+  Tenant & t = static_cast<Txn *>(txn)->copy;
+  *out = 0;
+  for (auto it = t.outbox.begin(); it != t.outbox.end(); ++it) {
+    if (it->second.pid == std::string(pid, pid_len)) {
+      if (!it->second.parked) {
+        t.outbox.erase(it);
+        *out = 1;
+      }
+      break;
+    }
+  }
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_outbox_fail(void * ctx, void * txn, const char * pid,
+    size_t pid_len, int64_t now, uint32_t park_at, int * found, int * parked) {
+  (void)ctx;
+  Ob * o = find_ob(static_cast<Txn *>(txn)->copy, pid, pid_len);
+  *found = o != nullptr;
+  *parked = 0;
+  if (o == nullptr) {
+    return GDEFSTOR_OK;
+  }
+  if (!o->parked) {
+    o->fails += 1;
+    if (o->fails >= park_at) {
+      o->parked = 1;
+      o->until = 0;
+    } else {
+      o->until = now;
+    }
+  }
+  *parked = o->parked;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_outbox_parked(void * ctx, const char * tn, size_t tl,
+    const char * stream, size_t stream_len, uint64_t * out) {
+  Tenant * t = view(static_cast<Scratch *>(ctx), nullptr, tn, tl);
+  *out = 0;
+  if (t == nullptr) {
+    return GDEFSTOR_OK;
+  }
+  for (const auto & kv : t->outbox) {
+    if (kv.second.parked && (stream_len == 0 ||
+                                kv.first.first == std::string(stream, stream_len))) {
+      *out += 1;
+    }
+  }
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_dump_system(Tenant * ten, const GDEFSTOR_ModelVisitor * v) {
+  GDEFSTOR_Result rc = GDEFSTOR_OK;
+  if (v->record != nullptr) {
+    for (const auto & ns : ten->recs) {
+      for (const auto & kv : ns.second) {
+        rc = visit_record(v, ns.first, kv.first, kv.second);
+        if (rc != GDEFSTOR_OK) {
+          return rc;
+        }
+      }
+    }
+  }
+  if (v->counter != nullptr) {
+    for (const auto & kv : ten->counters) {
+      rc = v->counter(v->ctx, kv.first.first, kv.first.second.data(),
+          kv.first.second.size(), kv.second);
+      if (rc != GDEFSTOR_OK) {
+        return rc;
+      }
+    }
+  }
+  if (v->outbox != nullptr) {
+    for (const auto & kv : ten->outbox) {
+      rc = visit_outbox(v, kv.first.first, kv.first.second, kv.second);
+      if (rc != GDEFSTOR_OK) {
+        return rc;
+      }
+    }
+  }
+  return rc;
+}
+
 } /* extern "C" */
 
 } /* namespace */
@@ -807,10 +1103,11 @@ static GDEFSTOR_Result kb_list(void * ctx, const char * t, size_t tl,
 }
 }
 
-GDEFSTOR_Result ModelOpen(GDEFSTOR_Store ** out,
-    const GDEFSTOR_Allocator * alloc) {
-  GDEFSTOR_Backend kb;
-  GDEFSTOR_ModelBackend mb;
+/* The two backends of a scratch store, owning a new Scratch. */
+static void ScratchBackends(const GDEFSTOR_Allocator * alloc,
+    GDEFSTOR_Backend * out_kb, GDEFSTOR_ModelBackend * out_mb) {
+  GDEFSTOR_Backend & kb = *out_kb;
+  GDEFSTOR_ModelBackend & mb = *out_mb;
   Scratch * s = new Scratch();
   s->alloc = alloc == nullptr ? gdefstor_allocator_default() : alloc;
   std::memset(&kb, 0, sizeof kb);
@@ -844,9 +1141,28 @@ GDEFSTOR_Result ModelOpen(GDEFSTOR_Store ** out,
   mb.blind_history = s_blind_history;
   mb.subject_lookup = s_subject_lookup;
   mb.blind_delete = s_blind_delete;
+  mb.sys_ctx = s;
+  mb.record_put = s_record_put;
+  mb.record_delete = s_record_delete;
+  mb.record_get = s_record_get;
+  mb.record_list = s_record_list;
+  mb.counter_next = s_counter_next;
+  mb.counter_get = s_counter_get;
+  mb.outbox_insert = s_outbox_insert;
+  mb.outbox_claim = s_outbox_claim;
+  mb.outbox_delete = s_outbox_delete;
+  mb.outbox_fail = s_outbox_fail;
+  mb.outbox_parked = s_outbox_parked;
+}
+
+GDEFSTOR_Result ModelOpen(GDEFSTOR_Store ** out,
+    const GDEFSTOR_Allocator * alloc) {
+  GDEFSTOR_Backend kb;
+  GDEFSTOR_ModelBackend mb;
+  ScratchBackends(alloc, &kb, &mb);
   GDEFSTOR_Result rc = gdefstor_store_create_model(&kb, &mb, alloc, nullptr, out);
   if (rc != GDEFSTOR_OK) {
-    delete s;
+    mb.destroy(mb.ctx);
   }
   return rc;
 }
@@ -856,6 +1172,48 @@ void ModelClose(GDEFSTOR_Store * store) {
 }
 
 #include "model.inc"
+
+/* A backend of the size before records, counters and the outbox: those calls
+ * are refused as unsupported and nothing else changes; and a backend with
+ * some of the members and not all is refused when the store is opened. */
+TEST(ModelPort, ABackendWithoutTheSystemFamiliesServesTheRest) {
+  GDEFSTOR_Backend kb;
+  GDEFSTOR_ModelBackend mb;
+  ScratchBackends(nullptr, &kb, &mb);
+  GDEFSTOR_ModelBackend v3 = mb;
+  v3.destroy = [](void *) {}; /* the last store below destroys the Scratch */
+  v3.size = GDEFSTOR_MODEL_BACKEND_SIZE_V3;
+  GDEFSTOR_Store * old = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_create_model(&kb, &v3, nullptr,
+      nullptr, &old));
+  GDEFSTOR_Write * w = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(old, "t1", 2, nullptr, &w));
+  uint64_t v = 0;
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_record_put(w, "a", 1, "b", 1,
+      nullptr, 0));
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_counter_next(w, "a", 1, &v));
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_model_outbox_append(w, "s", 1,
+      "p", 1, "f", 1, nullptr, 0, nullptr));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(w));
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_counter_peek(old, "t1", 2, "a",
+      1, &v));
+  GDEFSTOR_OutboxClaim * c = nullptr;
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_model_outbox_claim(old, "t1", 2,
+      "s", 1, 10, 0, 1, &c));
+  uint8_t * text = nullptr;
+  size_t len = 0;
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_model_dump(old, "t1", 2, GDEFSTOR_MODEL_TRUTH,
+      &text, &len));
+  gdefstor_bytes_free(nullptr, text);
+  gdefstor_store_destroy(old);
+  GDEFSTOR_ModelBackend part = mb;
+  part.outbox_parked = nullptr;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_store_create_model(&kb, &part,
+      nullptr, nullptr, &old));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_create_model(&kb, &mb, nullptr,
+      nullptr, &old));
+  gdefstor_store_destroy(old); /* destroys the backends, once */
+}
 
 /* A scratch key store over the cipher it is given, apart from the memory
  * library's, so the port runs keystore.inc on its own. */

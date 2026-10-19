@@ -9,7 +9,9 @@ It also has the entity port (`model.h`): declared types with typed, nested
 and multiple fields; entities with one linear revision history each, in which
 only changed items get new rows and `valid_to` is written once; reverts as new
 revisions; drafts outside history; current tables that rebuild from the truth;
-and the query form over fields. A backend implements `model_backend.h`; the
+the query form over fields; and, in the same write as entities, records,
+monotonic counters and an ordered outbox with leases. A backend implements
+`model_backend.h`; the
 port decides what every write means. See `documentation/model.md`. The key
 store port (`keystore.h`) holds subject keys and the erasure ledger.
 
@@ -31,4 +33,4 @@ make test-valgrind test-asan fuzz FUZZ_TIME=30 PREFIX=/path/to/prefix
 `make test` also runs `check-symbols`, `check-aliasing`, `check-seams`, `check-defects`, `check-query` and `check-model`.
 
 Backends run the conformance suites installed beside the port:
-`suite.inc` (key/bytes), `model.inc` (the entity port) and `keystore.inc`.
+`suite.inc` (key/bytes), `model.inc` (the entity port, with `system.inc`) and `keystore.inc`.

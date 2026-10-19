@@ -36,8 +36,9 @@
  *
  * Writes take a GDEFSTOR_Write: the tenant's writer queue and one backend
  * transaction. A write holds either key/bytes rows or entity operations, not
- * both, until records, blobs and the outbox move onto this transaction; a
- * mix is ::GDEFSTOR_ERR_INVALID. A call that fails before it reached the
+ * both; a mix is ::GDEFSTOR_ERR_INVALID. Records, counters and the outbox
+ * (below) are entity operations: they commit in the entity transaction. A
+ * call that fails before it reached the
  * backend leaves the write as it was; one that fails after (an I/O error, a
  * full allocator) marks the write broken, and its commit aborts and returns
  * that error. Reads take the store and the tenant and see the last commit.
@@ -815,6 +816,285 @@ GDEFSTOR_API void gdefstor_subject_hits_free(GDEFSTOR_SubjectHits * hits);
 GDEFSTOR_API GDEFSTOR_Result gdefstor_blind_delete_subject(
     GDEFSTOR_Write * write, const char * subject, size_t subject_len);
 
+/* ---- records, counters and the outbox (AD-31, AD-33) ---------------------
+ *
+ * Three families that live in the entity write beside entities, so that one
+ * GDEFSTOR_Write commits an entity save, a record, a counter and an outbox row
+ * together or none of them (model.md, "Records, counters and the outbox").
+ * They are the entity side of a write: a write that holds key/bytes rows
+ * refuses them, as it refuses every entity operation.
+ *
+ * Names: a record's namespace, a counter's name and an outbox stream are 1 to
+ * ::GDEFSTOR_SYSTEM_MAX_NAME_BYTES bytes of `[A-Za-z0-9_.:-]`; a record's key is
+ * 1 to ::GDEFSTOR_RECORD_MAX_KEY_BYTES bytes of the same; an outbox format is
+ * 1 to ::GDEFSTOR_OUTBOX_MAX_FORMAT_BYTES bytes of the same or `/` (AD-34
+ * names a format `<name>/<version>`). Keys and names compare and sort by
+ * bytes. A store whose backend has no such families answers every call below
+ * ::GDEFSTOR_ERR_UNSUPPORTED. */
+
+/** Bytes of a record namespace, a counter name or an outbox stream. */
+#define GDEFSTOR_SYSTEM_MAX_NAME_BYTES 128
+/** Bytes of a record key. */
+#define GDEFSTOR_RECORD_MAX_KEY_BYTES 256
+/** Bytes of a record's value. */
+#define GDEFSTOR_RECORD_MAX_BYTES (1024u * 1024u)
+/** Records one gdefstor_record_list() returns at most. */
+#define GDEFSTOR_RECORD_MAX_PAGE 1000
+/** Bytes of an outbox row's format name. */
+#define GDEFSTOR_OUTBOX_MAX_FORMAT_BYTES 128
+/** Bytes of an outbox row's payload. */
+#define GDEFSTOR_OUTBOX_MAX_PAYLOAD_BYTES (1024u * 1024u)
+/** Rows one gdefstor_model_outbox_claim() takes at most. */
+#define GDEFSTOR_OUTBOX_MAX_CLAIM 1000
+/**
+ * Failures after which an outbox row is parked (AD-33): the
+ * GDEFSTOR_OUTBOX_PARK_FAILURES th gdefstor_model_outbox_failed() of a row
+ * parks it. A parked row is never claimed and never deleted; the admin counts
+ * it (gdefstor_model_outbox_parked()).
+ */
+#define GDEFSTOR_OUTBOX_PARK_FAILURES 5
+
+/**
+ * @brief Insert or replace a record: non-revisioned bytes under
+ * (@p ns, @p key), in this write.
+ *
+ * A record is truth, with no history: the newest put is all there is. It
+ * holds no personal value (AD-19): a record has no subject, so erasure could
+ * not find one there; personal data goes in a personal field of an entity.
+ * gdefstor_model_rebuild() never touches records, and a snapshot export
+ * includes them (AD-23; the format is the export's).
+ *
+ * @param bytes The value, copied. May be NULL when @p len is 0: an empty
+ *   value, which is a record (gdefstor_record_get() finds it).
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (a name, a key or a write that
+ *   is not usable), ::GDEFSTOR_ERR_LIMIT (more than
+ *   ::GDEFSTOR_RECORD_MAX_BYTES), ::GDEFSTOR_ERR_UNSUPPORTED, or a backend's
+ *   error (which breaks the write).
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_record_put(GDEFSTOR_Write * write,
+    const char * ns, size_t ns_len, const char * key, size_t key_len,
+    const uint8_t * bytes, size_t len);
+
+/**
+ * @brief Delete a record in this write. A record that is not there deletes
+ * nothing and succeeds.
+ * @param out_deleted Set to 1 when a record was deleted, 0 when there was
+ *   none. May be NULL.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_record_delete(GDEFSTOR_Write * write,
+    const char * ns, size_t ns_len, const char * key, size_t key_len,
+    int * out_deleted);
+
+/**
+ * @brief Read a record as of the last commit.
+ *
+ * A missing record is not an error: it is ::GDEFSTOR_OK with @p out_found 0
+ * and nothing allocated, apart from a record whose value is empty (found, 0
+ * bytes).
+ *
+ * @param out_found Receives 1 when the record exists, else 0.
+ * @param out_bytes Receives the value when found (free with
+ *   gdefstor_bytes_free() and the store's allocator; a non-NULL block even for
+ *   an empty value), else NULL.
+ * @param out_len Receives its length.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID, ::GDEFSTOR_ERR_UNSUPPORTED,
+ *   ::GDEFSTOR_ERR_OOM, or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_record_get(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * ns, size_t ns_len,
+    const char * key, size_t key_len, int * out_found, uint8_t ** out_bytes,
+    size_t * out_len);
+
+/** A page of records. Opaque. */
+typedef struct GDEFSTOR_RecordList GDEFSTOR_RecordList;
+
+/**
+ * @brief List the records of @p ns whose key starts with @p prefix, as of the
+ * last commit, ordered by key (bytes), skipping @p offset and returning at
+ * most @p limit.
+ *
+ * @param prefix May be empty (every key of the namespace); otherwise as a key.
+ * @param limit 1 to ::GDEFSTOR_RECORD_MAX_PAGE.
+ * @return ::GDEFSTOR_OK (no record is an empty list), ::GDEFSTOR_ERR_INVALID
+ *   (a limit of 0, a name or prefix that is not one), ::GDEFSTOR_ERR_LIMIT (a
+ *   limit above the page), ::GDEFSTOR_ERR_UNSUPPORTED, ::GDEFSTOR_ERR_OOM,
+ *   ::GDEFSTOR_ERR_CORRUPT (a backend that answered out of order or outside
+ *   the prefix), or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_record_list(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * ns, size_t ns_len,
+    const char * prefix, size_t prefix_len, uint64_t offset, size_t limit,
+    GDEFSTOR_RecordList ** out_list);
+
+/** @return Records in the page. */
+GDEFSTOR_API size_t gdefstor_record_list_count(const GDEFSTOR_RecordList * list);
+
+/**
+ * @brief Record @p index of the page. Borrowed until the list is freed.
+ * @param out_key Receives its key (not NUL-terminated by contract).
+ * @param out_bytes Receives its value; may be NULL for an empty value.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_record_list_item(
+    const GDEFSTOR_RecordList * list, size_t index, const char ** out_key,
+    size_t * out_key_len, const uint8_t ** out_bytes, size_t * out_len);
+
+/** @brief Release a page. NULL is ignored. */
+GDEFSTOR_API void gdefstor_record_list_free(GDEFSTOR_RecordList * list);
+
+/**
+ * @brief Take the next value of a named, monotonic counter, in this write:
+ * its value plus one, stored in the same write (the config epoch of AD-31 is
+ * one).
+ *
+ * A counter starts at 0, so the first value taken is 1. It never goes
+ * backwards and never hands a value out twice: a value taken in a write that
+ * then aborts (gdefstor_write_abort(), a broken write, a failed commit) is
+ * skipped, never taken again, while gdefstor_counter_peek() goes on reading the
+ * last committed value. So committed values may have gaps.
+ *
+ * @param out_value Receives the value. Written only on success.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID, ::GDEFSTOR_ERR_LIMIT (the
+ *   counter is at INT64_MAX), ::GDEFSTOR_ERR_UNSUPPORTED, or a backend's error
+ *   (which breaks the write).
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_counter_next(GDEFSTOR_Write * write,
+    const char * name, size_t name_len, uint64_t * out_value);
+
+/**
+ * @brief A counter's value as of the last commit: the value the newest
+ * committed write took, or 0 when none ever has.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_counter_peek(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * name,
+    size_t name_len, uint64_t * out_value);
+
+/**
+ * @brief Append an outbox row to @p stream in this write (AD-33): work that
+ * must happen after the commit, or a write to a secondary store (AD-13).
+ *
+ * The row gets the stream's next sequence (1, 2, 3 ... per tenant and
+ * stream), in the write; it appears when the write commits and never when it
+ * aborts. The payload is opaque bytes in @p format: the port never reads it.
+ * Payloads carry references, or personal values only as ciphertext (AD-33).
+ *
+ * @param public_id The row's public id, unique in the tenant (sinks
+ *   deduplicate by it). One already used is ::GDEFSTOR_ERR_INVALID.
+ * @param out_seq Receives the sequence. May be NULL.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID, ::GDEFSTOR_ERR_LIMIT (a payload
+ *   over ::GDEFSTOR_OUTBOX_MAX_PAYLOAD_BYTES), ::GDEFSTOR_ERR_UNSUPPORTED, or a
+ *   backend's error (which breaks the write).
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_model_outbox_append(
+    GDEFSTOR_Write * write, const char * stream, size_t stream_len,
+    const char * public_id, size_t public_id_len, const char * format,
+    size_t format_len, const uint8_t * payload, size_t payload_len,
+    uint64_t * out_seq);
+
+/** Rows a claim took. Opaque. */
+typedef struct GDEFSTOR_OutboxClaim GDEFSTOR_OutboxClaim;
+
+/** One claimed row. Pointers are valid until the claim is freed. */
+typedef struct GDEFSTOR_OutboxEntry {
+  size_t size;              ///< Set by the caller: `sizeof(GDEFSTOR_OutboxEntry)`.
+  const char * stream;      ///< Its stream.
+  size_t stream_len;        ///< Its length.
+  uint64_t seq;             ///< Its sequence in the stream.
+  const char * public_id;   ///< Its public id.
+  size_t public_id_len;     ///< Its length.
+  const char * format;      ///< Its payload's format.
+  size_t format_len;        ///< Its length.
+  const uint8_t * payload;  ///< The payload; may be NULL when empty.
+  size_t payload_len;       ///< Its length.
+  uint32_t failures;        ///< gdefstor_model_outbox_failed() calls so far.
+  int64_t lease_until_ms;   ///< The claim's lease ends here (the caller's clock).
+} GDEFSTOR_OutboxEntry;
+
+/**
+ * @brief Claim rows of one stream for delivery, under a lease that ends at
+ * @p now_ms + @p lease_ms (the caller's clock).
+ *
+ * A stream has at most one live claim, which is what keeps delivery in order
+ * (AD-33): while any row of the stream that is not parked has a lease that
+ * has not ended (`lease_until_ms > now_ms`), a claim takes nothing. Otherwise
+ * it takes the stream's lowest-sequence rows that are not parked, in sequence
+ * order, at most @p max: rows never claimed, and rows whose lease ended
+ * without a delivery (claimable again, so delivery is at least once).
+ *
+ * The claim runs as a write of its own: it waits for the tenant's open write
+ * as gdefstor_write_begin() does (::GDEFSTOR_ERR_BUSY for a caller that is not
+ * a fiber), and two stores on one database never hold live leases on one
+ * stream at once.
+ *
+ * @param lease_ms Greater than 0.
+ * @param max 1 to ::GDEFSTOR_OUTBOX_MAX_CLAIM.
+ * @param out_claim Receives the rows, perhaps none.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (an argument, a lease end past
+ *   INT64_MAX), ::GDEFSTOR_ERR_LIMIT (a max above the claim),
+ *   ::GDEFSTOR_ERR_UNSUPPORTED, ::GDEFSTOR_ERR_BUSY, ::GDEFSTOR_ERR_OOM,
+ *   ::GDEFSTOR_ERR_CORRUPT (a backend that answered out of order), or a
+ *   backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_model_outbox_claim(
+    GDEFSTOR_Store * store, const char * tenant, size_t tenant_len,
+    const char * stream, size_t stream_len, int64_t lease_ms, int64_t now_ms,
+    size_t max, GDEFSTOR_OutboxClaim ** out_claim);
+
+/** @return Rows in the claim. */
+GDEFSTOR_API size_t gdefstor_model_outbox_claim_count(
+    const GDEFSTOR_OutboxClaim * claim);
+
+/** @brief Describe row @p index of the claim (0 is the lowest sequence). */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_model_outbox_claim_entry(
+    const GDEFSTOR_OutboxClaim * claim, size_t index,
+    GDEFSTOR_OutboxEntry * out);
+
+/** @brief Release a claim. NULL is ignored. */
+GDEFSTOR_API void gdefstor_model_outbox_claim_free(GDEFSTOR_OutboxClaim * claim);
+
+/**
+ * @brief Delete delivered rows, by public id, in a write of its own.
+ *
+ * A row that is not there (delivered already: delivery is at least once) is
+ * skipped. A parked row is never deleted here, nor anywhere: it stays until
+ * an operator acts on it.
+ *
+ * @param out_deleted Receives how many rows were deleted. May be NULL.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (an id that is not a public id,
+ *   a NULL array with @p count above 0), ::GDEFSTOR_ERR_UNSUPPORTED,
+ *   ::GDEFSTOR_ERR_BUSY, or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_model_outbox_delivered(
+    GDEFSTOR_Store * store, const char * tenant, size_t tenant_len,
+    const char * const * public_ids, const size_t * public_id_lens,
+    size_t count, size_t * out_deleted);
+
+/**
+ * @brief Count one failed delivery of a row, in a write of its own.
+ *
+ * The row's lease ends at @p now_ms, so it is claimable again from then on (a
+ * runner that fails a row leaves the rest of its claim too: a later row
+ * delivered after an earlier one failed is delivered out of order). The
+ * ::GDEFSTOR_OUTBOX_PARK_FAILURES th failure parks the row instead: it is
+ * never claimed again and never deleted, and gdefstor_model_outbox_parked()
+ * counts it. A parked row's failure changes nothing.
+ *
+ * @param out_parked Set to 1 when the row is parked now, else 0. May be NULL.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (no such row, or an argument),
+ *   ::GDEFSTOR_ERR_UNSUPPORTED, ::GDEFSTOR_ERR_BUSY, or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_model_outbox_failed(
+    GDEFSTOR_Store * store, const char * tenant, size_t tenant_len,
+    const char * public_id, size_t public_id_len, int64_t now_ms,
+    int * out_parked);
+
+/**
+ * @brief How many rows of @p stream are parked, as of the last commit; with
+ * @p stream_len 0, of every stream of the tenant.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_model_outbox_parked(
+    GDEFSTOR_Store * store, const char * tenant, size_t tenant_len,
+    const char * stream, size_t stream_len, uint64_t * out_count);
+
 /* ---- derived data --------------------------------------------------------- */
 
 /**
@@ -822,12 +1102,13 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_blind_delete_subject(
  * write's tenant and rebuild it from the truth, in this write.
  *
  * The blind table is not derived and is left alone: its rows are truth for as
- * long as their subject exists.
+ * long as their subject exists. So are records, counters and outbox rows,
+ * which are truth and are never touched.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_model_rebuild(GDEFSTOR_Write * write);
 
 /** gdefstor_model_dump(): the truth (entities, states, revisions, every item
- * version, declarations, drafts, blind rows). */
+ * version, declarations, drafts, blind rows, records, counters, outbox rows). */
 #define GDEFSTOR_MODEL_TRUTH 1
 /** gdefstor_model_dump(): the derived data (current items, current state). */
 #define GDEFSTOR_MODEL_CURRENT 2
