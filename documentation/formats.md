@@ -43,9 +43,112 @@ in that stream. The payload is one JSON value the caller supplied. A log
 line is that document plus a newline, written by `gdefstor_outbox_run` after
 the commit, never inside it.
 
+## defiant-snapshot/2
+
+The current snapshot (AD-23, AD-34): a zip that is a logical export of one
+tenant, readable without the framework. Writers write version 2; a reader
+reads 1 and 2 and refuses a newer version with `GDEFSTOR_ERR_UNSUPPORTED`
+(`gdefstor_snapshot_import_explain` says which, in words). The member named
+`manifest` is:
+
+```json
+{"format":"defiant-snapshot/2","taken_ms":1234,"entries":[{"key":"r:...","kind":"revision"}],
+ "model":["model/73686f702e6f72646572/type.json","model/73686f702e6f72646572/entities.json",
+          "model/73686f702e6f72646572/6f31.json","model/drafts.json","model/records.json",
+          "model/counters.json","model/outbox.json"]}
+```
+
+`taken_ms` is there when `gdefstor_snapshot_export_at` made it. `entries`
+lists the key/bytes rows, exactly as in version 1 below. `model` lists the
+**entity part**, the truth of the entity port (model.h), in the order the
+members are written; it is empty for a tenant that holds none. Every member
+of the archive is the manifest, a member one of the two lists names, or
+`ledger`; anything else is `GDEFSTOR_ERR_CORRUPT`.
+
+The entity part is read through the backend's `dump` of the truth, so it is
+the same whichever backend held it, and it holds no derived data: no current
+table, no blind row, no index. Every list is sorted, so the same truth gives
+the same bytes. A personal value is there as stored, ciphertext and subject;
+no key is ever in a snapshot. Member names spell names in lowercase hex
+(`73686f702e6f72646572` is `shop.order`), so no two differ only in case.
+
+**`model/<hex of type>/type.json`**, one per type: the declaration exactly as
+stored, a `defiant-type/1` document (model.md, "Formats"). Types come in byte
+order of name.
+
+**`model/<hex of type>/entities.json`**, one per type, after its declaration:
+
+```json
+{"type":"shop.order","entities":[{"id":"o1","order":3,"creator":"u2","created_ms":120,
+  "revision":4,"last_item":9,"states":[{"published":true,"deleted":false,"actor":"u1","when_ms":5000}]}]}
+```
+
+The entities of the type in byte order of public id. `order` is the entity's
+place among the tenant's entities (1, 2, 3 ... across every type), the order
+its internal row had; rows themselves are internal (AD-34) and are given out
+afresh on import, in this order. `revision` is its newest revision (0 for an
+entity never saved), `last_item` the highest item id it has given out, and
+`states` its state history, oldest first.
+
+**`model/<hex of type>/<hex of public id>.json`**, one per entity, after its
+type's entities:
+
+```json
+{"type":"shop.order","id":"o1",
+ "revisions":[{"revision":1,"commit":1,"who":"u1","when_ms":1000,"why":"first","languages":"en"}],
+ "items":[{"lang":"en","group":0,"item":1,"parent":0,"order":"0000000000000000","from":1,"to":2,
+           "values":{"number":"A-1","total":"19.99","paid":false,"note":{"@c":"01fe","@s":"subj1"}}},
+          {"lang":"en","group":2,"item":4,"parent":1,"order":"3ff0000000000000","from":1,"to":0,
+           "values":{"sku":"a","qty":1,"price":"5.00"}}]}
+```
+
+`revisions` are revisions 1 to the entity's newest, each with its commit
+sequence (`commit`: the same for every revision one write made), who, when,
+why and the languages it changed. `items` is every item version of every
+language, by group, item and `from`: `group` is the group number of the
+declaration (0 the root group), `item` and `parent` the stable item ids,
+`order` the order key's IEEE-754 bits in 16 hex digits (exact, and no locale
+in it), `from` and `to` the version's `valid_from` and `valid_to` (0 while it
+is open). `values` names each value by its field's name in that group and
+spells it as `defiant-tree/1` does (model.md); a column with no value is left
+out.
+
+**`model/drafts.json`**: `{"drafts":[{"id":"o1","type":"shop.order","base":4,"document":"..."}]}`,
+by public id; `document` is the stored `defiant-draft/1` document, byte for
+byte, as a JSON string.
+
+**`model/records.json`**: `{"records":[{"namespace":"core.module","key":"alpha","text":"..."}]}`,
+by namespace and key. A value that is UTF-8 without NUL is `"text"`; any
+other is `"hex"`, lowercase.
+
+**`model/counters.json`**: `{"counters":[{"kind":"counter","name":"core.epoch","value":3}]}`:
+every caller's counter (`counter`) and every outbox stream's sequence
+(`stream`) at its committed value, by kind and name. A value an aborted write
+took above the committed one is not truth and is not exported.
+
+**`model/outbox.json`**: `{"outbox":[{"stream":"core.bus","seq":1,"id":"p1","format":"defiant-bus/1","text":"...","lease_until_ms":150,"failures":0,"parked":false}]}`,
+by stream and sequence; the payload is `"text"` or `"hex"` as for records.
+The drafts, records, counters and outbox members are left out when empty.
+
+An import is untrusted (AD-37): every member is parsed and checked before
+anything is written, and content an export does not write is
+`GDEFSTOR_ERR_CORRUPT`: a declaration that is not canonical or not the
+member's type, a public id twice, places that are not 1 to n, revisions that
+are not 1 to the newest, a version outside them, closed before it opened,
+named twice or with an id past `last_item`, a value its field refuses, a
+draft of an undeclared type or based past its entity's head, a duplicate
+record, counter or outbox row, an outbox row past its stream's counter. It
+writes into a tenant that holds no truth (else `GDEFSTOR_ERR_INVALID`), in one
+write: the declarations, the entities in their order with their states, each
+revision with its commit sequence (current tables rebuilt as it is applied),
+the drafts, the records, the counters at their values and the outbox rows
+with their leases, failures and parked flags, through the backend's restore
+members (model_backend.h). Blind rows are core's to rebuild from decryptable
+values (AD-23).
+
 ## defiant-snapshot/1
 
-A zip. The member named `manifest` is:
+Still read; no longer written. A zip. The member named `manifest` is:
 
 ```json
 {"format":"defiant-snapshot/1","entries":[{"key":"r:...","kind":"revision"}]}

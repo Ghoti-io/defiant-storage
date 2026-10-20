@@ -59,6 +59,11 @@ static int sys_name_ok(const char * p, size_t n, size_t cap, int slash) {
   return 1;
 }
 
+int gdefstor_model_sys_name_ok(const char * p, size_t n, size_t cap,
+    int slash) {
+  return sys_name_ok(p, n, cap, slash);
+}
+
 static int name_ok(const char * p, size_t n) {
   return sys_name_ok(p, n, GDEFSTOR_SYSTEM_MAX_NAME_BYTES, 0);
 }

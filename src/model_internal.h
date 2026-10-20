@@ -29,6 +29,7 @@
 
 #include <ghoti.io/defiant-storage/macros.h>
 #include "internal.h"
+#include <ghoti.io/text/json.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -63,6 +64,12 @@
 #define gdefstor_model_has_blind GHOTIIO_DEFSTOR(gdefstor_model_has_blind)
 #define gdefstor_model_has_personal GHOTIIO_DEFSTOR(gdefstor_model_has_personal)
 #define gdefstor_model_has_sys GHOTIIO_DEFSTOR(gdefstor_model_has_sys)
+#define gdefstor_model_has_restore GHOTIIO_DEFSTOR(gdefstor_model_has_restore)
+#define gdefstor_model_langs_ok GHOTIIO_DEFSTOR(gdefstor_model_langs_ok)
+#define gdefstor_model_sys_name_ok GHOTIIO_DEFSTOR(gdefstor_model_sys_name_ok)
+#define gdefstor_model_value_json GHOTIIO_DEFSTOR(gdefstor_model_value_json)
+#define gdefstor_model_value_from_json \
+  GHOTIIO_DEFSTOR(gdefstor_model_value_from_json)
 
 /* "No field": the parent of a root-group field, an unset index. */
 #define GDEFSTOR_NONE SIZE_MAX
@@ -277,5 +284,29 @@ int gdefstor_model_has_sys(const GDEFSTOR_Store * store);
 
 /* Whether a declaration has a personal field, retired ones included. */
 int gdefstor_model_has_personal(const GDEFSTOR_Type * t);
+
+/* Whether the store's backend can be imported into (model_backend.h). */
+int gdefstor_model_has_restore(const GDEFSTOR_Store * store);
+
+/* A revision's languages as stored: tags in ascending byte order, each once,
+ * joined by ','. */
+int gdefstor_model_langs_ok(const char * p, size_t n);
+
+/* 1 to @p cap bytes of `[A-Za-z0-9_.:-]`, and `/` with @p slash: the names of
+ * records, counters, streams and outbox formats. */
+int gdefstor_model_sys_name_ok(const char * p, size_t n, size_t cap,
+    int slash);
+
+/* Append value @p v of field @p f as `defiant-tree/1` spells a scalar. */
+GDEFSTOR_Result gdefstor_model_value_json(const GDEFSTOR_Allocator * alloc,
+    const GDEFSTOR_MField * f, const GDEFSTOR_Value * v, char ** buf,
+    size_t * len, size_t * cap);
+
+/* Read a scalar spelled as `defiant-tree/1` spells one, into @p out, which
+ * owns its bytes (gdefstor_model_value_clear()). A JSON null is no value.
+ * The value is not checked against the field's limits. */
+GDEFSTOR_Result gdefstor_model_value_from_json(
+    const GDEFSTOR_Allocator * alloc, const GDEFSTOR_MField * f,
+    const GTEXT_JSON_Value * j, GDEFSTOR_Value * out);
 
 #endif /* GHOTI_IO_GDEFSTOR_SRC_MODEL_INTERNAL_H */

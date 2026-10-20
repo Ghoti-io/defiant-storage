@@ -359,8 +359,40 @@ tenant's open write as a write does:
   stream or of every stream, for the admin.
 
 All three families are truth: `gdefstor_model_rebuild()` never touches them,
-`gdefstor_model_dump()` lists them, and a snapshot export includes records
-(the format is the export's, AD-23).
+`gdefstor_model_dump()` lists them, and a snapshot carries them (below).
+
+## Snapshots
+
+A snapshot (`snapshot.h`, AD-23) is a logical export of a tenant: on a store
+with this port, `gdefstor_snapshot_export()` and its variants add the
+**entity part** to the key/bytes rows, in `defiant-snapshot/2`
+(`formats.md`). It is the truth `dump` visits, read through the backend:
+declarations, entities with their state history, revisions with who, when,
+why, commit sequence and languages, every item version of every language,
+drafts, records, counters and outbox rows. Derived data stays out: no current
+table, no blind row, no index. Personal values are there as stored,
+ciphertext and subject, and no key is.
+
+`gdefstor_snapshot_import()` writes it into an empty tenant of any backend
+that has the restore members (below): item ids, revision numbers, commit
+sequences, `valid_from` and `valid_to`, order keys, creators, times and
+languages come back exactly, and so the truth `dump` of the import equals the
+source's (less its blind rows, which core rebuilds from decryptable values,
+AD-23). The current tables are rebuilt as each revision is written back.
+Counters come back at their committed values, so the next one continues
+from there; a value an aborted write took above the committed one is not
+truth and does not travel. Outbox rows keep their sequences, leases,
+failures and parked flags. Entity rows are given out afresh in the order the
+source's had. The same truth always exports to the same bytes, whichever
+backend held it.
+
+An import refuses, in words through `gdefstor_snapshot_import_explain()`, a
+tenant that holds anything (`GDEFSTOR_ERR_INVALID`), a newer format
+(`GDEFSTOR_ERR_UNSUPPORTED`), a store that cannot hold an entity part
+(`GDEFSTOR_ERR_UNSUPPORTED`) and any member that is not what an export writes
+(`GDEFSTOR_ERR_CORRUPT`), and writes nothing when it refuses. A snapshot that
+holds key/bytes rows as well commits them in a second write, after the entity
+part.
 
 ## Derived data
 
@@ -519,6 +551,12 @@ languages an entity has a tree in from its root items; a backend without it
 `items` instead, which reads every language's whole tree. A backend keeps the
 language as a column, never as a table or a column per language, and reads
 one language's items without the others' where it is asked for one.
+Restoring a snapshot (story S6a3) needs three more, with `restore_ctx`, all
+or none (`GDEFSTOR_MODEL_BACKEND_SIZE_V5` is the size before them):
+`restore_revision` is an `apply` that keeps the commit sequence it is given
+and raises the tenant's to at least it, `restore_counter` sets a counter's
+committed value, and `restore_outbox` inserts an outbox row with its lease,
+failures and parked flag. A backend without them cannot be imported into.
 
 Every backend runs the conformance suite, installed beside the port:
 `model.inc` (named cases for every rule above, the purchase-order fixture,
@@ -526,8 +564,10 @@ and a seeded random sweep of declarations, saves, drafts, reverts, reorders,
 conflicts, state changes and queries checked against a model written apart
 from the library), `system.inc` (records, counters and the outbox, which
 `model.inc` includes, with a seeded sweep of their own), `language.inc` (the
-language axis, which `model.inc` includes, with a seeded multilingual sweep)
-and `keystore.inc`. `make check-model` here plants a defect
+language axis, which `model.inc` includes, with a seeded multilingual sweep),
+`snapshot.inc` (export and import, which `model.inc` includes),
+`snapshot_fixture.inc` (the tenant those cases and the cross-backend round
+trips build, through the public calls only) and `keystore.inc`. `make check-model` here plants a defect
 in each rule the port decides and requires the named test to fail; a
 backend's own repository plants the defects a backend can make (a `valid_to`
 written twice, a revert that reopens old rows, a current table that drifts

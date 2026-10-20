@@ -237,4 +237,74 @@ GDEFSTOR_Result gdefstor_check_payload(const GDEFSTOR_Allocator * alloc,
  * (when @p commit and the write is not broken) or abort it. model.c. */
 GDEFSTOR_Result gdefstor_model_finish(GDEFSTOR_Write * write, int commit);
 
+/* ---- the entity part of a snapshot (model_snapshot.c) -------------------
+ * The seam between the snapshot (snapshot.c) and the entity port: the
+ * snapshot calls only these. */
+
+#define gdefstor_snap_model_free GHOTIIO_DEFSTOR(gdefstor_snap_model_free)
+#define gdefstor_snap_model_export GHOTIIO_DEFSTOR(gdefstor_snap_model_export)
+#define gdefstor_snap_model_member GHOTIIO_DEFSTOR(gdefstor_snap_model_member)
+#define gdefstor_snap_model_check GHOTIIO_DEFSTOR(gdefstor_snap_model_check)
+#define gdefstor_snap_model_import GHOTIIO_DEFSTOR(gdefstor_snap_model_import)
+#define gdefstor_snap_model_empty GHOTIIO_DEFSTOR(gdefstor_snap_model_empty)
+#define gdefstor_snap_model_none GHOTIIO_DEFSTOR(gdefstor_snap_model_none)
+#define gdefstor_snap_model_can_hold \
+  GHOTIIO_DEFSTOR(gdefstor_snap_model_can_hold)
+#define gdefstor_snap_model_open GHOTIIO_DEFSTOR(gdefstor_snap_model_open)
+
+
+/* One member of the entity part: its name and its bytes, owned. */
+typedef struct GDEFSTOR_SnapMember {
+  char * name;
+  size_t name_len;
+  uint8_t * bytes;
+  size_t len;
+} GDEFSTOR_SnapMember;
+
+/* The entity truth of one tenant, read from a store or from a snapshot. */
+typedef struct GDEFSTOR_SnapModel GDEFSTOR_SnapModel;
+
+void gdefstor_snap_model_free(GDEFSTOR_SnapModel * m);
+
+/* Read the tenant's truth through the backend's `dump` and spell it as the
+ * members of a snapshot's entity part, in the order they are written: none
+ * for a tenant that holds no truth, or a store without the entity port.
+ * Free each member's name and bytes and the array with the store's
+ * allocator. */
+GDEFSTOR_Result gdefstor_snap_model_export(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const GDEFSTOR_Limits * cap,
+    GDEFSTOR_SnapMember ** out, size_t * out_count);
+
+/* Hand an entity part every member the manifest lists under "model", in
+ * its order (gdefstor_snap_model_member(); the first call makes *m), then
+ * check the whole (gdefstor_snap_model_check()). Each returns ERR_CORRUPT
+ * for content that is not what an export writes. */
+GDEFSTOR_Result gdefstor_snap_model_member(GDEFSTOR_SnapModel ** m,
+    const GDEFSTOR_Allocator * alloc, const GDEFSTOR_Limits * cap,
+    const char * name, size_t name_len, const uint8_t * bytes, size_t len);
+GDEFSTOR_Result gdefstor_snap_model_check(GDEFSTOR_SnapModel * m);
+
+/* Whether the tenant holds any entity truth (a declaration, an entity, a
+ * draft, a blind row, a record, a counter or an outbox row), as of the last
+ * commit. A store without the entity port holds none. */
+GDEFSTOR_Result gdefstor_snap_model_empty(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, int * out_empty);
+
+/* Write a checked entity part into @p write's tenant, which the caller has
+ * found empty. Nothing is committed here. ERR_UNSUPPORTED when the part is
+ * not empty and the store cannot hold it (no entity port, no restore
+ * members, or records, counters or outbox rows on a backend without them). */
+GDEFSTOR_Result gdefstor_snap_model_import(GDEFSTOR_Write * write,
+    const GDEFSTOR_SnapModel * m);
+
+/* Whether a checked entity part holds nothing. */
+int gdefstor_snap_model_none(const GDEFSTOR_SnapModel * m);
+
+/* Whether the store can be imported into: the entity port, with the
+ * restore members and records, counters and the outbox (model_backend.h). */
+int gdefstor_snap_model_can_hold(const GDEFSTOR_Store * store);
+
+/* Open @p write's entity transaction now (gdefstor_model_txn()). */
+GDEFSTOR_Result gdefstor_snap_model_open(GDEFSTOR_Write * write);
+
 #endif /* GHOTI_IO_GDEFSTOR_SRC_INTERNAL_H */

@@ -18,8 +18,8 @@ store port (`keystore.h`) holds subject keys and the erasure ledger.
 The in-memory backend is a separate library, `defiant-storage-memory`. SQLite
 is not this library. The port does not hash plaintext and does not encrypt.
 
-Formats are `defiant-revision/1`, `defiant-outbox/1` and `defiant-snapshot/1`
-(`documentation/formats.md`), and `defiant-type/1` and `defiant-tree/1`
+Formats are `defiant-revision/1`, `defiant-outbox/1` and `defiant-snapshot/2`
+(which reads `/1` too; `documentation/formats.md`), and `defiant-type/1` and `defiant-tree/1`
 (`documentation/model.md`). Queries over projection rows (a predicate tree, a
 sort and a page, with a total) are in `documentation/query.md`.
 

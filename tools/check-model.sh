@@ -155,4 +155,64 @@ plant unchanged-language-rewritten src/model.c testModel \
   '      if (item_same(s, x, b)) {' \
   '      if (item_same(s, x, b) && i != 0) {'
 
+# A current-table row exported: the snapshot also takes the current tables'
+# items, which are derived, beside the truth's (story S6a3).
+plant snapshot-exports-current src/model_snapshot.c testModel \
+  'ModelSnapshot.HoldsTheTruthAndNoDerivedRow' \
+  '  rc = store->model.dump(store->model.ctx, tenant, tenant_len,
+      GDEFSTOR_MODEL_TRUTH, &v);
+  if (rc == GDEFSTOR_OK) {
+    rc = link_rows(m);
+  }' \
+  '  rc = store->model.dump(store->model.ctx, tenant, tenant_len,
+      GDEFSTOR_MODEL_TRUTH, &v);
+  if (rc == GDEFSTOR_OK) {
+    size_t ne = m->nents;
+    rc = store->model.dump(store->model.ctx, tenant, tenant_len,
+        GDEFSTOR_MODEL_CURRENT, &v);
+    while (m->nents > ne) {
+      m->nents -= 1;
+      gcu_allocator_free(m->alloc, m->ents[m->nents].type);
+      gcu_allocator_free(m->alloc, m->ents[m->nents].pid);
+      gcu_allocator_free(m->alloc, m->ents[m->nents].creator);
+    }
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = link_rows(m);
+  }'
+
+# An item version's valid_from changed on import: a version that revision 1
+# wrote and nothing closed comes back as written by revision 2.
+plant snapshot-import-moves-valid-from src/model_snapshot.c testModel \
+  'ModelSnapshot.EveryRevisionReadsBackAsOfAfterImport ModelSnapshot.ARoundTripKeepsEveryTruthRow' \
+  '    rc = read_order(it, &x->order);' \
+  '    if (x->from == 1 && x->to == 0 && e->revision > 1) {
+      x->from = 2;
+    }
+    rc = read_order(it, &x->order);'
+
+# A language dropped: the export keeps only the versions in the language of
+# the first version it met.
+plant snapshot-drops-a-language src/model_snapshot.c testModel \
+  'ModelSnapshot.EveryLanguageComesBack' \
+  '  /* Trailing no-values are not stored differences (model.md). */' \
+  '  if (m->nvers > 0 && !same(i->language, i->language_len, m->vers[0].lang,
+                         m->vers[0].lang_len)) {
+    return GDEFSTOR_OK;
+  }
+  /* Trailing no-values are not stored differences (model.md). */'
+
+# An import into a tenant that already holds entity truth accepted.
+plant snapshot-import-into-non-empty src/snapshot.c testModel \
+  'ModelSnapshot.ImportIntoANonEmptyTenantIsRefusedInWords' \
+  '    if (rc == GDEFSTOR_OK && !empty) {' \
+  '    if (0) {'
+
+# A counter reset on import: a caller's counter comes back at 0.
+plant snapshot-import-resets-a-counter src/model_snapshot.c testModel \
+  'ModelSnapshot.CountersContinueAndOutboxRowsKeepTheirPlace' \
+  '        c->name, c->name_len, c->value);' \
+  '        c->name, c->name_len,
+        c->kind == GDEFSTOR_MODEL_COUNTER ? 0 : c->value);'
+
 plant_finish

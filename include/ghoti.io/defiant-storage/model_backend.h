@@ -420,7 +420,8 @@ typedef struct GDEFSTOR_ModelBackend {
    * to that size (GDEFSTOR_MODEL_BACKEND_SIZE_V1), and one built against the
    * struct that ends at @ref index_state to GDEFSTOR_MODEL_BACKEND_SIZE_V2,
    * at @ref blind_delete to GDEFSTOR_MODEL_BACKEND_SIZE_V3, and at
-   * @ref outbox_parked to GDEFSTOR_MODEL_BACKEND_SIZE_V4; the port treats
+   * @ref outbox_parked to GDEFSTOR_MODEL_BACKEND_SIZE_V4, and at
+   * @ref languages to GDEFSTOR_MODEL_BACKEND_SIZE_V5; the port treats
    * every member past its size as NULL. (The rows above gained a language
    * with languages, so a backend is built against this header whatever its
    * size.) */
@@ -553,6 +554,38 @@ typedef struct GDEFSTOR_ModelBackend {
   GDEFSTOR_Result (*languages)(void * lang_ctx, void * txn, const char * tenant,
       size_t tenant_len, uint64_t row, uint64_t as_of,
       const GDEFSTOR_ModelVisitor * visitor);
+  /* ---- restoring a snapshot (snapshot.h; AD-23): optional, all three or
+   * none -------------------------------------------------------------------
+   * An import writes the truth a snapshot holds back as it was: the
+   * revisions with their commit sequences, the counters at their values and
+   * the outbox rows with their leases, failures and parked flags. A write
+   * through the members above cannot say any of those, so a backend that
+   * sets these can be imported into; one that does not refuses an import
+   * that holds entity truth with ::GDEFSTOR_ERR_UNSUPPORTED. The port calls
+   * them only in an import's own transaction, into a tenant that holds no
+   * truth, with values it has validated. */
+  /** The context the three below are called with, kept apart from @ref ctx
+   * for the reason @ref index_ctx is. */
+  void * restore_ctx;
+  /** As `apply`, except that the revision row keeps
+   * GDEFSTOR_ModelRevision::commit_seq as given instead of taking the
+   * transaction's: the tenant's commit sequence is raised to at least it,
+   * so the next transaction that writes a revision takes a larger one.
+   * Every revision one import restores may carry a different sequence. */
+  GDEFSTOR_Result (*restore_revision)(void * restore_ctx, void * txn,
+      const GDEFSTOR_ModelApply * a);
+  /** Set counter (@p kind, @p name) to @p value in @p txn, as a committed
+   * value would be: `counter_get` and `dump` read it once @p txn commits,
+   * and the next `counter_next` returns one more. Only a backend that keeps
+   * records, counters and the outbox is called. */
+  GDEFSTOR_Result (*restore_counter)(void * restore_ctx, void * txn, int kind,
+      const char * name, size_t name_len, uint64_t value);
+  /** As `outbox_insert`, except that the row keeps the
+   * GDEFSTOR_ModelOutbox::lease_until_ms, `failures` and `parked` it is
+   * given. Only a backend that keeps records, counters and the outbox is
+   * called. */
+  GDEFSTOR_Result (*restore_outbox)(void * restore_ctx, void * txn,
+      const GDEFSTOR_ModelOutbox * o);
 } GDEFSTOR_ModelBackend;
 
 /** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::index_ctx
@@ -574,6 +607,12 @@ typedef struct GDEFSTOR_ModelBackend {
  * was added; gdefstor_store_create_model() accepts it. */
 #define GDEFSTOR_MODEL_BACKEND_SIZE_V4 \
   offsetof(GDEFSTOR_ModelBackend, lang_ctx)
+
+/** `sizeof(GDEFSTOR_ModelBackend)` before
+ * @ref GDEFSTOR_ModelBackend::restore_ctx was added;
+ * gdefstor_store_create_model() accepts it. */
+#define GDEFSTOR_MODEL_BACKEND_SIZE_V5 \
+  offsetof(GDEFSTOR_ModelBackend, restore_ctx)
 
 /**
  * @brief The reference query engine: answer @p plan over the entities

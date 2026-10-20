@@ -59,7 +59,8 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
           model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V1 &&
           model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V2 &&
           model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V3 &&
-          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V4) ||
+          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V4 &&
+          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V5) ||
       model->destroy == NULL ||
       model->begin == NULL || model->commit == NULL || model->abort == NULL ||
       model->type_load == NULL || model->type_store == NULL ||
@@ -99,6 +100,16 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
       return GDEFSTOR_ERR_INVALID;
     }
   }
+  /* Restoring is the three members together or not at all: an import that
+   * could write revisions back and not the counters beside them would bring
+   * a tenant back with numbers it had already handed out. */
+  {
+    int n = (copy.restore_revision != NULL) + (copy.restore_counter != NULL) +
+            (copy.restore_outbox != NULL);
+    if (n != 0 && n != 3) {
+      return GDEFSTOR_ERR_INVALID;
+    }
+  }
   rc = gdefstor_store_create(backend, allocator, limits, &store);
   if (rc != GDEFSTOR_OK) {
     return rc;
@@ -116,6 +127,11 @@ int gdefstor_model_has_blind(const GDEFSTOR_Store * store) {
 
 int gdefstor_model_has_sys(const GDEFSTOR_Store * store) {
   return store != NULL && store->has_model && store->model.record_put != NULL;
+}
+
+int gdefstor_model_has_restore(const GDEFSTOR_Store * store) {
+  return store != NULL && store->has_model &&
+         store->model.restore_revision != NULL;
 }
 
 int gdefstor_model_has_personal(const GDEFSTOR_Type * t) {
@@ -2814,6 +2830,10 @@ static int langs_text_ok(const char * p, size_t n) {
     at = end + 1;
   }
   return 1;
+}
+
+int gdefstor_model_langs_ok(const char * p, size_t n) {
+  return langs_text_ok(p, n);
 }
 
 /* Whether a revision's language text names @p tag. */

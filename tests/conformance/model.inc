@@ -49,6 +49,14 @@
 #include <string>
 #include <vector>
 
+/* For the snapshot cases (snapshot.inc). */
+#include <ghoti.io/archive/reader.h>
+#include <ghoti.io/archive/sink.h>
+#include <ghoti.io/archive/stream.h>
+#include <ghoti.io/archive/writer.h>
+
+#include "snapshot_fixture.inc"
+
 namespace model_conformance {
 
 const char * const kTenant = "t1";
@@ -4781,5 +4789,6 @@ TEST_F(ModelSweep, RandomHistoriesMatchAnIndependentModel) {
 /* Records, counters and the outbox (story S6a), in this namespace. */
 #include "system.inc"
 #include "language.inc"
+#include "snapshot.inc"
 
 } /* namespace model_conformance */

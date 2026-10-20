@@ -484,6 +484,25 @@ static GDEFSTOR_Result s_apply(void * ctx, void * txn,
   return GDEFSTOR_OK;
 }
 
+/* An import's revision (model_backend.h): an apply that keeps the commit
+ * sequence it is given and raises the tenant's to at least it. */
+static GDEFSTOR_Result s_restore_revision(void * ctx, void * txn,
+    const GDEFSTOR_ModelApply * a) {
+  Txn * x = static_cast<Txn *>(txn);
+  uint64_t seq = x->seq;
+  uint64_t tenant_seq = x->copy.commit_seq;
+  GDEFSTOR_Result rc = s_apply(ctx, txn, a);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  x->seq = seq;
+  x->copy.ents[a->row - 1].revs.back().commit_seq = a->revision->commit_seq;
+  x->copy.commit_seq = tenant_seq > a->revision->commit_seq
+                           ? tenant_seq
+                           : a->revision->commit_seq;
+  return GDEFSTOR_OK;
+}
+
 static GDEFSTOR_Result s_history(void * ctx, void * txn, const char * t,
     size_t tl, uint64_t row, const GDEFSTOR_ModelVisitor * v) {
   Tenant * ten = view(static_cast<Scratch *>(ctx), txn, t, tl);
@@ -975,6 +994,29 @@ static GDEFSTOR_Result s_outbox_insert(void * ctx, void * txn,
   return GDEFSTOR_OK;
 }
 
+static GDEFSTOR_Result s_restore_counter(void * ctx, void * txn, int kind,
+    const char * name, size_t name_len, uint64_t value) {
+  (void)ctx;
+  static_cast<Txn *>(txn)->copy.counters[std::make_pair(kind,
+      std::string(name, name_len))] = value;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result s_restore_outbox(void * ctx, void * txn,
+    const GDEFSTOR_ModelOutbox * o) {
+  GDEFSTOR_Result rc = s_outbox_insert(ctx, txn, o);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  Tenant & t = static_cast<Txn *>(txn)->copy;
+  Ob & b = t.outbox[std::make_pair(std::string(o->stream, o->stream_len),
+      o->seq)];
+  b.until = o->lease_until_ms;
+  b.fails = o->failures;
+  b.parked = o->parked != 0;
+  return GDEFSTOR_OK;
+}
+
 static GDEFSTOR_Result s_outbox_claim(void * ctx, void * txn,
     const char * stream, size_t stream_len, int64_t now, int64_t until,
     size_t max, const GDEFSTOR_ModelVisitor * v) {
@@ -1182,6 +1224,10 @@ static void ScratchBackends(const GDEFSTOR_Allocator * alloc,
   mb.outbox_delete = s_outbox_delete;
   mb.outbox_fail = s_outbox_fail;
   mb.outbox_parked = s_outbox_parked;
+  mb.restore_ctx = s;
+  mb.restore_revision = s_restore_revision;
+  mb.restore_counter = s_restore_counter;
+  mb.restore_outbox = s_restore_outbox;
 }
 
 GDEFSTOR_Result ModelOpen(GDEFSTOR_Store ** out,

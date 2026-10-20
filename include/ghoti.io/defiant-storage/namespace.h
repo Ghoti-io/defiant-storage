@@ -171,6 +171,8 @@
 #define gdefstor_snapshot_export_ledger                                        \
   GHOTIIO_DEFSTOR(gdefstor_snapshot_export_ledger)
 #define gdefstor_snapshot_import GHOTIIO_DEFSTOR(gdefstor_snapshot_import)
+#define gdefstor_snapshot_import_explain                                       \
+  GHOTIIO_DEFSTOR(gdefstor_snapshot_import_explain)
 #define gdefstor_snapshot_ledger GHOTIIO_DEFSTOR(gdefstor_snapshot_ledger)
 #define gdefstor_snapshot_export_at GHOTIIO_DEFSTOR(gdefstor_snapshot_export_at)
 #define gdefstor_snapshot_taken GHOTIIO_DEFSTOR(gdefstor_snapshot_taken)

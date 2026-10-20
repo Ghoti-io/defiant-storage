@@ -991,7 +991,8 @@ static int make_zip_n(const ZipPart * parts, size_t n, int deflate,
 TEST_F(Formats, SnapshotVersion) {
   uint8_t * zip = NULL;
   size_t zip_len = 0;
-  const char manifest[] = "{\"format\":\"defiant-snapshot/2\",\"entries\":[]}";
+  /* One version past what this build writes (snapshot.h). */
+  const char manifest[] = "{\"format\":\"defiant-snapshot/3\",\"entries\":[]}";
   const char unknown[] = "{\"format\":\"nope/1\",\"entries\":[]}";
   const char listed[] =
       "{\"format\":\"defiant-snapshot/1\",\"entries\":[{\"key\":\"o:65767431\","

@@ -572,14 +572,19 @@ static GDEFSTOR_Result parse_id(const GTEXT_JSON_Value * v, uint64_t * out) {
 }
 
 /* Set item @p item's value for field @p f (@p own: the item's own value). */
-static GDEFSTOR_Result parse_scalar(Parse * p, size_t item,
-    const GDEFSTOR_MField * f, int own, const GTEXT_JSON_Value * j) {
+/* One scalar's JSON as a value of field @p f: borrowed from @p j, except a
+ * personal value's ciphertext, which is put in *out_buf for the caller to
+ * free. A JSON null is no value (type 0). */
+static GDEFSTOR_Result scalar_from_json(const GDEFSTOR_Allocator * alloc,
+    const GDEFSTOR_MField * f, const GTEXT_JSON_Value * j,
+    GDEFSTOR_Value * out, uint8_t ** out_buf) {
   GDEFSTOR_Value v;
   const char * s;
   size_t s_len;
   uint8_t * buf = NULL;
-  GDEFSTOR_Result rc;
   memset(&v, 0, sizeof v);
+  memset(out, 0, sizeof *out);
+  *out_buf = NULL;
   v.type = f->type;
   if (gtext_json_typeof(j) == GTEXT_JSON_NULL) {
     return GDEFSTOR_OK;
@@ -601,7 +606,7 @@ static GDEFSTOR_Result parse_scalar(Parse * p, size_t item,
     if (s_len / 2 > GDEFSTOR_MODEL_MAX_VALUE_BYTES) {
       return GDEFSTOR_ERR_LIMIT;
     }
-    buf = (uint8_t *)gdefstor_mem(p->alloc, s_len / 2 + 1);
+    buf = (uint8_t *)gdefstor_mem(alloc, s_len / 2 + 1);
     if (buf == NULL) {
       return GDEFSTOR_ERR_OOM;
     }
@@ -609,7 +614,7 @@ static GDEFSTOR_Result parse_scalar(Parse * p, size_t item,
       int hi = hex_val(s[2 * i]);
       int lo = hex_val(s[2 * i + 1]);
       if (hi < 0 || lo < 0) {
-        gcu_allocator_free(p->alloc, buf);
+        gcu_allocator_free(alloc, buf);
         return GDEFSTOR_ERR_INVALID;
       }
       buf[i] = (uint8_t)(hi * 16 + lo);
@@ -696,9 +701,35 @@ static GDEFSTOR_Result parse_scalar(Parse * p, size_t item,
       return GDEFSTOR_ERR_INVALID;
     }
   }
+  *out = v;
+  *out_buf = buf;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result parse_scalar(Parse * p, size_t item,
+    const GDEFSTOR_MField * f, int own, const GTEXT_JSON_Value * j) {
+  GDEFSTOR_Value v;
+  uint8_t * buf = NULL;
+  GDEFSTOR_Result rc = scalar_from_json(p->alloc, f, j, &v, &buf);
+  if (rc != GDEFSTOR_OK || v.type == 0) {
+    return rc;
+  }
   rc = own ? gdefstor_tree_set(p->tree, item, NULL, 0, &v)
            : gdefstor_tree_set(p->tree, item, f->name, f->name_len, &v);
   gcu_allocator_free(p->alloc, buf);
+  return rc;
+}
+
+GDEFSTOR_Result gdefstor_model_value_from_json(
+    const GDEFSTOR_Allocator * alloc, const GDEFSTOR_MField * f,
+    const GTEXT_JSON_Value * j, GDEFSTOR_Value * out) {
+  GDEFSTOR_Value v;
+  uint8_t * buf = NULL;
+  GDEFSTOR_Result rc = scalar_from_json(alloc, f, j, &v, &buf);
+  if (rc == GDEFSTOR_OK) {
+    rc = gdefstor_model_value_copy(alloc, out, &v);
+  }
+  gcu_allocator_free(alloc, buf);
   return rc;
 }
 
@@ -1201,6 +1232,22 @@ static void put_scalar(Out * w, const GDEFSTOR_MField * f,
   default:
     w->rc = GDEFSTOR_ERR_INVALID;
   }
+}
+
+GDEFSTOR_Result gdefstor_model_value_json(const GDEFSTOR_Allocator * alloc,
+    const GDEFSTOR_MField * f, const GDEFSTOR_Value * v, char ** buf,
+    size_t * len, size_t * cap) {
+  Out w;
+  w.alloc = alloc;
+  w.buf = *buf;
+  w.len = *len;
+  w.cap = *cap;
+  w.rc = GDEFSTOR_OK;
+  put_scalar(&w, f, v);
+  *buf = w.buf;
+  *len = w.len;
+  *cap = w.cap;
+  return w.rc;
 }
 
 static void put_id(Out * w, uint64_t id, int * first) {
