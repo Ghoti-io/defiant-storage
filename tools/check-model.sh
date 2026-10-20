@@ -126,6 +126,14 @@ plant blind-older-version src/model_query.c testModel \
   '      if (b->item == it->item && b->from == it->from && b->field == f->id &&' \
   '      if (b->item == it->item && b->field == f->id &&'
 
+# A blind row put back for a version that does not exist: the item's version
+# that holds at that revision is taken, whichever revision it began in, so
+# the row indexes a valid_from no version has (story S6c).
+plant blind-put-any-version src/model.c testModel \
+  'ModelBlindPut.APutForNoSuchVersionIsRefused' \
+  '    if (x->item == item && x->from == valid_from && x->group == group) {' \
+  '    if (x->item == item && x->group == group) {'
+
 # A query reading another language: the reference engine keeps every
 # language's items, so a field predicate or a sort sees them all (story S6a2).
 plant language-other-read src/model_query.c testModel \

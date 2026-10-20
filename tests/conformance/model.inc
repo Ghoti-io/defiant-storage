@@ -3218,6 +3218,216 @@ TEST_F(ModelBlind, ARevertBringsBackTheBlindRowsOfTheValuesItRestores) {
       History(kMember, "name", "ann"));
 }
 
+/* Story S6c: the blind index rebuilt from decryptable values. The suite's
+ * "ciphertext" is "sealed:<plain>:<n>", so the plaintext of a version, and so
+ * its MAC, is read back from the version itself, as a caller holding the key
+ * would read it. */
+class ModelBlindPut : public ModelBlind {
+ protected:
+  struct Version {
+    std::string type;
+    std::string pid;
+    std::string field;
+    uint64_t item = 0;
+    uint64_t from = 0;
+    std::string lang;
+  };
+
+  std::vector<Version> Versions(const std::string & subject) {
+    std::vector<Version> out;
+    GDEFSTOR_SubjectHits * h = nullptr;
+    EXPECT_EQ(GDEFSTOR_OK, gdefstor_subject_lookup(store, kTenant, 2,
+        subject.data(), subject.size(), &h));
+    for (size_t i = 0; i < gdefstor_subject_hits_count(h); i++) {
+      GDEFSTOR_SubjectHit x;
+      std::memset(&x, 0, sizeof x);
+      x.size = sizeof x;
+      EXPECT_EQ(GDEFSTOR_OK, gdefstor_subject_hit(h, i, &x));
+      Version v;
+      v.type.assign(x.type, x.type_len);
+      v.pid.assign(x.public_id, x.public_id_len);
+      v.field.assign(x.field, x.field_len);
+      v.item = x.item;
+      v.from = x.valid_from;
+      v.lang.assign(x.language, x.language_len);
+      out.push_back(v);
+    }
+    gdefstor_subject_hits_free(h);
+    return out;
+  }
+
+  /* The plaintext the version holds, from its ciphertext. */
+  std::string PlainOf(const Version & v) {
+    GDEFSTOR_Tree * tree = nullptr;
+    std::string plain;
+    std::string leaf = v.field.substr(v.field.rfind('.') == std::string::npos
+                                          ? 0
+                                          : v.field.rfind('.') + 1);
+    EXPECT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, v.pid.data(),
+        v.pid.size(), v.lang.data(), v.lang.size(), v.from, &tree));
+    for (size_t i = 0; tree != nullptr && i < gdefstor_tree_item_count(tree);
+         i++) {
+      GDEFSTOR_TreeItem it;
+      std::memset(&it, 0, sizeof it);
+      it.size = sizeof it;
+      EXPECT_EQ(GDEFSTOR_OK, gdefstor_tree_item(tree, i, &it));
+      if (it.id != v.item) {
+        continue;
+      }
+      GDEFSTOR_Value val;
+      std::memset(&val, 0, sizeof val);
+      bool own = std::string(it.field, it.field_len) == leaf;
+      EXPECT_EQ(GDEFSTOR_OK, gdefstor_tree_get(tree, i, own ? "" : leaf.data(),
+          own ? 0 : leaf.size(), &val));
+      std::string c(reinterpret_cast<const char *>(val.bytes), val.len);
+      if (c.compare(0, 7, "sealed:") == 0 && c.rfind(':') > 6) {
+        plain = c.substr(7, c.rfind(':') - 7);
+      }
+    }
+    gdefstor_tree_free(tree);
+    return plain;
+  }
+
+  GDEFSTOR_Result PutMac(GDEFSTOR_Write * w, const Version & v,
+      const std::string & mac) {
+    GDEFSTOR_BlindMac m;
+    std::memset(&m, 0, sizeof m);
+    m.size = sizeof m;
+    m.mac = reinterpret_cast<const uint8_t *>(mac.data());
+    m.mac_len = mac.size();
+    m.key_id = kMacKey;
+    m.version = kMacVersion;
+    return gdefstor_blind_put(w, v.type.data(), v.type.size(), v.pid.data(),
+        v.pid.size(), v.field.data(), v.field.size(), v.item, v.from,
+        v.lang.data(), v.lang.size(), &m);
+  }
+
+  /* Put back the row of every version of @p subjects. */
+  GDEFSTOR_Result Rebuild(const std::vector<std::string> & subjects) {
+    std::vector<Version> all;
+    for (const std::string & s : subjects) {
+      for (const Version & v : Versions(s)) {
+        all.push_back(v);
+      }
+    }
+    return InWrite([&](GDEFSTOR_Write * w) {
+      for (const Version & v : all) {
+        std::string plain = PlainOf(v);
+        if (plain.empty()) {
+          return GDEFSTOR_ERR_INTERNAL;
+        }
+        GDEFSTOR_Result rc = PutMac(w, v, MacOf(plain));
+        if (rc != GDEFSTOR_OK) {
+          return rc;
+        }
+      }
+      return GDEFSTOR_OK;
+    });
+  }
+
+  /* Members with a changed name and a nested email, and a gift. */
+  void History3() {
+    Put(kMember, "m1", MemberTree("ann", "s1", "x", {{"home", {"a@x"}}}));
+    Node next = Current("m1");
+    Seal(next, "name", "cy", "s1");
+    GDEFSTOR_Tree * t = Build(next);
+    ASSERT_EQ(GDEFSTOR_OK, Save("m1", 1, t));
+    gdefstor_tree_free(t);
+    Put(kMember, "m2", MemberTree("bob", "s2", "y", {{"work", {"b@x"}}}));
+    Put(kGift, "g1", GiftTree("s1", "thanks"));
+  }
+};
+
+/* Every row deleted, then put back from the versions the subject lookup names
+ * and the plaintexts they hold: the blind table, blind equality and the
+ * history lookup are as they were, and putting the rows again changes
+ * nothing. */
+TEST_F(ModelBlindPut, PuttingTheRowsBackRebuildsTheBlindIndex) {
+  History3();
+  if (HasFatalFailure()) {
+    return;
+  }
+  std::vector<std::string> rows = BlindRows();
+  /* ann and a@x, cy (a@x carried with no row of its own), bob and b@x,
+   * thanks. */
+  ASSERT_EQ(6u, rows.size());
+  std::vector<Answer> asks = {Blind(kMember, "name", "cy"),
+      Blind(kMember, "name", "ann"), Blind(kMember, "contacts.emails", "a@x"),
+      Blind(kMember, "name", "bob"), Blind(kGift, "note", "thanks")};
+  std::vector<std::vector<std::string>> history = {
+      History(kMember, "name", "ann"), History(kMember, "name", "cy"),
+      History(kMember, "contacts.emails", "b@x")};
+  ASSERT_EQ(Ids({"m1"}, 1), asks[0]);
+  ASSERT_EQ(GDEFSTOR_OK, DeleteSubject("s1"));
+  ASSERT_EQ(GDEFSTOR_OK, DeleteSubject("s2"));
+  ASSERT_TRUE(BlindRows().empty());
+  ASSERT_EQ(GDEFSTOR_OK, Rebuild({"s1", "s2"}));
+  EXPECT_EQ(rows, BlindRows());
+  EXPECT_EQ(asks[0], Blind(kMember, "name", "cy"));
+  EXPECT_EQ(asks[1], Blind(kMember, "name", "ann"));
+  EXPECT_EQ(asks[2], Blind(kMember, "contacts.emails", "a@x"));
+  EXPECT_EQ(asks[3], Blind(kMember, "name", "bob"));
+  EXPECT_EQ(asks[4], Blind(kGift, "note", "thanks"));
+  EXPECT_EQ(history[0], History(kMember, "name", "ann"));
+  EXPECT_EQ(history[1], History(kMember, "name", "cy"));
+  EXPECT_EQ(history[2], History(kMember, "contacts.emails", "b@x"));
+  /* Again: each version still has one row. */
+  ASSERT_EQ(GDEFSTOR_OK, Rebuild({"s1", "s2"}));
+  EXPECT_EQ(rows, BlindRows());
+  /* A row put back is deleted with its subject like any other. */
+  ASSERT_EQ(GDEFSTOR_OK, DeleteSubject("s1"));
+  EXPECT_EQ(Ids({}, 0), Blind(kMember, "name", "cy"));
+  EXPECT_EQ(Ids({"m2"}, 1), Blind(kMember, "name", "bob"));
+}
+
+/* A row is put back only for a version that holds a value of a personal
+ * field: anything else is refused, and the write is as it was. */
+TEST_F(ModelBlindPut, APutForNoSuchVersionIsRefused) {
+  History3();
+  if (HasFatalFailure()) {
+    return;
+  }
+  std::vector<Version> v = Versions("s1");
+  ASSERT_FALSE(v.empty());
+  Version name;
+  for (const Version & x : v) {
+    if (x.pid == "m1" && x.field == "name" && x.from == 2) {
+      name = x;
+    }
+  }
+  ASSERT_EQ(2u, name.from);
+  std::string truth = Dump(GDEFSTOR_MODEL_TRUTH);
+  std::string mac = MacOf("cy");
+  const GDEFSTOR_Result I = GDEFSTOR_ERR_INVALID;
+  EXPECT_EQ(GDEFSTOR_OK, InWrite([&](GDEFSTOR_Write * w) {
+    Version x = name;
+    /* The item's current version began in revision 2: none began in 3. */
+    x.from = 3;
+    EXPECT_EQ(I, PutMac(w, x, mac));
+    x = name;
+    x.item += 1000;
+    EXPECT_EQ(I, PutMac(w, x, mac));
+    x = name;
+    x.field = "tag";
+    EXPECT_EQ(I, PutMac(w, x, mac));
+    x = name;
+    x.field = "contacts";
+    EXPECT_EQ(I, PutMac(w, x, mac));
+    x = name;
+    x.pid = "g1";
+    EXPECT_EQ(I, PutMac(w, x, mac));
+    x = name;
+    x.pid = "m404";
+    EXPECT_EQ(I, PutMac(w, x, mac));
+    x = name;
+    x.lang = "fr";
+    EXPECT_EQ(I, PutMac(w, x, mac));
+    EXPECT_EQ(I, PutMac(w, name, mac.substr(1)));
+    return GDEFSTOR_OK;
+  }));
+  EXPECT_EQ(truth, Dump(GDEFSTOR_MODEL_TRUTH));
+}
+
 /* The sweep: seeded histories of members, their names and nested emails
  * saved, changed, carried by other changes, removed, and their subjects
  * erased, checked against a model kept apart from the library: blind

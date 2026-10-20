@@ -955,6 +955,37 @@ GDEFSTOR_API void gdefstor_subject_hits_free(GDEFSTOR_SubjectHits * hits);
 GDEFSTOR_API GDEFSTOR_Result gdefstor_blind_delete_subject(
     GDEFSTOR_Write * write, const char * subject, size_t subject_len);
 
+/**
+ * @brief Put back the blind row of one stored personal value version, in
+ * this write: the blind index rebuilt from decryptable values (AD-14,
+ * CAP-S1), which only the caller can do because it needs the keys.
+ *
+ * Blind rows are not in a snapshot (AD-23), so a restored tenant has none,
+ * and a save writes them only for the versions it writes. This writes the
+ * row of the version that already exists: entity @p public_id of @p type,
+ * personal scalar @p field (a dotted path, retired or not), item @p item,
+ * the version that first held in revision @p valid_from, in @p language (as
+ * gdefstor_subject_lookup() reports each version). The row takes the
+ * subject the version records; the MAC is the caller's, computed as for
+ * gdefstor_tree_set_blind(). A row the version already has is replaced, so
+ * putting the same rows again changes nothing. The caller decides which
+ * subjects are indexed: a subject whose key is destroyed is never put back
+ * (AD-19), and gdefstor_blind_delete_subject() removes this row as any
+ * other.
+ *
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (a type never declared, a
+ *   path that is not a personal scalar field, an entity of another type or
+ *   none, no such version or one with no value there, a MAC of another
+ *   length or a @ref GDEFSTOR_BlindMac::size that is not this header's, a
+ *   language that is not one), ::GDEFSTOR_ERR_UNSUPPORTED (a backend with no
+ *   blind table, or one built before this call), or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_blind_put(GDEFSTOR_Write * write,
+    const char * type, size_t type_len, const char * public_id,
+    size_t public_id_len, const char * field, size_t field_len, uint64_t item,
+    uint64_t valid_from, const char * language, size_t language_len,
+    const GDEFSTOR_BlindMac * mac);
+
 /* ---- records, counters and the outbox (AD-31, AD-33) ---------------------
  *
  * Three families that live in the entity write beside entities, so that one

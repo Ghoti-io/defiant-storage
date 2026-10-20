@@ -60,7 +60,8 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
           model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V2 &&
           model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V3 &&
           model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V4 &&
-          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V5) ||
+          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V5 &&
+          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V6) ||
       model->destroy == NULL ||
       model->begin == NULL || model->commit == NULL || model->abort == NULL ||
       model->type_load == NULL || model->type_store == NULL ||
@@ -109,6 +110,10 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
     if (n != 0 && n != 3) {
       return GDEFSTOR_ERR_INVALID;
     }
+  }
+  /* A blind row can be put back only where there is a blind table. */
+  if (copy.blind_put != NULL && copy.blind_history == NULL) {
+    return GDEFSTOR_ERR_INVALID;
   }
   rc = gdefstor_store_create(backend, allocator, limits, &store);
   if (rc != GDEFSTOR_OK) {
@@ -3716,6 +3721,111 @@ GDEFSTOR_Result gdefstor_model_rebuild(GDEFSTOR_Write * write) {
     return rc;
   }
   rc = store->model.rebuild(store->model.ctx, txn);
+  return rc == GDEFSTOR_OK ? rc : gdefstor_model_break(write, rc);
+}
+
+/* ---- putting a blind row back ------------------------------------------- */
+
+GDEFSTOR_Result gdefstor_blind_put(GDEFSTOR_Write * write, const char * type,
+    size_t type_len, const char * public_id, size_t public_id_len,
+    const char * field, size_t field_len, uint64_t item, uint64_t valid_from,
+    const char * language, size_t language_len, const GDEFSTOR_BlindMac * mac) {
+  GDEFSTOR_Store * store;
+  void * txn = NULL;
+  GDEFSTOR_Type * t = NULL;
+  Ent e;
+  Items it;
+  size_t fi = 0;
+  size_t i;
+  const GDEFSTOR_MField * f;
+  const GDEFSTOR_Value * v = NULL;
+  uint32_t group;
+  uint32_t column;
+  GDEFSTOR_ModelBlind b;
+  GDEFSTOR_Result rc = write_store(write, &store);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  if (!gdefstor_model_has_blind(store) || store->model.blind_put == NULL) {
+    return GDEFSTOR_ERR_UNSUPPORTED;
+  }
+  if (mac == NULL || mac->size != sizeof *mac || mac->mac == NULL ||
+      mac->mac_len != GDEFSTOR_BLIND_MAC_BYTES || item == 0 ||
+      valid_from == 0 || field == NULL || field_len == 0 ||
+      !gdefstor_model_lang_ok(language, language_len)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  rc = gdefstor_model_txn(write, &txn);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  rc = gdefstor_model_type_load(store, txn, write->tenant, write->tenant_len,
+      type, type_len, &t);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  /* A personal scalar: the only fields with blind rows. A retired one keeps
+   * its history, and its rows can be put back. */
+  if (gdefstor_type_find(t, field, field_len, &fi) != GDEFSTOR_OK ||
+      t->f[fi].type == GDEFSTOR_FIELD_GROUP ||
+      (t->f[fi].flags & GDEFSTOR_FIELD_PERSONAL) == 0) {
+    gdefstor_type_free(t);
+    return GDEFSTOR_ERR_INVALID;
+  }
+  f = &t->f[fi];
+  rc = find_entity(store, txn, write->tenant, write->tenant_len, public_id,
+      public_id_len, &e);
+  if (rc != GDEFSTOR_OK) {
+    gdefstor_type_free(t);
+    return rc;
+  }
+  if (!same_span(e.type, e.type_len, type, type_len)) {
+    ent_release(store->alloc, &e);
+    gdefstor_type_free(t);
+    return GDEFSTOR_ERR_INVALID;
+  }
+  /* The version as stored: the item of the field's group that held the
+   * value from valid_from on, in that language. The row indexes it, so it
+   * must exist and hold a value, whose subject the row takes. */
+  rc = load_items(store, txn, write->tenant, write->tenant_len, e.row,
+      valid_from, language, language_len, 0, &it);
+  if (rc != GDEFSTOR_OK) {
+    ent_release(store->alloc, &e);
+    gdefstor_type_free(t);
+    return rc;
+  }
+  group = (f->flags & GDEFSTOR_FIELD_MULTIPLE) != 0 ? f->group : f->in_group;
+  column = (f->flags & GDEFSTOR_FIELD_MULTIPLE) != 0 ? 0u : f->column;
+  for (i = 0; i < it.n; i++) {
+    const Item * x = &it.v[i];
+    if (x->item == item && x->from == valid_from && x->group == group) {
+      if (column < x->nvals && x->vals[column].type != 0) {
+        v = &x->vals[column];
+      }
+      break;
+    }
+  }
+  if (v == NULL || v->subject == NULL || v->subject_len == 0) {
+    items_release(&it);
+    ent_release(store->alloc, &e);
+    gdefstor_type_free(t);
+    return GDEFSTOR_ERR_INVALID;
+  }
+  memset(&b, 0, sizeof b);
+  b.item = item;
+  b.valid_from = valid_from;
+  b.field = f->id;
+  b.subject = v->subject;
+  b.subject_len = v->subject_len;
+  b.mac = mac->mac;
+  b.key_id = mac->key_id;
+  b.version = mac->version;
+  b.language = language;
+  b.language_len = language_len;
+  rc = store->model.blind_put(store->model.blind_ctx, txn, t, e.row, &b);
+  items_release(&it);
+  ent_release(store->alloc, &e);
+  gdefstor_type_free(t);
   return rc == GDEFSTOR_OK ? rc : gdefstor_model_break(write, rc);
 }
 

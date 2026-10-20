@@ -296,8 +296,19 @@ every blind row of the subject in every type, is idempotent, and leaves the
 ciphertext rows, so the subject lookup still finds every value afterwards and
 blind equality and the history lookup find none.
 
-A backend serves this through three optional members (`model_backend.h`);
-one that does not refuses every call here `GDEFSTOR_ERR_UNSUPPORTED`.
+**Putting a row back**, `gdefstor_blind_put()`: the blind index rebuilt from
+decryptable values (CAP-S1), which needs keys and so is the caller's to
+drive. Blind rows are not in a snapshot, so a restored tenant has none. The
+caller names a version as the subject lookup reports it (type, entity,
+field, item, `valid_from`, language) and hands its MAC; the port checks that
+the version exists and holds a value of that personal field, and writes the
+row with the version's own subject, replacing the row that version already
+has. Which subjects are indexed is the caller's decision: one whose key is
+destroyed is never put back.
+
+A backend serves this through three optional members (`model_backend.h`),
+and the put through a fourth, `blind_put`; one that does not refuses every
+call here `GDEFSTOR_ERR_UNSUPPORTED`.
 
 ## Records, counters and the outbox
 
@@ -557,6 +568,12 @@ or none (`GDEFSTOR_MODEL_BACKEND_SIZE_V5` is the size before them):
 and raises the tenant's to at least it, `restore_counter` sets a counter's
 committed value, and `restore_outbox` inserts an outbox row with its lease,
 failures and parked flag. A backend without them cannot be imported into.
+Rebuilding the blind index (story S6c) added `blind_put`, called with
+`blind_ctx` (`GDEFSTOR_MODEL_BACKEND_SIZE_V6` is the size before it): it
+writes one blind row for a version that exists, replacing the row of the
+same entity, item, `valid_from` and field. It is optional, and set only by a
+backend that serves the blind index; without it `gdefstor_blind_put()` is
+`GDEFSTOR_ERR_UNSUPPORTED`.
 
 Every backend runs the conformance suite, installed beside the port:
 `model.inc` (named cases for every rule above, the purchase-order fixture,

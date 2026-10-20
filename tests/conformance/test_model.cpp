@@ -854,6 +854,37 @@ static GDEFSTOR_Result s_blind_delete(void * ctx, void * txn,
   return GDEFSTOR_OK;
 }
 
+/* One blind row put back for a version the port found, replacing the row of
+ * the same item, valid_from and field. */
+static GDEFSTOR_Result s_blind_put(void * ctx, void * txn,
+    const GDEFSTOR_Type * type, uint64_t row, const GDEFSTOR_ModelBlind * m) {
+  (void)ctx;
+  (void)type;
+  Tenant & t = static_cast<Txn *>(txn)->copy;
+  if (row == 0 || row > t.ents.size() || m->mac == nullptr) {
+    return GDEFSTOR_ERR_INTERNAL;
+  }
+  Ent & e = t.ents[row - 1];
+  std::vector<Blind> kept;
+  for (const Blind & b : e.blinds) {
+    if (!(b.item == m->item && b.from == m->valid_from && b.field == m->field)) {
+      kept.push_back(b);
+    }
+  }
+  Blind b;
+  b.item = m->item;
+  b.from = m->valid_from;
+  b.field = m->field;
+  b.subject.assign(reinterpret_cast<const char *>(m->subject), m->subject_len);
+  b.mac.assign(reinterpret_cast<const char *>(m->mac), GDEFSTOR_BLIND_MAC_BYTES);
+  b.key_id = m->key_id;
+  b.version = m->version;
+  b.lang.assign(m->language, m->language_len);
+  kept.push_back(b);
+  e.blinds = kept;
+  return GDEFSTOR_OK;
+}
+
 /* ---- records, counters and the outbox ---------------------------------- */
 
 static GDEFSTOR_Result visit_record(const GDEFSTOR_ModelVisitor * v,
@@ -1244,6 +1275,7 @@ static void ScratchBackends(const GDEFSTOR_Allocator * alloc,
   mb.restore_revision = s_restore_revision;
   mb.restore_counter = s_restore_counter;
   mb.restore_outbox = s_restore_outbox;
+  mb.blind_put = s_blind_put;
 }
 
 GDEFSTOR_Result ModelOpen(GDEFSTOR_Store ** out,
@@ -1300,6 +1332,44 @@ TEST(ModelPort, ABackendWithoutTheSystemFamiliesServesTheRest) {
   GDEFSTOR_ModelBackend part = mb;
   part.outbox_parked = nullptr;
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_store_create_model(&kb, &part,
+      nullptr, nullptr, &old));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_create_model(&kb, &mb, nullptr,
+      nullptr, &old));
+  gdefstor_store_destroy(old); /* destroys the backends, once */
+}
+
+/* A backend of the size before gdefstor_blind_put() serves everything else and
+ * refuses the put as unsupported; a put without a blind table is refused when
+ * the store is opened. */
+TEST(ModelPort, ABackendWithoutBlindPutRefusesOnlyThePut) {
+  GDEFSTOR_Backend kb;
+  GDEFSTOR_ModelBackend mb;
+  ScratchBackends(nullptr, &kb, &mb);
+  GDEFSTOR_ModelBackend v6 = mb;
+  v6.destroy = [](void *) {}; /* the last store below destroys the Scratch */
+  v6.size = GDEFSTOR_MODEL_BACKEND_SIZE_V6;
+  GDEFSTOR_Store * old = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_create_model(&kb, &v6, nullptr,
+      nullptr, &old));
+  GDEFSTOR_Write * w = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(old, "t1", 2, nullptr, &w));
+  uint8_t mac[GDEFSTOR_BLIND_MAC_BYTES] = {0};
+  GDEFSTOR_BlindMac m;
+  std::memset(&m, 0, sizeof m);
+  m.size = sizeof m;
+  m.mac = mac;
+  m.mac_len = sizeof mac;
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_blind_put(w, "a.b", 3, "p", 1,
+      "f", 1, 1, 1, "en", 2, &m));
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_blind_delete_subject(w, "s", 1));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(w));
+  gdefstor_store_destroy(old);
+  GDEFSTOR_ModelBackend lone = mb;
+  lone.destroy = [](void *) {};
+  lone.blind_history = nullptr;
+  lone.subject_lookup = nullptr;
+  lone.blind_delete = nullptr;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_store_create_model(&kb, &lone,
       nullptr, nullptr, &old));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_create_model(&kb, &mb, nullptr,
       nullptr, &old));

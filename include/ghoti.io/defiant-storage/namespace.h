@@ -258,6 +258,7 @@
 #define gdefstor_type_find GHOTIIO_DEFSTOR(gdefstor_type_find)
 #define gdefstor_type_index_state GHOTIIO_DEFSTOR(gdefstor_type_index_state)
 #define gdefstor_blind_delete_subject GHOTIIO_DEFSTOR(gdefstor_blind_delete_subject)
+#define gdefstor_blind_put GHOTIIO_DEFSTOR(gdefstor_blind_put)
 #define gdefstor_blind_history GHOTIIO_DEFSTOR(gdefstor_blind_history)
 #define gdefstor_blind_hit GHOTIIO_DEFSTOR(gdefstor_blind_hit)
 #define gdefstor_blind_hits_count GHOTIIO_DEFSTOR(gdefstor_blind_hits_count)

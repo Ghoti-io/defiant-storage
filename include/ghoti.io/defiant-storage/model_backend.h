@@ -422,7 +422,8 @@ typedef struct GDEFSTOR_ModelBackend {
    * struct that ends at @ref index_state to GDEFSTOR_MODEL_BACKEND_SIZE_V2,
    * at @ref blind_delete to GDEFSTOR_MODEL_BACKEND_SIZE_V3, and at
    * @ref outbox_parked to GDEFSTOR_MODEL_BACKEND_SIZE_V4, and at
-   * @ref languages to GDEFSTOR_MODEL_BACKEND_SIZE_V5; the port treats
+   * @ref languages to GDEFSTOR_MODEL_BACKEND_SIZE_V5, and at
+   * @ref restore_outbox to GDEFSTOR_MODEL_BACKEND_SIZE_V6; the port treats
    * every member past its size as NULL. (The rows above gained a language
    * with languages, so a backend is built against this header whatever its
    * size.) */
@@ -587,6 +588,18 @@ typedef struct GDEFSTOR_ModelBackend {
    * called. */
   GDEFSTOR_Result (*restore_outbox)(void * restore_ctx, void * txn,
       const GDEFSTOR_ModelOutbox * o);
+  /* ---- rebuilding the blind index: optional ------------------------------
+   * The blind table is truth while its subject exists, but it is not in a
+   * snapshot (AD-23), so a restored tenant has none, and only the caller,
+   * which holds the keys, can compute its MACs again from the decryptable
+   * values (AD-14, CAP-S1). gdefstor_blind_put() hands each one here, for a
+   * value version the port has checked exists and is personal. */
+  /** Write blind row @p b of entity @p row of @p type in @p txn, replacing
+   * the row of the same entity, item, valid_from and field if there is one,
+   * so that a rebuild run twice leaves one row per version. Called with
+   * @ref blind_ctx, and only on a backend that serves the blind index. */
+  GDEFSTOR_Result (*blind_put)(void * blind_ctx, void * txn,
+      const GDEFSTOR_Type * type, uint64_t row, const GDEFSTOR_ModelBlind * b);
 } GDEFSTOR_ModelBackend;
 
 /** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::index_ctx
@@ -614,6 +627,12 @@ typedef struct GDEFSTOR_ModelBackend {
  * gdefstor_store_create_model() accepts it. */
 #define GDEFSTOR_MODEL_BACKEND_SIZE_V5 \
   offsetof(GDEFSTOR_ModelBackend, restore_ctx)
+
+/** `sizeof(GDEFSTOR_ModelBackend)` before
+ * @ref GDEFSTOR_ModelBackend::blind_put was added;
+ * gdefstor_store_create_model() accepts it. */
+#define GDEFSTOR_MODEL_BACKEND_SIZE_V6 \
+  offsetof(GDEFSTOR_ModelBackend, blind_put)
 
 /**
  * @brief The reference query engine: answer @p plan over the entities
