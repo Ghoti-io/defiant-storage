@@ -52,6 +52,9 @@
 namespace model_conformance {
 
 const char * const kTenant = "t1";
+/* The language of every tree a test does not say the language of. */
+const char * const kLang = "en";
+const size_t kLangLen = 2;
 
 /* ---- values -------------------------------------------------------------- */
 
@@ -252,6 +255,20 @@ inline GDEFSTOR_RevisionMeta Meta(const char * who = "u1", int64_t when = 1000,
   return m;
 }
 
+/* A draft of one language's tree. */
+inline GDEFSTOR_Result DraftPut(GDEFSTOR_Write * w, const char * type,
+    size_t type_len, const char * pid, size_t pid_len, uint64_t base,
+    const uint8_t * json, size_t json_len, const char * lang = kLang) {
+  GDEFSTOR_DraftTree t;
+  std::memset(&t, 0, sizeof t);
+  t.size = sizeof t;
+  t.language = lang;
+  t.language_len = std::strlen(lang);
+  t.json = json;
+  t.json_len = json_len;
+  return gdefstor_draft_put(w, type, type_len, pid, pid_len, base, &t, 1);
+}
+
 class ModelTest : public ::testing::Test {
  public:
   GDEFSTOR_Store * store = nullptr;
@@ -301,7 +318,7 @@ class ModelTest : public ::testing::Test {
     uint64_t got = 0;
     GDEFSTOR_RevisionMeta m = Meta(who, 2000 + static_cast<int64_t>(base));
     GDEFSTOR_Result rc = InWrite([&](GDEFSTOR_Write * w) {
-      return gdefstor_entity_save(w, pid.data(), pid.size(), base, &m, tree,
+      return gdefstor_entity_save(w, pid.data(), pid.size(), base, &m, kLang, kLangLen, tree,
           &got);
     });
     if (out != nullptr) {
@@ -726,7 +743,7 @@ TEST_F(ModelDeclare, AddingAFieldWorks) {
   ASSERT_EQ(GDEFSTOR_OK, Declare("site.note", {F("title", GDEFSTOR_FIELD_TEXT),
       F("rank", GDEFSTOR_FIELD_INTEGER)}));
   GDEFSTOR_Tree * cur = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "n1", 2, 0, &cur));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "n1", 2, kLang, kLangLen, 0, &cur));
   Node b = Read(cur);
   gdefstor_tree_free(cur);
   EXPECT_EQ(Val::From(Text("one")), b.vals["title"]);
@@ -736,11 +753,11 @@ TEST_F(ModelDeclare, AddingAFieldWorks) {
   ASSERT_EQ(GDEFSTOR_OK, Save("n1", 1, t, &rev));
   gdefstor_tree_free(t);
   EXPECT_EQ(2u, rev);
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "n1", 2, 0, &cur));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "n1", 2, kLang, kLangLen, 0, &cur));
   EXPECT_EQ(Val::From(Integer(7)), Read(cur).vals["rank"]);
   gdefstor_tree_free(cur);
   /* Revision 1 was written before the field existed and still reads so. */
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "n1", 2, 1, &cur));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "n1", 2, kLang, kLangLen, 1, &cur));
   EXPECT_EQ(0u, Read(cur).vals.count("rank"));
   gdefstor_tree_free(cur);
 }
@@ -778,7 +795,7 @@ TEST_F(ModelDeclare, RetiredFieldDataStaysReadable) {
   gdefstor_tree_free(t);
   ASSERT_EQ(2u, rev);
   GDEFSTOR_Tree * cur = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "n1", 2, 0, &cur));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "n1", 2, kLang, kLangLen, 0, &cur));
   Node now = Read(cur);
   gdefstor_tree_free(cur);
   EXPECT_EQ(Val::From(Text("two")), now.vals["title"]);
@@ -799,7 +816,7 @@ TEST_F(ModelDeclare, RetiredFieldDataStaysReadable) {
   ASSERT_EQ(GDEFSTOR_OK, Declare("site.note", {F("title", GDEFSTOR_FIELD_TEXT),
       F("old", GDEFSTOR_FIELD_TEXT), G("parts", GDEFSTOR_FIELD_MULTIPLE,
           {F("p", GDEFSTOR_FIELD_INTEGER)})}));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "n1", 2, 0, &cur));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "n1", 2, kLang, kLangLen, 0, &cur));
   EXPECT_EQ(Val::From(Text("keep me")), Read(cur).vals["old"]);
   gdefstor_tree_free(cur);
 }
@@ -977,7 +994,7 @@ TEST_F(ModelEntity, CreateRecordsCreatorAndTime) {
   /* No revision yet: no tree. */
   GDEFSTOR_Tree * t = nullptr;
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_entity_tree(store, kTenant, 2, "n1",
-      2, 0, &t));
+      2, kLang, kLangLen, 0, &t));
   /* Undeclared types and malformed ids are refused. */
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, Create("site.none", "n2"));
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, Create("site.note", "n 2"));
@@ -1038,7 +1055,7 @@ TEST_F(ModelEntity, StateChangesAreAppended) {
   ASSERT_EQ(GDEFSTOR_OK, set(1, 1, "mod", 12));
   EXPECT_EQ(1, changed);
   GDEFSTOR_History * h = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_history(store, kTenant, 2, "n1", 2, &h));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_history(store, kTenant, 2, "n1", 2, nullptr, 0, &h));
   ASSERT_EQ(2u, gdefstor_history_state_count(h));
   GDEFSTOR_StateInfo s;
   std::memset(&s, 0, sizeof s);
@@ -1081,7 +1098,7 @@ class ModelSave : public ModelTest {
   Node Current(const std::string & pid) {
     GDEFSTOR_Tree * t = nullptr;
     EXPECT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, pid.data(),
-        pid.size(), 0, &t));
+        pid.size(), kLang, kLangLen, 0, &t));
     Node n = t == nullptr ? Node() : Read(t);
     gdefstor_tree_free(t);
     return n;
@@ -1106,7 +1123,7 @@ TEST_F(ModelSave, FirstSaveIsRevisionOne) {
   EXPECT_EQ(1u, now.id);
   EXPECT_EQ(1u, Head("po1"));
   GDEFSTOR_History * h = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_history(store, kTenant, 2, "po1", 3, &h));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_history(store, kTenant, 2, "po1", 3, nullptr, 0, &h));
   ASSERT_EQ(1u, gdefstor_history_revision_count(h));
   GDEFSTOR_RevisionInfo r;
   std::memset(&r, 0, sizeof r);
@@ -1148,7 +1165,7 @@ TEST_F(ModelSave, UnchangedItemIsNotRewritten) {
   EXPECT_EQ(1u, NewRows(before, after, 'R'));
   EXPECT_EQ("", AppendOnly(before, after));
   GDEFSTOR_Diff * d = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_diff(store, kTenant, 2, "po1", 3, 1,
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_diff(store, kTenant, 2, "po1", 3, nullptr, 0, 1,
       2, &d));
   ASSERT_EQ(1u, gdefstor_diff_count(d));
   GDEFSTOR_DiffItem di;
@@ -1234,7 +1251,7 @@ TEST_F(ModelSave, NewItemsGetNewIdsAndRemovedOnesAreClosed) {
   EXPECT_EQ(0u, seen.count(got.kids["lines"][1].kids["taxes"][0].id));
   /* The removed line and everything under it are closed, not deleted. */
   GDEFSTOR_Tree * old = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "po1", 3, 1, &old));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "po1", 3, kLang, kLangLen, 1, &old));
   EXPECT_EQ(gone, Read(old).kids["lines"][0].id);
   gdefstor_tree_free(old);
   /* An id the entity does not have now is refused. */
@@ -1396,7 +1413,7 @@ TEST_F(ModelSave, LimitsAreRefusedNotCrashed) {
   GDEFSTOR_RevisionMeta m = Meta("u1", 1, why.c_str());
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_tree_create(nullptr, &t));
   EXPECT_EQ(GDEFSTOR_ERR_LIMIT, InWrite([&](GDEFSTOR_Write * w) {
-    return gdefstor_entity_save(w, "b1", 2, 1, &m, t, nullptr);
+    return gdefstor_entity_save(w, "b1", 2, 1, &m, kLang, kLangLen, t, nullptr);
   }));
   gdefstor_tree_free(t);
 }
@@ -1432,7 +1449,7 @@ class ModelHistory : public ModelSave {
   Node AsOf(uint64_t rev) {
     GDEFSTOR_Tree * t = nullptr;
     EXPECT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "po1", 3,
-        rev, &t));
+        kLang, kLangLen, rev, &t));
     Node n = t == nullptr ? Node() : Read(t);
     gdefstor_tree_free(t);
     return n;
@@ -1480,7 +1497,7 @@ TEST_F(ModelHistory, AsOfReadsEveryPastRevision) {
   EXPECT_EQ(trees[3], Current("po1"));
   GDEFSTOR_Tree * t = nullptr;
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_entity_tree(store, kTenant, 2, "po1",
-      3, 4, &t));
+      3, kLang, kLangLen, 4, &t));
 }
 
 TEST_F(ModelHistory, RevertAddsRowsAndLeavesHistory) {
@@ -1523,7 +1540,7 @@ TEST_F(ModelHistory, RevertAddsRowsAndLeavesHistory) {
 TEST_F(ModelHistory, DiffListsAddedChangedRemoved) {
   SetUpThree();
   GDEFSTOR_Diff * d = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_diff(store, kTenant, 2, "po1", 3, 1,
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_diff(store, kTenant, 2, "po1", 3, nullptr, 0, 1,
       2, &d));
   std::map<uint64_t, GDEFSTOR_DiffItem> got;
   for (size_t i = 0; i < gdefstor_diff_count(d); i++) {
@@ -1544,7 +1561,7 @@ TEST_F(ModelHistory, DiffListsAddedChangedRemoved) {
   EXPECT_EQ(GDEFSTOR_DIFF_REMOVED, got[note].kind);
   gdefstor_diff_free(d);
   /* From nothing, everything is added. */
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_diff(store, kTenant, 2, "po1", 3, 0,
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_diff(store, kTenant, 2, "po1", 3, nullptr, 0, 0,
       1, &d));
   size_t all = 0;
   std::function<void(const Node &)> count = [&](const Node & n) {
@@ -1558,7 +1575,7 @@ TEST_F(ModelHistory, DiffListsAddedChangedRemoved) {
   count(trees[1]);
   EXPECT_EQ(all, gdefstor_diff_count(d));
   gdefstor_diff_free(d);
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_diff(store, kTenant, 2, "po1", 3, 2,
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_diff(store, kTenant, 2, "po1", 3, nullptr, 0, 2,
       2, &d));
   EXPECT_EQ(0u, gdefstor_diff_count(d));
   gdefstor_diff_free(d);
@@ -1586,7 +1603,7 @@ class ModelOrder : public ModelSave {
   std::map<uint64_t, double> IdKeys() {
     std::map<uint64_t, double> out;
     GDEFSTOR_Tree * t = nullptr;
-    EXPECT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "l1", 2, 0,
+    EXPECT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "l1", 2, kLang, kLangLen, 0,
         &t));
     for (size_t i = 1; t != nullptr && i < gdefstor_tree_item_count(t); i++) {
       GDEFSTOR_TreeItem c;
@@ -1601,7 +1618,7 @@ class ModelOrder : public ModelSave {
 
   std::vector<double> CurrentKeys() {
     GDEFSTOR_Tree * t = nullptr;
-    EXPECT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "l1", 2, 0,
+    EXPECT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "l1", 2, kLang, kLangLen, 0,
         &t));
     std::vector<double> k = t == nullptr ? std::vector<double>()
                                          : Keys(t, 1, "items");
@@ -1720,7 +1737,7 @@ class ModelDraft : public ModelSave {
   GDEFSTOR_Result Put(const char * pid, uint64_t base, const std::string & json,
       const char * type = nullptr) {
     return InWrite([&](GDEFSTOR_Write * w) {
-      return gdefstor_draft_put(w, type, type == nullptr ? 0 : std::strlen(type),
+      return DraftPut(w, type, type == nullptr ? 0 : std::strlen(type),
           pid, std::strlen(pid), base,
           reinterpret_cast<const uint8_t *>(json.data()), json.size());
     });
@@ -1979,10 +1996,12 @@ inline std::ostream & operator<<(std::ostream & os, const Answer & a) {
 inline Answer Ask(GDEFSTOR_Store * store, const char * type,
     const GDEFSTOR_QueryNode * where,
     std::vector<GDEFSTOR_QuerySort> sorts = {}, uint64_t offset = 0,
-    uint64_t limit = 0) {
+    uint64_t limit = 0, const char * lang = kLang) {
   GDEFSTOR_Query q;
   std::memset(&q, 0, sizeof q);
   q.size = sizeof q;
+  q.language = lang;
+  q.language_len = std::strlen(lang);
   q.where = where;
   q.sorts = sorts.empty() ? nullptr : sorts.data();
   q.sort_count = sorts.size();
@@ -2140,7 +2159,7 @@ TEST_F(ModelQuery, SortPageAndCount) {
       {By(q.Entity())}));
   uint64_t n = 0;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_count(store, kTenant, 2, kPo,
-      std::strlen(kPo), q.Cmp(GDEFSTOR_QUERY_GT, q.Field("total"),
+      std::strlen(kPo), kLang, kLangLen, q.Cmp(GDEFSTOR_QUERY_GT, q.Field("total"),
           q.Values({Decimal(0)})), &n));
   EXPECT_EQ(3u, n);
   /* A limit above the page cap is clamped to it. */
@@ -2184,7 +2203,7 @@ TEST_F(ModelQuery, TotalCountsMatchesNotScanned) {
   EXPECT_EQ(Ids({}, 1), Ask(store, kPo, w, {}, 1, 1));
   uint64_t n = 99;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_count(store, kTenant, 2, kPo,
-      std::strlen(kPo), w, &n));
+      std::strlen(kPo), kLang, kLangLen, w, &n));
   EXPECT_EQ(1u, n);
 }
 
@@ -2307,6 +2326,8 @@ TEST_F(ModelQuery, RefusesWhatItCannotAnswer) {
   GDEFSTOR_Query bad;
   std::memset(&bad, 0, sizeof bad);
   bad.size = sizeof bad;
+  bad.language = kLang;
+  bad.language_len = kLangLen;
   bad.entity_numeric = 1;
   GDEFSTOR_QueryResult * r = nullptr;
   EXPECT_EQ(I, gdefstor_entity_query(store, kTenant, 2, kPo, std::strlen(kPo),
@@ -2568,9 +2589,10 @@ TEST_F(ModelBlind, ASaveWritesOneBlindRowPerPersonalValueVersion) {
   /* The name and the two emails: three values, three rows. */
   ASSERT_EQ(3u, blind.size()) << truth;
   for (const std::string & b : blind) {
-    /* B row item from field subject mac key version */
+    /* B row item from field subject mac key version language */
     std::vector<std::string> w = Words(b);
-    ASSERT_EQ(9u, w.size()) << b;
+    ASSERT_EQ(10u, w.size()) << b;
+    EXPECT_EQ(HexOf(kLang), w[9]) << b;
     EXPECT_EQ("1", w[3]) << b;
     EXPECT_EQ(HexOf("s1"), w[5]) << b;
     EXPECT_EQ(std::to_string(kMacKey), w[7]) << b;
@@ -2635,7 +2657,7 @@ TEST_F(ModelBlind, AFailedSaveWritesNoBlindRow) {
   EXPECT_EQ(GDEFSTOR_ERR_CONFLICT, Save("m1", 0, t));
   GDEFSTOR_RevisionMeta m = Meta();
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, InWrite([&](GDEFSTOR_Write * w) {
-    GDEFSTOR_Result rc = gdefstor_entity_save(w, "m1", 2, 1, &m, t, nullptr);
+    GDEFSTOR_Result rc = gdefstor_entity_save(w, "m1", 2, 1, &m, kLang, kLangLen, t, nullptr);
     EXPECT_EQ(GDEFSTOR_OK, rc);
     /* Then something in the same write is refused, and it aborts. */
     return gdefstor_entity_create(w, kMember, std::strlen(kMember), "m1", 2,
@@ -2715,7 +2737,7 @@ TEST_F(ModelBlind, EqualityMatchesOnlyTheCurrentVersion) {
   uint64_t n = 9;
   Q q;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_count(store, kTenant, 2, kMember,
-      std::strlen(kMember), q.Cmp(GDEFSTOR_QUERY_BLIND, q.Field("name"),
+      std::strlen(kMember), kLang, kLangLen, q.Cmp(GDEFSTOR_QUERY_BLIND, q.Field("name"),
           q.Mac(MacOf("ann"))), &n));
   EXPECT_EQ(0u, n);
   /* The history lookup finds it, with the revisions that held it. */
@@ -3280,7 +3302,7 @@ TEST_F(ModelWrite, AnOpenWriteIsInvisible) {
   now.Set("total", Decimal(7));
   GDEFSTOR_Tree * t = Build(now);
   GDEFSTOR_RevisionMeta m = Meta();
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_save(w, "po1", 3, 1, &m, t, nullptr));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_save(w, "po1", 3, 1, &m, kLang, kLangLen, t, nullptr));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_create(w, kPo, std::strlen(kPo), "po2",
       3, "", 0, 1, nullptr));
   /* Inside the write, the next save builds on the one just written. */
@@ -3288,7 +3310,7 @@ TEST_F(ModelWrite, AnOpenWriteIsInvisible) {
   gdefstor_tree_free(t);
   t = Build(now);
   uint64_t rev = 0;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_save(w, "po1", 3, 2, &m, t, &rev));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_save(w, "po1", 3, 2, &m, kLang, kLangLen, t, &rev));
   EXPECT_EQ(3u, rev);
   gdefstor_tree_free(t);
   /* Outside it, the last commit. */
@@ -3304,7 +3326,7 @@ TEST_F(ModelWrite, AnOpenWriteIsInvisible) {
   EXPECT_EQ(Ids({"po1", "po2"}, 2), Ask(store, kPo, nullptr));
   /* Both revisions of one write share its commit sequence. */
   GDEFSTOR_History * h = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_history(store, kTenant, 2, "po1", 3, &h));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_history(store, kTenant, 2, "po1", 3, nullptr, 0, &h));
   GDEFSTOR_RevisionInfo r1;
   GDEFSTOR_RevisionInfo r2;
   GDEFSTOR_RevisionInfo r3;
@@ -3330,7 +3352,7 @@ TEST_F(ModelWrite, AbortLeavesNothing) {
   now.kids["lines"].clear();
   GDEFSTOR_Tree * t = Build(now);
   GDEFSTOR_RevisionMeta m = Meta();
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_save(w, "po1", 3, 1, &m, t, nullptr));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_save(w, "po1", 3, 1, &m, kLang, kLangLen, t, nullptr));
   gdefstor_tree_free(t);
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_set_state(w, "po1", 3, 1, 0, "", 0, 1,
       nullptr));
@@ -3345,7 +3367,7 @@ TEST_F(ModelWrite, AbortLeavesNothing) {
     Node bad = Current("po1");
     bad.vals.erase("number");
     GDEFSTOR_Tree * b = Build(bad);
-    GDEFSTOR_Result rc = gdefstor_entity_save(x, "po1", 3, 1, &m, b, nullptr);
+    GDEFSTOR_Result rc = gdefstor_entity_save(x, "po1", 3, 1, &m, kLang, kLangLen, b, nullptr);
     gdefstor_tree_free(b);
     if (rc != GDEFSTOR_ERR_INVALID) {
       return GDEFSTOR_ERR_INTERNAL;
@@ -3353,7 +3375,7 @@ TEST_F(ModelWrite, AbortLeavesNothing) {
     Node good = Current("po1");
     good.Set("total", Decimal(1));
     b = Build(good);
-    rc = gdefstor_entity_save(x, "po1", 3, 1, &m, b, nullptr);
+    rc = gdefstor_entity_save(x, "po1", 3, 1, &m, kLang, kLangLen, b, nullptr);
     gdefstor_tree_free(b);
     return rc;
   }));
@@ -3404,7 +3426,7 @@ TEST_F(ModelQuery, PurchaseOrderRoundTripsReordersRevertsAndLists) {
   EXPECT_EQ(Ids({}, 0), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
       q.Field("lines.discounts.breakdown.reason"), q.Values({Text("bulk")}))));
   GDEFSTOR_Tree * one = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "po1", 3, 1,
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "po1", 3, kLang, kLangLen, 1,
       &one));
   EXPECT_EQ(Read(one), Current("po1"));
   gdefstor_tree_free(one);
@@ -3516,13 +3538,13 @@ inline GDEFSTOR_Result OomScenario(const GDEFSTOR_Allocator * alloc) {
   if (rc == GDEFSTOR_OK) {
     t = Build(PoTree("PO-1", 100, "c1"));
     rc = t == nullptr ? GDEFSTOR_ERR_OOM : in_write([&](GDEFSTOR_Write * w) {
-      return gdefstor_entity_save(w, "po1", 3, 0, &m, t, nullptr);
+      return gdefstor_entity_save(w, "po1", 3, 0, &m, kLang, kLangLen, t, nullptr);
     });
     gdefstor_tree_free(t);
     t = nullptr;
   }
   if (rc == GDEFSTOR_OK) {
-    rc = gdefstor_entity_tree(store, kTenant, 2, "po1", 3, 0, &t);
+    rc = gdefstor_entity_tree(store, kTenant, 2, "po1", 3, kLang, kLangLen, 0, &t);
   }
   if (rc == GDEFSTOR_OK) {
     Node n = Read(t);
@@ -3533,7 +3555,7 @@ inline GDEFSTOR_Result OomScenario(const GDEFSTOR_Allocator * alloc) {
     n.Set("total", Decimal(7));
     t = Build(n);
     rc = t == nullptr ? GDEFSTOR_ERR_OOM : in_write([&](GDEFSTOR_Write * w) {
-      GDEFSTOR_Result r = gdefstor_entity_save(w, "po1", 3, 1, &m, t, nullptr);
+      GDEFSTOR_Result r = gdefstor_entity_save(w, "po1", 3, 1, &m, kLang, kLangLen, t, nullptr);
       if (r == GDEFSTOR_OK) {
         r = gdefstor_entity_set_state(w, "po1", 3, 1, 0, "u1", 2, 2, nullptr);
       }
@@ -3551,7 +3573,7 @@ inline GDEFSTOR_Result OomScenario(const GDEFSTOR_Allocator * alloc) {
     rc = gdefstor_type_get(store, kTenant, 2, kPo, std::strlen(kPo), &type);
   }
   if (rc == GDEFSTOR_OK) {
-    rc = gdefstor_entity_tree(store, kTenant, 2, "po1", 3, 2, &t);
+    rc = gdefstor_entity_tree(store, kTenant, 2, "po1", 3, kLang, kLangLen, 2, &t);
   }
   if (rc == GDEFSTOR_OK) {
     rc = gdefstor_tree_to_json(type, t, &bytes, &len);
@@ -3570,10 +3592,10 @@ inline GDEFSTOR_Result OomScenario(const GDEFSTOR_Allocator * alloc) {
   }
   if (rc == GDEFSTOR_OK) {
     rc = in_write([&](GDEFSTOR_Write * w) {
-      GDEFSTOR_Result r = gdefstor_draft_put(w, nullptr, 0, "po1", 3, 3, bytes,
+      GDEFSTOR_Result r = DraftPut(w, nullptr, 0, "po1", 3, 3, bytes,
           len);
       if (r == GDEFSTOR_OK) {
-        r = gdefstor_draft_put(w, kPo, std::strlen(kPo), "po2", 3, 0, fresh,
+        r = DraftPut(w, kPo, std::strlen(kPo), "po2", 3, 0, fresh,
             fresh_len);
       }
       if (r == GDEFSTOR_OK) {
@@ -3595,6 +3617,8 @@ inline GDEFSTOR_Result OomScenario(const GDEFSTOR_Allocator * alloc) {
     GDEFSTOR_Query query;
     std::memset(&query, 0, sizeof query);
     query.size = sizeof query;
+    query.language = kLang;
+    query.language_len = kLangLen;
     query.where = q.Op(GDEFSTOR_QUERY_AND, {q.Op(GDEFSTOR_QUERY_EXISTS,
         {q.Cmp(GDEFSTOR_QUERY_EQ, q.Entity(), q.Field("customer", true))},
         "site.customer"), q.Cmp(GDEFSTOR_QUERY_EQ, q.Field("lines.sku"),
@@ -3608,12 +3632,12 @@ inline GDEFSTOR_Result OomScenario(const GDEFSTOR_Allocator * alloc) {
   }
   if (rc == GDEFSTOR_OK) {
     GDEFSTOR_History * h = nullptr;
-    rc = gdefstor_entity_history(store, kTenant, 2, "po1", 3, &h);
+    rc = gdefstor_entity_history(store, kTenant, 2, "po1", 3, nullptr, 0, &h);
     gdefstor_history_free(h);
   }
   if (rc == GDEFSTOR_OK) {
     GDEFSTOR_Diff * d = nullptr;
-    rc = gdefstor_entity_diff(store, kTenant, 2, "po1", 3, 1, 3, &d);
+    rc = gdefstor_entity_diff(store, kTenant, 2, "po1", 3, nullptr, 0, 1, 3, &d);
     gdefstor_diff_free(d);
   }
   if (rc == GDEFSTOR_OK) {
@@ -3712,7 +3736,7 @@ inline GDEFSTOR_Result BlindOomScenario(const GDEFSTOR_Allocator * alloc) {
     if (step > 0) {
       /* Name the items the first save made, so they continue. */
       GDEFSTOR_Tree * cur = nullptr;
-      rc = gdefstor_entity_tree(store, kTenant, 2, "m1", 2, 0, &cur);
+      rc = gdefstor_entity_tree(store, kTenant, 2, "m1", 2, kLang, kLangLen, 0, &cur);
       if (rc != GDEFSTOR_OK) {
         break;
       }
@@ -3725,7 +3749,7 @@ inline GDEFSTOR_Result BlindOomScenario(const GDEFSTOR_Allocator * alloc) {
     GDEFSTOR_Tree * t = Build(n);
     rc = t == nullptr ? GDEFSTOR_ERR_OOM : in_write([&](GDEFSTOR_Write * w) {
       return gdefstor_entity_save(w, "m1", 2, static_cast<uint64_t>(step), &m,
-          t, nullptr);
+          kLang, kLangLen, t, nullptr);
     });
     gdefstor_tree_free(t);
   }
@@ -3739,6 +3763,8 @@ inline GDEFSTOR_Result BlindOomScenario(const GDEFSTOR_Allocator * alloc) {
     GDEFSTOR_Query query;
     std::memset(&query, 0, sizeof query);
     query.size = sizeof query;
+    query.language = kLang;
+    query.language_len = kLangLen;
     query.where = q.Op(GDEFSTOR_QUERY_OR, {q.Cmp(GDEFSTOR_QUERY_BLIND,
         q.Field("name"), q.Mac(ann)), q.Cmp(GDEFSTOR_QUERY_BLIND,
             q.Field("contacts.emails"), q.Mac(ann))});
@@ -3749,7 +3775,7 @@ inline GDEFSTOR_Result BlindOomScenario(const GDEFSTOR_Allocator * alloc) {
     uint64_t n = 0;
     if (rc == GDEFSTOR_OK) {
       rc = gdefstor_entity_count(store, kTenant, 2, kMember,
-          std::strlen(kMember), query.where, &n);
+          std::strlen(kMember), kLang, kLangLen, query.where, &n);
     }
   }
   if (rc == GDEFSTOR_OK) {
@@ -4222,7 +4248,7 @@ class Sweep {
   Node CurrentOf(const MEntity & e, uint64_t rev = 0) {
     GDEFSTOR_Tree * t = nullptr;
     GDEFSTOR_Result rc = gdefstor_entity_tree(store_, kTenant, 2, e.pid.data(),
-        e.pid.size(), rev, &t);
+        e.pid.size(), kLang, kLangLen, rev, &t);
     EXPECT_EQ(GDEFSTOR_OK, rc) << "seed " << seed_ << " " << e.pid << "@" << rev;
     Node n = t == nullptr ? Node() : Read(t);
     gdefstor_tree_free(t);
@@ -4248,7 +4274,7 @@ class Sweep {
     EXPECT_EQ("", AppendOnly(before, after)) << "seed " << seed_;
     GDEFSTOR_Diff * d = nullptr;
     ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_diff(store_, kTenant, 2,
-        e.pid.data(), e.pid.size(), rev - 1, rev, &d));
+        e.pid.data(), e.pid.size(), nullptr, 0, rev - 1, rev, &d));
     size_t written = 0;
     std::set<uint64_t> lib_changed;
     for (size_t i = 0; i < gdefstor_diff_count(d); i++) {
@@ -4313,7 +4339,7 @@ class Sweep {
       gdefstor_tree_free(t);
       gdefstor_type_free(type);
       rc = t_->InWrite([&](GDEFSTOR_Write * w) {
-        return gdefstor_draft_put(w, nullptr, 0, e.pid.data(), e.pid.size(),
+        return DraftPut(w, nullptr, 0, e.pid.data(), e.pid.size(),
             head, json, len);
       });
       gdefstor_bytes_free(nullptr, json);
@@ -4631,7 +4657,7 @@ class Sweep {
     if (where != nullptr) {
       uint64_t n = 0;
       EXPECT_EQ(GDEFSTOR_OK, gdefstor_entity_count(store_, kTenant, 2,
-          type_.data(), type_.size(), where, &n));
+          type_.data(), type_.size(), kLang, kLangLen, where, &n));
       EXPECT_EQ(want.total, n) << "seed " << seed_;
     }
     queries_ += 1;
@@ -4754,5 +4780,6 @@ TEST_F(ModelSweep, RandomHistoriesMatchAnIndependentModel) {
 
 /* Records, counters and the outbox (story S6a), in this namespace. */
 #include "system.inc"
+#include "language.inc"
 
 } /* namespace model_conformance */

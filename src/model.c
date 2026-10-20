@@ -58,7 +58,8 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
       (model->size != sizeof(GDEFSTOR_ModelBackend) &&
           model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V1 &&
           model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V2 &&
-          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V3) ||
+          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V3 &&
+          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V4) ||
       model->destroy == NULL ||
       model->begin == NULL || model->commit == NULL || model->abort == NULL ||
       model->type_load == NULL || model->type_store == NULL ||
@@ -284,7 +285,90 @@ typedef struct Item {
   uint64_t to;
   GDEFSTOR_Value * vals;
   size_t nvals;
+  char lang[GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES];
+  size_t lang_len;
 } Item;
+
+/* ---- languages ----------------------------------------------------------- */
+
+#define lang_cmp gdefstor_model_lang_cmp
+
+/* A set of languages, sorted by bytes. */
+typedef struct Lang {
+  char tag[GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES];
+  size_t len;
+} Lang;
+
+typedef struct Langs {
+  const GDEFSTOR_Allocator * alloc;
+  Lang * v;
+  size_t n;
+  size_t cap;
+} Langs;
+
+static void langs_release(Langs * l) {
+  gcu_allocator_free(l->alloc, l->v);
+  l->v = NULL;
+  l->n = 0;
+  l->cap = 0;
+}
+
+/* Where @p tag is or would go. */
+static size_t langs_at(const Langs * l, const char * tag, size_t len,
+    int * found) {
+  size_t lo = 0;
+  size_t hi = l->n;
+  *found = 0;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    int c = lang_cmp(l->v[mid].tag, l->v[mid].len, tag, len);
+    if (c == 0) {
+      *found = 1;
+      return mid;
+    }
+    if (c < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+static int langs_has(const Langs * l, const char * tag, size_t len) {
+  int found;
+  (void)langs_at(l, tag, len, &found);
+  return found;
+}
+
+/* Add a valid tag; *out_added 0 when it was there already. */
+static GDEFSTOR_Result langs_add(Langs * l, const char * tag, size_t len,
+    int * out_added) {
+  int found;
+  size_t at = langs_at(l, tag, len, &found);
+  if (out_added != NULL) {
+    *out_added = !found;
+  }
+  if (found) {
+    return GDEFSTOR_OK;
+  }
+  if (l->n == l->cap) {
+    size_t grown = l->cap == 0 ? 4 : l->cap * 2;
+    Lang * next = (Lang *)gcu_allocator_realloc(l->alloc, l->v,
+        grown * sizeof *next);
+    if (next == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    l->v = next;
+    l->cap = grown;
+  }
+  memmove(&l->v[at + 1], &l->v[at], (l->n - at) * sizeof *l->v);
+  memcpy(l->v[at].tag, tag, len);
+  l->v[at].len = len;
+  l->n += 1;
+  return GDEFSTOR_OK;
+}
+
 
 /* A blind row the port read back: which version and field it indexes, and
  * its MAC (the subject is the value's own, so it is not kept). */
@@ -303,6 +387,10 @@ typedef struct Items {
   IBlind * bl;  /* read only when asked: sorted by item, from, field */
   size_t nbl;
   size_t capbl;
+  /* The language asked for, or none (every language): a row of another is
+   * the backend's damage. */
+  const char * lang;
+  size_t lang_len;
 } Items;
 
 static void items_release(Items * it) {
@@ -329,7 +417,10 @@ static GDEFSTOR_Result catch_blind(void * ctx, uint64_t row,
   Items * it = (Items *)ctx;
   IBlind * o;
   (void)row;
-  if (b->mac == NULL || it->nbl >= GDEFSTOR_MODEL_MAX_ITEMS * 4u) {
+  if (b->mac == NULL || it->nbl >= GDEFSTOR_MODEL_MAX_ITEMS * 4u ||
+      !gdefstor_model_lang_ok(b->language, b->language_len) ||
+      (it->lang_len != 0 &&
+          !same_span(b->language, b->language_len, it->lang, it->lang_len))) {
     return GDEFSTOR_ERR_CORRUPT;
   }
   if (it->nbl == it->capbl) {
@@ -405,7 +496,10 @@ static GDEFSTOR_Result catch_item(void * ctx, uint64_t row,
   Item * o;
   size_t k;
   (void)row;
-  if (it->n >= GDEFSTOR_MODEL_MAX_ITEMS * 4u) {
+  if (it->n >= GDEFSTOR_MODEL_MAX_ITEMS * 4u * GDEFSTOR_MODEL_MAX_LANGUAGES ||
+      !gdefstor_model_lang_ok(i->language, i->language_len) ||
+      (it->lang_len != 0 &&
+          !same_span(i->language, i->language_len, it->lang, it->lang_len))) {
     return GDEFSTOR_ERR_CORRUPT;
   }
   if (it->n == it->cap) {
@@ -426,6 +520,8 @@ static GDEFSTOR_Result catch_item(void * ctx, uint64_t row,
   o->order = i->order;
   o->from = i->valid_from;
   o->to = i->valid_to;
+  memcpy(o->lang, i->language, i->language_len);
+  o->lang_len = i->language_len;
   if (i->value_count > 0) {
     if (i->values == NULL || i->value_count > GDEFSTOR_MODEL_MAX_FIELDS) {
       return GDEFSTOR_ERR_CORRUPT;
@@ -453,15 +549,18 @@ static GDEFSTOR_Result catch_item(void * ctx, uint64_t row,
   return GDEFSTOR_OK;
 }
 
-/* @p with_blind also reads the entity's blind rows (a backend that serves
- * the blind index only). */
+/* The items of language @p lang (every language when @p lang_len is 0).
+ * @p with_blind also reads the entity's blind rows (a backend that serves the
+ * blind index only). */
 static GDEFSTOR_Result load_items(GDEFSTOR_Store * store, void * txn,
     const char * tenant, size_t tenant_len, uint64_t row, uint64_t as_of,
-    int with_blind, Items * out) {
+    const char * lang, size_t lang_len, int with_blind, Items * out) {
   GDEFSTOR_ModelVisitor v;
   GDEFSTOR_Result rc;
   memset(out, 0, sizeof *out);
   out->alloc = store->alloc;
+  out->lang = lang;
+  out->lang_len = lang_len;
   memset(&v, 0, sizeof v);
   v.ctx = out;
   v.item = catch_item;
@@ -469,7 +568,7 @@ static GDEFSTOR_Result load_items(GDEFSTOR_Store * store, void * txn,
     v.blind = catch_blind;
   }
   rc = store->model.items(store->model.ctx, txn, tenant, tenant_len, row,
-      as_of, &v);
+      as_of, lang_len == 0 ? NULL : lang, lang_len, &v);
   if (rc != GDEFSTOR_OK) {
     items_release(out);
     return rc;
@@ -480,6 +579,58 @@ static GDEFSTOR_Result load_items(GDEFSTOR_Store * store, void * txn,
 
 static int cmp_u64(uint64_t a, uint64_t b) {
   return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+static GDEFSTOR_Result catch_lang(void * ctx, uint64_t row,
+    const char * language, size_t language_len) {
+  Langs * l = (Langs *)ctx;
+  int added = 0;
+  GDEFSTOR_Result rc;
+  (void)row;
+  if (!gdefstor_model_lang_ok(language, language_len) ||
+      l->n >= GDEFSTOR_MODEL_MAX_LANGUAGES) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  rc = langs_add(l, language, language_len, &added);
+  if (rc == GDEFSTOR_OK && !added) {
+    /* One root, so one visit, per language. */
+    rc = GDEFSTOR_ERR_CORRUPT;
+  }
+  return rc;
+}
+
+/* The languages entity @p row has a tree in (a root item), now or as of a
+ * revision. */
+static GDEFSTOR_Result load_langs(GDEFSTOR_Store * store, void * txn,
+    const char * tenant, size_t tenant_len, uint64_t row, uint64_t as_of,
+    Langs * out) {
+  GDEFSTOR_Result rc;
+  memset(out, 0, sizeof *out);
+  out->alloc = store->alloc;
+  if (store->model.languages != NULL) {
+    GDEFSTOR_ModelVisitor v;
+    memset(&v, 0, sizeof v);
+    v.ctx = out;
+    v.language = catch_lang;
+    rc = store->model.languages(store->model.lang_ctx, txn, tenant,
+        tenant_len, row, as_of, &v);
+  } else {
+    /* No call of its own: the root items, from every language's items. */
+    Items it;
+    size_t i;
+    rc = load_items(store, txn, tenant, tenant_len, row, as_of, NULL, 0, 0,
+        &it);
+    for (i = 0; rc == GDEFSTOR_OK && i < it.n; i++) {
+      if (it.v[i].group == 0) {
+        rc = catch_lang(out, row, it.v[i].lang, it.v[i].lang_len);
+      }
+    }
+    items_release(&it);
+  }
+  if (rc != GDEFSTOR_OK) {
+    langs_release(out);
+  }
+  return rc;
 }
 
 /* A stable merge sort of the indexes 0..n-1 by @p cmp, which C's qsort cannot
@@ -802,6 +953,10 @@ typedef struct Save {
   GDEFSTOR_Store * store;
   const GDEFSTOR_Allocator * alloc;
   const GDEFSTOR_Type * type;
+  /* The language whose tree this plans: every base item, close, insert and
+   * blind row is of it. */
+  char lang[GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES];
+  size_t lang_len;
   size_t id_cap;
   int revert;             /* ids from history may come back */
   /* The type has a personal field and the backend serves the blind index:
@@ -811,6 +966,7 @@ typedef struct Save {
   size_t n;
   size_t cap;
   Items base;             /* the current versions */
+  Items past;             /* a revert's past versions: targets borrow them */
   size_t * base_idx;      /* base sorted by id */
   size_t * base_by_parent; /* base sorted by parent id */
   unsigned char * used;   /* base[i] is continued by a target */
@@ -839,6 +995,7 @@ static void save_release(Save * s) {
   gcu_allocator_free(s->alloc, s->closes);
   gcu_allocator_free(s->alloc, s->inserts);
   items_release(&s->base);
+  items_release(&s->past);
 }
 
 static uint32_t group_of(const GDEFSTOR_Type * t, size_t field) {
@@ -1110,7 +1267,9 @@ static GDEFSTOR_Result map_ids(Save * s) {
   for (i = 0; i < s->n; i++) {
     Tgt * x = &s->t[i];
     size_t b;
-    if (i == 0) {
+    if (i == 0 && !s->revert) {
+      /* The root continues the language's root; a revert names the old one,
+       * which a language removed and saved again since no longer has. */
       x->id = s->base_root;
     }
     if (x->id == 0) {
@@ -1547,6 +1706,8 @@ static void blinds_of(Save * s, const Tgt * x, int count_only, size_t * n) {
     o->mac = x->bl[c].mac;
     o->key_id = x->bl[c].key_id;
     o->version = x->bl[c].version;
+    o->language = s->lang;
+    o->language_len = s->lang_len;
     s->nblind += 1;
   }
 }
@@ -1583,6 +1744,8 @@ static GDEFSTOR_Result diff_rows(Save * s) {
       s->closes[s->nclose].group = b->group;
       s->closes[s->nclose].item = b->item;
       s->closes[s->nclose].valid_from = b->from;
+      s->closes[s->nclose].language = s->lang;
+      s->closes[s->nclose].language_len = s->lang_len;
       s->nclose += 1;
     }
     ins = &s->inserts[s->ninsert];
@@ -1592,6 +1755,8 @@ static GDEFSTOR_Result diff_rows(Save * s) {
     ins->order = x->order;
     ins->values = x->cols;
     ins->value_count = x->ncols;
+    ins->language = s->lang;
+    ins->language_len = s->lang_len;
     s->ninsert += 1;
     blinds_of(s, x, 0, NULL);
   }
@@ -1600,30 +1765,36 @@ static GDEFSTOR_Result diff_rows(Save * s) {
       s->closes[s->nclose].group = s->base.v[i].group;
       s->closes[s->nclose].item = s->base.v[i].item;
       s->closes[s->nclose].valid_from = s->base.v[i].from;
+      s->closes[s->nclose].language = s->lang;
+      s->closes[s->nclose].language_len = s->lang_len;
       s->nclose += 1;
     }
   }
   return GDEFSTOR_OK;
 }
 
-/* Load the current versions of an entity (none for a new one) and index them. */
+/* Load the current versions of one language of an entity (none for a new
+ * entity or language) and index them. */
 static GDEFSTOR_Result save_begin(Save * s, GDEFSTOR_Store * store,
     const GDEFSTOR_Type * type, void * txn, const char * tenant,
-    size_t tenant_len, const Ent * e, size_t id_cap) {
+    size_t tenant_len, const Ent * e, size_t id_cap, const char * lang,
+    size_t lang_len) {
   size_t i;
   GDEFSTOR_Result rc;
   memset(s, 0, sizeof *s);
   s->store = store;
   s->alloc = store->alloc;
   s->type = type;
+  memcpy(s->lang, lang, lang_len);
+  s->lang_len = lang_len;
   s->id_cap = id_cap;
   s->personal = gdefstor_model_has_personal(type) &&
                 gdefstor_model_has_blind(store);
   s->base.alloc = store->alloc;
   s->next_item = e->last_item;
   if (e->row != 0 && e->revision != 0) {
-    rc = load_items(store, txn, tenant, tenant_len, e->row, 0, s->personal,
-        &s->base);
+    rc = load_items(store, txn, tenant, tenant_len, e->row, 0, s->lang,
+        s->lang_len, s->personal, &s->base);
     if (rc != GDEFSTOR_OK) {
       return rc;
     }
@@ -1658,7 +1829,8 @@ static GDEFSTOR_Result save_begin(Save * s, GDEFSTOR_Store * store,
       return GDEFSTOR_ERR_CORRUPT;
     }
   }
-  if (e->revision != 0 && s->base_root == 0) {
+  /* A language with items has its root; one with none has no tree yet. */
+  if (s->base.n != 0 && s->base_root == 0) {
     return GDEFSTOR_ERR_CORRUPT;
   }
   return GDEFSTOR_OK;
@@ -1684,22 +1856,369 @@ static GDEFSTOR_Result save_plan(Save * s) {
   return rc;
 }
 
-/* Write the planned rows as revision @p e->revision + 1. Nothing changed:
- * nothing is written and *out_revision is 0. */
-static GDEFSTOR_Result save_apply(Save * s, GDEFSTOR_Write * write,
-    void * txn, uint64_t row, uint64_t head, const GDEFSTOR_RevisionMeta * meta,
+/* ---- one revision over several languages ---------------------------------- */
+
+/* The languages a save, a revert or an apply plans, one Save each, and what
+ * they share: the entity's item ids are given out across its languages, so
+ * one language's new items never take another's ids, and every language's
+ * rows are one revision. */
+typedef struct Multi {
+  GDEFSTOR_Store * store;
+  const GDEFSTOR_Type * type;
+  const Ent * e;
+  void * txn;
+  const char * tenant;
+  size_t tenant_len;
+  size_t id_cap;
+  int revert;
+  /* Allocated once, at its full size: the rows a part plans point into its
+   * Save (the language), so a part never moves. */
+  Save * v;
+  size_t n;
+  size_t cap;
+  uint64_t next_item;  /* the last item id given out, across languages */
+  Langs now;           /* the languages the entity has a tree in now */
+} Multi;
+
+static void multi_release(Multi * m) {
+  size_t i;
+  for (i = 0; i < m->n; i++) {
+    save_release(&m->v[i]);
+  }
+  gcu_allocator_free(m->store->alloc, m->v);
+  langs_release(&m->now);
+  m->v = NULL;
+  m->n = 0;
+}
+
+/* The entity's languages now; parts are reserved by multi_reserve(). */
+static GDEFSTOR_Result multi_begin(Multi * m, GDEFSTOR_Write * write,
+    void * txn, const Ent * e, const GDEFSTOR_Type * type) {
+  memset(m, 0, sizeof *m);
+  m->store = write->store;
+  m->type = type;
+  m->e = e;
+  m->txn = txn;
+  m->tenant = write->tenant;
+  m->tenant_len = write->tenant_len;
+  m->id_cap = write->limits.max_public_id_bytes;
+  m->next_item = e->last_item;
+  m->now.alloc = write->store->alloc;
+  if (e->row != 0 && e->revision != 0) {
+    return load_langs(m->store, txn, m->tenant, m->tenant_len, e->row, 0,
+        &m->now);
+  }
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result multi_reserve(Multi * m, size_t parts) {
+  m->v = (Save *)gdefstor_mem0(m->store->alloc,
+      (parts == 0 ? 1 : parts) * sizeof *m->v);
+  if (m->v == NULL) {
+    return GDEFSTOR_ERR_OOM;
+  }
+  m->cap = parts;
+  return GDEFSTOR_OK;
+}
+
+/* A new part for language @p lang, its current versions loaded. */
+static GDEFSTOR_Result multi_part(Multi * m, const char * lang, size_t lang_len,
+    Save ** out) {
+  Save * s;
+  size_t i;
+  GDEFSTOR_Result rc;
+  if (!gdefstor_model_lang_ok(lang, lang_len)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  for (i = 0; i < m->n; i++) {
+    if (same_span(m->v[i].lang, m->v[i].lang_len, lang, lang_len)) {
+      /* A language named twice in one save. */
+      return GDEFSTOR_ERR_INVALID;
+    }
+  }
+  if (m->n >= m->cap) {
+    return GDEFSTOR_ERR_INTERNAL;
+  }
+  s = &m->v[m->n];
+  rc = save_begin(s, m->store, m->type, m->txn, m->tenant, m->tenant_len,
+      m->e, m->id_cap, lang, lang_len);
+  /* Counted at once, so that whatever it holds is released. */
+  m->n += 1;
+  s->base.lang = NULL;
+  s->revert = m->revert;
+  s->next_item = m->next_item;
+  if (rc == GDEFSTOR_OK &&
+      (s->base_root != 0) != langs_has(&m->now, lang, lang_len)) {
+    /* The language list and the items disagree: damage. */
+    rc = GDEFSTOR_ERR_CORRUPT;
+  }
+  *out = s;
+  return rc;
+}
+
+/* Plan language @p lang's whole new tree. */
+static GDEFSTOR_Result multi_tree(Multi * m, const char * lang,
+    size_t lang_len, const GDEFSTOR_Tree * tree) {
+  Save * s = NULL;
+  size_t root;
+  GDEFSTOR_Result rc = multi_part(m, lang, lang_len, &s);
+  if (rc == GDEFSTOR_OK) {
+    rc = tgt_new(s, 0, GDEFSTOR_NONE, GDEFSTOR_NONE, &root);
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = resolve_node(s, tree, 0, root, GDEFSTOR_NONE);
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = save_plan(s);
+  }
+  if (rc == GDEFSTOR_OK) {
+    m->next_item = s->next_item;
+  }
+  return rc;
+}
+
+/* Plan language @p lang's removal: no targets, so every current item of it
+ * is closed (none, for a language it has no tree in). */
+static GDEFSTOR_Result multi_remove(Multi * m, const char * lang,
+    size_t lang_len) {
+  Save * s = NULL;
+  GDEFSTOR_Result rc = multi_part(m, lang, lang_len, &s);
+  if (rc == GDEFSTOR_OK) {
+    rc = save_plan(s);
+  }
+  return rc;
+}
+
+/* Plan language @p lang back to its tree as of @p to_revision, which it has:
+ * the past tree, parents first, as targets with their old ids and keys.
+ * Retired fields are left out here: carry_retired() keeps the current ones. */
+static GDEFSTOR_Result multi_revert(Multi * m, const char * lang,
+    size_t lang_len, uint64_t to_revision) {
+  const GDEFSTOR_Type * type = m->type;
+  Save * s = NULL;
+  Items * old;
+  size_t * by_parent = NULL;
+  size_t * stack_items = NULL;
+  size_t * stack_tgts = NULL;
+  GDEFSTOR_Result rc;
+  rc = multi_part(m, lang, lang_len, &s);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  /* Kept in the part: its targets borrow these values until the apply. */
+  old = &s->past;
+  rc = load_items(m->store, m->txn, m->tenant, m->tenant_len, m->e->row,
+      to_revision, lang, lang_len, s->personal, old);
+  s->past.lang = NULL;
+  if (rc == GDEFSTOR_OK) {
+    rc = gdefstor_model_sort(s->alloc, old->n, by_parent_id, old->v,
+        &by_parent);
+  }
+  if (rc == GDEFSTOR_OK) {
+    stack_items = (size_t *)gdefstor_mem(s->alloc,
+        (old->n + 1) * sizeof(size_t));
+    stack_tgts = (size_t *)gdefstor_mem(s->alloc,
+        (old->n + 1) * sizeof(size_t));
+    if (stack_items == NULL || stack_tgts == NULL) {
+      rc = GDEFSTOR_ERR_OOM;
+    }
+  }
+  if (rc == GDEFSTOR_OK) {
+    size_t top = 0;
+    size_t i;
+    size_t root = GDEFSTOR_NONE;
+    for (i = 0; i < old->n; i++) {
+      if (old->v[i].group == 0) {
+        root = root == GDEFSTOR_NONE ? i : old->n;
+      }
+    }
+    if (root == GDEFSTOR_NONE || root == old->n) {
+      rc = GDEFSTOR_ERR_CORRUPT;
+    }
+    if (rc == GDEFSTOR_OK) {
+      stack_items[top] = root;
+      stack_tgts[top] = GDEFSTOR_NONE;
+      top = 1;
+    }
+    while (rc == GDEFSTOR_OK && top > 0) {
+      size_t oi;
+      size_t parent_t;
+      size_t field;
+      size_t ti;
+      size_t lo;
+      size_t hi;
+      uint32_t c;
+      const Item * x;
+      top -= 1;
+      oi = stack_items[top];
+      parent_t = stack_tgts[top];
+      x = &old->v[oi];
+      if (x->group >= type->next_group) {
+        rc = GDEFSTOR_ERR_CORRUPT;
+        break;
+      }
+      field = type->group_owner[x->group];
+      if (field != GDEFSTOR_NONE && type->f[field].eff_retired) {
+        continue;
+      }
+      rc = tgt_new(s, x->item, field, parent_t, &ti);
+      if (rc != GDEFSTOR_OK) {
+        break;
+      }
+      s->t[ti].has_order = 1;
+      s->t[ti].order = x->order;
+      for (c = 0; c < s->t[ti].ncols; c++) {
+        s->t[ti].cols[c] = *base_col(x, c);
+      }
+      /* The old values come back with the blind rows they had (those of a
+       * subject erased since are gone, and are not brought back). */
+      for (c = 0; s->t[ti].bl != NULL && c < s->t[ti].ncols; c++) {
+        const GDEFSTOR_MField * f = col_field(type, x->group, c);
+        const GDEFSTOR_BlindVal * was;
+        if ((f->flags & GDEFSTOR_FIELD_PERSONAL) == 0 ||
+            s->t[ti].cols[c].type == 0) {
+          continue;
+        }
+        was = blind_of(old, x->item, x->from, f->id);
+        if (was != NULL) {
+          s->t[ti].bl[c] = *was;
+        }
+      }
+      if (find_id(s->base.v, s->base_idx, s->base.n, x->item) ==
+          GDEFSTOR_NONE) {
+        /* Brought back: its retired columns are not restored either. */
+        for (c = 0; c < s->t[ti].ncols; c++) {
+          size_t cf = type->col_field[type->col_base[x->group] + c];
+          if (type->f[cf].eff_retired) {
+            memset(&s->t[ti].cols[c], 0, sizeof s->t[ti].cols[c]);
+          }
+        }
+      }
+      lo = 0;
+      hi = old->n;
+      while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (old->v[by_parent[mid]].parent < x->item) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+      for (; lo < old->n && old->v[by_parent[lo]].parent == x->item; lo++) {
+        if (top >= old->n) {
+          rc = GDEFSTOR_ERR_CORRUPT;
+          break;
+        }
+        stack_items[top] = by_parent[lo];
+        stack_tgts[top] = ti;
+        top += 1;
+      }
+    }
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = save_plan(s);
+  }
+  if (rc == GDEFSTOR_OK) {
+    m->next_item = s->next_item;
+  }
+  gcu_allocator_free(m->store->alloc, by_parent);
+  gcu_allocator_free(m->store->alloc, stack_items);
+  gcu_allocator_free(m->store->alloc, stack_tgts);
+  return rc;
+}
+
+/* Whether a planned part writes anything: an unchanged language writes no
+ * row, and is not one of the revision's languages. */
+static int part_writes(const Save * s) {
+  return s->nclose != 0 || s->ninsert != 0;
+}
+
+/* Write every part's planned rows as revision @p head + 1, one apply. No part
+ * changed: nothing is written and *out_revision is 0. */
+static GDEFSTOR_Result multi_apply(Multi * m, GDEFSTOR_Write * write,
+    uint64_t row, uint64_t head, const GDEFSTOR_RevisionMeta * meta,
     uint64_t * out_revision) {
+  const GDEFSTOR_Allocator * alloc = m->store->alloc;
   GDEFSTOR_ModelRevision r;
   GDEFSTOR_ModelApply a;
-  GDEFSTOR_Result rc;
+  GDEFSTOR_ModelClose * closes = NULL;
+  GDEFSTOR_ModelItem * inserts = NULL;
+  GDEFSTOR_ModelBlind * blinds = NULL;
+  Langs touched;
+  char * text = NULL;
+  size_t text_len = 0;
+  size_t text_cap = 0;
+  size_t nclose = 0;
+  size_t ninsert = 0;
+  size_t nblind = 0;
+  size_t after = 0;
+  size_t i;
+  GDEFSTOR_Result rc = GDEFSTOR_OK;
   if (out_revision != NULL) {
     *out_revision = 0;
   }
-  if (s->nclose == 0 && s->ninsert == 0) {
+  memset(&touched, 0, sizeof touched);
+  touched.alloc = alloc;
+  /* The languages it holds afterwards: those it does not plan, and those it
+   * plans a tree for. */
+  for (i = 0; i < m->now.n; i++) {
+    size_t k;
+    int planned = 0;
+    for (k = 0; k < m->n && !planned; k++) {
+      planned = same_span(m->v[k].lang, m->v[k].lang_len, m->now.v[i].tag,
+          m->now.v[i].len);
+    }
+    after += planned ? 0 : 1;
+  }
+  for (i = 0; i < m->n; i++) {
+    after += m->v[i].n > 0 ? 1 : 0;
+    if (part_writes(&m->v[i])) {
+      nclose += m->v[i].nclose;
+      ninsert += m->v[i].ninsert;
+      nblind += m->v[i].nblind;
+      if (rc == GDEFSTOR_OK) {
+        rc = langs_add(&touched, m->v[i].lang, m->v[i].lang_len, NULL);
+      }
+    }
+  }
+  if (rc == GDEFSTOR_OK && after > GDEFSTOR_MODEL_MAX_LANGUAGES) {
+    rc = GDEFSTOR_ERR_LIMIT;
+  }
+  if (rc == GDEFSTOR_OK && touched.n == 0) {
+    langs_release(&touched);
     return GDEFSTOR_OK;
   }
-  if (head == UINT64_MAX) {
-    return GDEFSTOR_ERR_LIMIT;
+  if (rc == GDEFSTOR_OK && head == UINT64_MAX) {
+    rc = GDEFSTOR_ERR_LIMIT;
+  }
+  if (rc == GDEFSTOR_OK) {
+    closes = (GDEFSTOR_ModelClose *)gdefstor_mem0(alloc,
+        (nclose + 1) * sizeof *closes);
+    inserts = (GDEFSTOR_ModelItem *)gdefstor_mem0(alloc,
+        (ninsert + 1) * sizeof *inserts);
+    blinds = (GDEFSTOR_ModelBlind *)gdefstor_mem0(alloc,
+        (nblind + 1) * sizeof *blinds);
+    if (closes == NULL || inserts == NULL || blinds == NULL) {
+      rc = GDEFSTOR_ERR_OOM;
+    }
+  }
+  /* The revision's languages: sorted, joined by ','. */
+  for (i = 0; rc == GDEFSTOR_OK && i < touched.n; i++) {
+    if (i > 0) {
+      rc = gdefstor_buf_append(&text, &text_len, &text_cap, alloc, ",", 1);
+    }
+    if (rc == GDEFSTOR_OK) {
+      rc = gdefstor_buf_append(&text, &text_len, &text_cap, alloc,
+          touched.v[i].tag, touched.v[i].len);
+    }
+  }
+  if (rc != GDEFSTOR_OK) {
+    gcu_allocator_free(alloc, closes);
+    gcu_allocator_free(alloc, inserts);
+    gcu_allocator_free(alloc, blinds);
+    gcu_allocator_free(alloc, text);
+    langs_release(&touched);
+    return rc;
   }
   memset(&r, 0, sizeof r);
   r.revision = head + 1;
@@ -1708,28 +2227,49 @@ static GDEFSTOR_Result save_apply(Save * s, GDEFSTOR_Write * write,
   r.when_ms = meta->when_ms;
   r.why = meta->why_len == 0 ? "" : meta->why;
   r.why_len = meta->why_len;
+  r.languages = text;
+  r.languages_len = text_len;
+  nclose = 0;
+  ninsert = 0;
+  nblind = 0;
+  for (i = 0; i < m->n; i++) {
+    const Save * s = &m->v[i];
+    size_t k;
+    if (!part_writes(s)) {
+      continue;
+    }
+    for (k = 0; k < s->nclose; k++) {
+      closes[nclose++] = s->closes[k];
+    }
+    for (k = 0; k < s->ninsert; k++) {
+      inserts[ninsert] = s->inserts[k];
+      inserts[ninsert].valid_from = r.revision;
+      inserts[ninsert].valid_to = 0;
+      ninsert += 1;
+    }
+    /* A blind row indexes the version written in this same apply. */
+    for (k = 0; k < s->nblind; k++) {
+      blinds[nblind] = s->blinds[k];
+      blinds[nblind].valid_from = r.revision;
+      nblind += 1;
+    }
+  }
   memset(&a, 0, sizeof a);
   a.row = row;
   a.revision = &r;
-  a.last_item = s->next_item;
-  a.closes = s->closes;
-  a.close_count = s->nclose;
-  a.inserts = s->inserts;
-  a.insert_count = s->ninsert;
-  a.blinds = s->nblind == 0 ? NULL : s->blinds;
-  a.blind_count = s->nblind;
-  {
-    size_t i;
-    for (i = 0; i < s->ninsert; i++) {
-      s->inserts[i].valid_from = r.revision;
-      s->inserts[i].valid_to = 0;
-    }
-    /* A blind row indexes the version written in this same apply. */
-    for (i = 0; i < s->nblind; i++) {
-      s->blinds[i].valid_from = r.revision;
-    }
-  }
-  rc = write->store->model.apply(write->store->model.ctx, txn, &a);
+  a.last_item = m->next_item;
+  a.closes = closes;
+  a.close_count = nclose;
+  a.inserts = inserts;
+  a.insert_count = ninsert;
+  a.blinds = nblind == 0 ? NULL : blinds;
+  a.blind_count = nblind;
+  rc = write->store->model.apply(write->store->model.ctx, m->txn, &a);
+  gcu_allocator_free(alloc, closes);
+  gcu_allocator_free(alloc, inserts);
+  gcu_allocator_free(alloc, blinds);
+  gcu_allocator_free(alloc, text);
+  langs_release(&touched);
   if (rc != GDEFSTOR_OK) {
     return gdefstor_model_break(write, rc);
   }
@@ -1777,51 +2317,96 @@ static GDEFSTOR_Result open_save(GDEFSTOR_Write * write,
   return GDEFSTOR_OK;
 }
 
-static GDEFSTOR_Result save_tree(GDEFSTOR_Write * write, void * txn,
-    const Ent * e, const GDEFSTOR_Type * type, const GDEFSTOR_Tree * tree,
-    const GDEFSTOR_RevisionMeta * meta, uint64_t * out_revision) {
-  GDEFSTOR_Store * store = write->store;
-  Save s;
-  size_t root;
-  GDEFSTOR_Result rc;
-  rc = save_begin(&s, store, type, txn, write->tenant, write->tenant_len, e,
-      write->limits.max_public_id_bytes);
-  if (rc == GDEFSTOR_OK) {
-    rc = tgt_new(&s, 0, GDEFSTOR_NONE, GDEFSTOR_NONE, &root);
+/* Plan @p count languages' trees (a NULL tree removes its language). */
+static GDEFSTOR_Result multi_trees(Multi * m, const GDEFSTOR_LanguageTree * trees,
+    size_t count) {
+  size_t i;
+  GDEFSTOR_Result rc = multi_reserve(m, count);
+  for (i = 0; rc == GDEFSTOR_OK && i < count; i++) {
+    rc = trees[i].tree == NULL
+             ? multi_remove(m, trees[i].language, trees[i].language_len)
+             : multi_tree(m, trees[i].language, trees[i].language_len,
+                   trees[i].tree);
   }
-  if (rc == GDEFSTOR_OK) {
-    rc = resolve_node(&s, tree, 0, root, GDEFSTOR_NONE);
-  }
-  if (rc == GDEFSTOR_OK) {
-    rc = save_plan(&s);
-  }
-  if (rc == GDEFSTOR_OK) {
-    rc = save_apply(&s, write, txn, e->row, e->revision, meta, out_revision);
-  }
-  save_release(&s);
   return rc;
 }
 
-GDEFSTOR_Result gdefstor_entity_save(GDEFSTOR_Write * write,
+static GDEFSTOR_Result check_trees(const GDEFSTOR_LanguageTree * trees,
+    size_t count) {
+  size_t i;
+  if (trees == NULL && count != 0) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (count > GDEFSTOR_MODEL_MAX_LANGUAGES) {
+    return GDEFSTOR_ERR_LIMIT;
+  }
+  for (i = 0; i < count; i++) {
+    if (trees[i].size != sizeof trees[i] ||
+        !gdefstor_model_lang_ok(trees[i].language, trees[i].language_len)) {
+      return GDEFSTOR_ERR_INVALID;
+    }
+  }
+  return GDEFSTOR_OK;
+}
+
+GDEFSTOR_Result gdefstor_entity_save_languages(GDEFSTOR_Write * write,
     const char * public_id, size_t public_id_len, uint64_t base_revision,
-    const GDEFSTOR_RevisionMeta * meta, const GDEFSTOR_Tree * tree,
-    uint64_t * out_revision) {
+    const GDEFSTOR_RevisionMeta * meta, const GDEFSTOR_LanguageTree * trees,
+    size_t count, uint64_t * out_revision) {
   void * txn = NULL;
   Ent e;
   GDEFSTOR_Type * type = NULL;
-  GDEFSTOR_Result rc;
-  if (tree == NULL) {
-    return GDEFSTOR_ERR_INVALID;
+  Multi m;
+  GDEFSTOR_Result rc = check_trees(trees, count);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
   }
   rc = open_save(write, public_id, public_id_len, base_revision, meta, &txn,
       &e, &type);
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
-  rc = save_tree(write, txn, &e, type, tree, meta, out_revision);
+  rc = multi_begin(&m, write, txn, &e, type);
+  if (rc == GDEFSTOR_OK) {
+    rc = multi_trees(&m, trees, count);
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = multi_apply(&m, write, e.row, e.revision, meta, out_revision);
+  }
+  multi_release(&m);
   gdefstor_type_free(type);
   ent_release(write->store->alloc, &e);
   return rc;
+}
+
+GDEFSTOR_Result gdefstor_entity_save(GDEFSTOR_Write * write,
+    const char * public_id, size_t public_id_len, uint64_t base_revision,
+    const GDEFSTOR_RevisionMeta * meta, const char * language,
+    size_t language_len, const GDEFSTOR_Tree * tree, uint64_t * out_revision) {
+  GDEFSTOR_LanguageTree one;
+  if (tree == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  memset(&one, 0, sizeof one);
+  one.size = sizeof one;
+  one.language = language;
+  one.language_len = language_len;
+  one.tree = tree;
+  return gdefstor_entity_save_languages(write, public_id, public_id_len,
+      base_revision, meta, &one, 1, out_revision);
+}
+
+GDEFSTOR_Result gdefstor_entity_remove_language(GDEFSTOR_Write * write,
+    const char * public_id, size_t public_id_len, uint64_t base_revision,
+    const GDEFSTOR_RevisionMeta * meta, const char * language,
+    size_t language_len, uint64_t * out_revision) {
+  GDEFSTOR_LanguageTree one;
+  memset(&one, 0, sizeof one);
+  one.size = sizeof one;
+  one.language = language;
+  one.language_len = language_len;
+  return gdefstor_entity_save_languages(write, public_id, public_id_len,
+      base_revision, meta, &one, 1, out_revision);
 }
 
 /* ---- reverting ----------------------------------------------------------- */
@@ -1833,150 +2418,59 @@ GDEFSTOR_Result gdefstor_entity_revert(GDEFSTOR_Write * write,
   void * txn = NULL;
   Ent e;
   GDEFSTOR_Type * type = NULL;
-  Items old;
-  size_t * by_parent = NULL;
-  size_t * stack_items = NULL;
-  size_t * stack_tgts = NULL;
-  Save s;
+  Langs past;
+  Multi m;
   GDEFSTOR_Result rc;
   rc = open_save(write, public_id, public_id_len, base_revision, meta, &txn,
       &e, &type);
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
-  memset(&old, 0, sizeof old);
-  old.alloc = write->store->alloc;
-  rc = save_begin(&s, write->store, type, txn, write->tenant,
-      write->tenant_len, &e, write->limits.max_public_id_bytes);
-  s.revert = 1;
+  memset(&past, 0, sizeof past);
+  past.alloc = write->store->alloc;
+  rc = multi_begin(&m, write, txn, &e, type);
+  m.revert = 1;
   if (rc == GDEFSTOR_OK && (to_revision == 0 || to_revision > e.revision)) {
     rc = GDEFSTOR_ERR_INVALID;
   }
   if (rc == GDEFSTOR_OK) {
-    rc = load_items(write->store, txn, write->tenant, write->tenant_len, e.row,
-        to_revision, s.personal, &old);
+    rc = load_langs(write->store, txn, write->tenant, write->tenant_len, e.row,
+        to_revision, &past);
   }
   if (rc == GDEFSTOR_OK) {
-    rc = gdefstor_model_sort(s.alloc, old.n, by_parent_id, old.v, &by_parent);
+    rc = multi_reserve(&m, m.now.n + past.n);
   }
+  /* Every language it has now or had then, in byte order: back to its past
+   * tree, or removed when it had none. */
   if (rc == GDEFSTOR_OK) {
-    stack_items = (size_t *)gdefstor_mem(s.alloc, (old.n + 1) * sizeof(size_t));
-    stack_tgts = (size_t *)gdefstor_mem(s.alloc, (old.n + 1) * sizeof(size_t));
-    if (stack_items == NULL || stack_tgts == NULL) {
-      rc = GDEFSTOR_ERR_OOM;
-    }
-  }
-  /* The past tree, parents first, as targets with their old ids and keys.
-   * Retired fields are left out here: carry_retired() keeps the current ones. */
-  if (rc == GDEFSTOR_OK) {
-    size_t top = 0;
-    size_t i;
-    size_t root = GDEFSTOR_NONE;
-    for (i = 0; i < old.n; i++) {
-      if (old.v[i].group == 0) {
-        root = root == GDEFSTOR_NONE ? i : old.n;
+    size_t i = 0;
+    size_t j = 0;
+    while (rc == GDEFSTOR_OK && (i < m.now.n || j < past.n)) {
+      int c = i == m.now.n ? 1
+              : j == past.n
+                  ? -1
+                  : lang_cmp(m.now.v[i].tag, m.now.v[i].len, past.v[j].tag,
+                        past.v[j].len);
+      if (c < 0) {
+        rc = multi_remove(&m, m.now.v[i].tag, m.now.v[i].len);
+        i += 1;
+      } else {
+        rc = multi_revert(&m, past.v[j].tag, past.v[j].len, to_revision);
+        i += c == 0 ? 1 : 0;
+        j += 1;
       }
-    }
-    if (root == GDEFSTOR_NONE || root == old.n) {
-      rc = GDEFSTOR_ERR_CORRUPT;
-    }
-    if (rc == GDEFSTOR_OK) {
-      stack_items[top] = root;
-      stack_tgts[top] = GDEFSTOR_NONE;
-      top = 1;
-    }
-    while (rc == GDEFSTOR_OK && top > 0) {
-      size_t oi;
-      size_t parent_t;
-      size_t field;
-      size_t ti;
-      size_t lo;
-      size_t hi;
-      uint32_t c;
-      const Item * x;
-      top -= 1;
-      oi = stack_items[top];
-      parent_t = stack_tgts[top];
-      x = &old.v[oi];
-      if (x->group >= type->next_group) {
-        rc = GDEFSTOR_ERR_CORRUPT;
-        break;
-      }
-      field = type->group_owner[x->group];
-      if (field != GDEFSTOR_NONE && type->f[field].eff_retired) {
-        continue;
-      }
-      rc = tgt_new(&s, x->item, field, parent_t, &ti);
-      if (rc != GDEFSTOR_OK) {
-        break;
-      }
-      s.t[ti].has_order = 1;
-      s.t[ti].order = x->order;
-      for (c = 0; c < s.t[ti].ncols; c++) {
-        s.t[ti].cols[c] = *base_col(x, c);
-      }
-      /* The old values come back with the blind rows they had (those of a
-       * subject erased since are gone, and are not brought back). */
-      for (c = 0; s.t[ti].bl != NULL && c < s.t[ti].ncols; c++) {
-        const GDEFSTOR_MField * f = col_field(type, x->group, c);
-        const GDEFSTOR_BlindVal * was;
-        if ((f->flags & GDEFSTOR_FIELD_PERSONAL) == 0 ||
-            s.t[ti].cols[c].type == 0) {
-          continue;
-        }
-        was = blind_of(&old, x->item, x->from, f->id);
-        if (was != NULL) {
-          s.t[ti].bl[c] = *was;
-        }
-      }
-      if (find_id(s.base.v, s.base_idx, s.base.n, x->item) == GDEFSTOR_NONE) {
-        /* Brought back: its retired columns are not restored either. */
-        for (c = 0; c < s.t[ti].ncols; c++) {
-          size_t cf = type->col_field[type->col_base[x->group] + c];
-          if (type->f[cf].eff_retired) {
-            memset(&s.t[ti].cols[c], 0, sizeof s.t[ti].cols[c]);
-          }
-        }
-      }
-      lo = 0;
-      hi = old.n;
-      while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (old.v[by_parent[mid]].parent < x->item) {
-          lo = mid + 1;
-        } else {
-          hi = mid;
-        }
-      }
-      for (; lo < old.n && old.v[by_parent[lo]].parent == x->item; lo++) {
-        if (top >= old.n) {
-          rc = GDEFSTOR_ERR_CORRUPT;
-          break;
-        }
-        stack_items[top] = by_parent[lo];
-        stack_tgts[top] = ti;
-        top += 1;
-      }
-    }
-    if (rc == GDEFSTOR_OK && s.n > 0 && s.t[0].id != s.base_root) {
-      rc = GDEFSTOR_ERR_CORRUPT;
     }
   }
   if (rc == GDEFSTOR_OK) {
-    rc = save_plan(&s);
+    rc = multi_apply(&m, write, e.row, e.revision, meta, out_revision);
   }
-  if (rc == GDEFSTOR_OK) {
-    rc = save_apply(&s, write, txn, e.row, e.revision, meta, out_revision);
-  }
-  gcu_allocator_free(s.alloc, by_parent);
-  gcu_allocator_free(s.alloc, stack_items);
-  gcu_allocator_free(s.alloc, stack_tgts);
-  items_release(&old);
-  save_release(&s);
+  multi_release(&m);
+  langs_release(&past);
   gdefstor_type_free(type);
   ent_release(write->store->alloc, &e);
   return rc;
 }
+
 
 /* ---- reading trees ------------------------------------------------------- */
 
@@ -2169,12 +2663,13 @@ static GDEFSTOR_Result open_read(GDEFSTOR_Store * store, const char * tenant,
 
 GDEFSTOR_Result gdefstor_entity_tree(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * public_id,
-    size_t public_id_len, uint64_t revision, GDEFSTOR_Tree ** out_tree) {
+    size_t public_id_len, const char * language, size_t language_len,
+    uint64_t revision, GDEFSTOR_Tree ** out_tree) {
   Ent e;
   GDEFSTOR_Type * type = NULL;
   Items it;
   GDEFSTOR_Result rc;
-  if (out_tree == NULL) {
+  if (out_tree == NULL || !gdefstor_model_lang_ok(language, language_len)) {
     return GDEFSTOR_ERR_INVALID;
   }
   rc = open_read(store, tenant, tenant_len, public_id, public_id_len, &e,
@@ -2187,15 +2682,83 @@ GDEFSTOR_Result gdefstor_entity_tree(GDEFSTOR_Store * store,
   }
   if (rc == GDEFSTOR_OK) {
     /* 0 reads the current tables; a number reads history. */
-    rc = load_items(store, NULL, tenant, tenant_len, e.row, revision, 0, &it);
+    rc = load_items(store, NULL, tenant, tenant_len, e.row, revision, language,
+        language_len, 0, &it);
   }
   if (rc == GDEFSTOR_OK) {
-    rc = build_tree(store->alloc, type, &it, out_tree);
+    /* No item: no tree in that language then. */
+    rc = it.n == 0 ? GDEFSTOR_ERR_INVALID
+                   : build_tree(store->alloc, type, &it, out_tree);
     items_release(&it);
   }
   gdefstor_type_free(type);
   ent_release(store->alloc, &e);
   return rc;
+}
+
+struct GDEFSTOR_Languages {
+  Langs l;
+};
+
+GDEFSTOR_Result gdefstor_entity_languages(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * public_id,
+    size_t public_id_len, uint64_t revision, GDEFSTOR_Languages ** out) {
+  Ent e;
+  GDEFSTOR_Languages * l;
+  GDEFSTOR_Result rc;
+  if (out == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  rc = open_read(store, tenant, tenant_len, public_id, public_id_len, &e,
+      NULL);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  if (revision > e.revision) {
+    ent_release(store->alloc, &e);
+    return GDEFSTOR_ERR_INVALID;
+  }
+  l = (GDEFSTOR_Languages *)gdefstor_mem0(store->alloc, sizeof *l);
+  if (l == NULL) {
+    ent_release(store->alloc, &e);
+    return GDEFSTOR_ERR_OOM;
+  }
+  l->l.alloc = store->alloc;
+  if (e.revision != 0) {
+    rc = load_langs(store, NULL, tenant, tenant_len, e.row, revision, &l->l);
+  }
+  ent_release(store->alloc, &e);
+  if (rc != GDEFSTOR_OK) {
+    gcu_allocator_free(store->alloc, l);
+    return rc;
+  }
+  *out = l;
+  return GDEFSTOR_OK;
+}
+
+size_t gdefstor_languages_count(const GDEFSTOR_Languages * l) {
+  return l == NULL ? 0 : l->l.n;
+}
+
+GDEFSTOR_Result gdefstor_languages_get(const GDEFSTOR_Languages * l,
+    size_t index, const char ** out_language, size_t * out_len) {
+  if (l == NULL || out_language == NULL || out_len == NULL ||
+      index >= l->l.n) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  *out_language = l->l.v[index].tag;
+  *out_len = l->l.v[index].len;
+  return GDEFSTOR_OK;
+}
+
+void gdefstor_languages_free(GDEFSTOR_Languages * l) {
+  const GDEFSTOR_Allocator * alloc;
+  if (l == NULL) {
+    return;
+  }
+  alloc = l->l.alloc;
+  langs_release(&l->l);
+  gcu_allocator_free(alloc, l);
 }
 
 /* ---- history ------------------------------------------------------------- */
@@ -2218,6 +2781,7 @@ void gdefstor_history_free(GDEFSTOR_History * h) {
   for (i = 0; i < h->nrev; i++) {
     gcu_allocator_free(h->alloc, (void *)h->revs[i].who);
     gcu_allocator_free(h->alloc, (void *)h->revs[i].why);
+    gcu_allocator_free(h->alloc, (void *)h->revs[i].languages);
   }
   for (i = 0; i < h->nstate; i++) {
     gcu_allocator_free(h->alloc, (void *)h->states[i].actor);
@@ -2225,6 +2789,48 @@ void gdefstor_history_free(GDEFSTOR_History * h) {
   gcu_allocator_free(h->alloc, h->revs);
   gcu_allocator_free(h->alloc, h->states);
   gcu_allocator_free(h->alloc, h);
+}
+
+/* A revision's languages as stored: tags in ascending byte order, each once,
+ * joined by ','; at least one, since a revision writes a row. */
+static int langs_text_ok(const char * p, size_t n) {
+  size_t at = 0;
+  const char * prev = NULL;
+  size_t prev_len = 0;
+  if (p == NULL || n == 0) {
+    return 0;
+  }
+  while (at <= n) {
+    size_t end = at;
+    while (end < n && p[end] != ',') {
+      end += 1;
+    }
+    if (!gdefstor_model_lang_ok(p + at, end - at) ||
+        (prev != NULL && lang_cmp(prev, prev_len, p + at, end - at) >= 0)) {
+      return 0;
+    }
+    prev = p + at;
+    prev_len = end - at;
+    at = end + 1;
+  }
+  return 1;
+}
+
+/* Whether a revision's language text names @p tag. */
+static int langs_text_has(const char * p, size_t n, const char * tag,
+    size_t len) {
+  size_t at = 0;
+  while (at <= n) {
+    size_t end = at;
+    while (end < n && p[end] != ',') {
+      end += 1;
+    }
+    if (same_span(p + at, end - at, tag, len)) {
+      return 1;
+    }
+    at = end + 1;
+  }
+  return 0;
 }
 
 static GDEFSTOR_Result catch_revision(void * ctx, uint64_t row,
@@ -2242,13 +2848,18 @@ static GDEFSTOR_Result catch_revision(void * ctx, uint64_t row,
     h->revs = next;
     h->caprev = grown;
   }
+  if (!langs_text_ok(r->languages, r->languages_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
   o = &h->revs[h->nrev];
   *o = *r;
   o->who = gdefstor_dup(h->alloc, r->who, r->who_len);
   o->why = gdefstor_dup(h->alloc, r->why, r->why_len);
-  if (o->who == NULL || o->why == NULL) {
+  o->languages = gdefstor_dup(h->alloc, r->languages, r->languages_len);
+  if (o->who == NULL || o->why == NULL || o->languages == NULL) {
     gcu_allocator_free(h->alloc, (void *)o->who);
     gcu_allocator_free(h->alloc, (void *)o->why);
+    gcu_allocator_free(h->alloc, (void *)o->languages);
     return GDEFSTOR_ERR_OOM;
   }
   h->nrev += 1;
@@ -2310,14 +2921,17 @@ static GDEFSTOR_Result permute(const GDEFSTOR_Allocator * alloc, void * base,
 
 GDEFSTOR_Result gdefstor_entity_history(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * public_id,
-    size_t public_id_len, GDEFSTOR_History ** out_history) {
+    size_t public_id_len, const char * language, size_t language_len,
+    GDEFSTOR_History ** out_history) {
   Ent e;
   GDEFSTOR_History * h;
   GDEFSTOR_ModelVisitor v;
   size_t * idx = NULL;
   size_t i;
   GDEFSTOR_Result rc;
-  if (out_history == NULL) {
+  if (out_history == NULL ||
+      (language_len == 0 ? language != NULL
+                         : !gdefstor_model_lang_ok(language, language_len))) {
     return GDEFSTOR_ERR_INVALID;
   }
   rc = open_read(store, tenant, tenant_len, public_id, public_id_len, &e,
@@ -2364,6 +2978,22 @@ GDEFSTOR_Result gdefstor_entity_history(GDEFSTOR_Store * store,
       rc = GDEFSTOR_ERR_CORRUPT;
     }
   }
+  if (rc == GDEFSTOR_OK && language_len != 0) {
+    /* One language's history: the revisions that changed its tree. */
+    size_t k = 0;
+    for (i = 0; i < h->nrev; i++) {
+      GDEFSTOR_ModelRevision * r = &h->revs[i];
+      if (langs_text_has(r->languages, r->languages_len, language,
+              language_len)) {
+        h->revs[k++] = *r;
+      } else {
+        gcu_allocator_free(h->alloc, (void *)r->who);
+        gcu_allocator_free(h->alloc, (void *)r->why);
+        gcu_allocator_free(h->alloc, (void *)r->languages);
+      }
+    }
+    h->nrev = k;
+  }
   if (rc != GDEFSTOR_OK) {
     gdefstor_history_free(h);
     return rc;
@@ -2391,6 +3021,8 @@ GDEFSTOR_Result gdefstor_history_revision(const GDEFSTOR_History * h,
   out->when_ms = r->when_ms;
   out->why = r->why;
   out->why_len = r->why_len;
+  out->languages = r->languages;
+  out->languages_len = r->languages_len;
   return GDEFSTOR_OK;
 }
 
@@ -2421,6 +3053,8 @@ typedef struct DItem {
   unsigned what;
   uint64_t item;
   size_t field; /* GDEFSTOR_NONE: the root */
+  char lang[GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES];
+  size_t lang_len;
 } DItem;
 
 struct GDEFSTOR_Diff {
@@ -2460,8 +3094,8 @@ static unsigned item_delta(const Item * a, const Item * b) {
 
 GDEFSTOR_Result gdefstor_entity_diff(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * public_id,
-    size_t public_id_len, uint64_t from, uint64_t to,
-    GDEFSTOR_Diff ** out_diff) {
+    size_t public_id_len, const char * language, size_t language_len,
+    uint64_t from, uint64_t to, GDEFSTOR_Diff ** out_diff) {
   Ent e;
   GDEFSTOR_Type * type = NULL;
   Items a;
@@ -2472,7 +3106,9 @@ GDEFSTOR_Result gdefstor_entity_diff(GDEFSTOR_Store * store,
   size_t i;
   size_t j;
   GDEFSTOR_Result rc;
-  if (out_diff == NULL) {
+  if (out_diff == NULL ||
+      (language_len == 0 ? language != NULL
+                         : !gdefstor_model_lang_ok(language, language_len))) {
     return GDEFSTOR_ERR_INVALID;
   }
   rc = open_read(store, tenant, tenant_len, public_id, public_id_len, &e,
@@ -2489,10 +3125,12 @@ GDEFSTOR_Result gdefstor_entity_diff(GDEFSTOR_Store * store,
   }
   /* Revision 0 is the empty tree; for the backend 0 would mean "current". */
   if (rc == GDEFSTOR_OK && from > 0) {
-    rc = load_items(store, NULL, tenant, tenant_len, e.row, from, 0, &a);
+    rc = load_items(store, NULL, tenant, tenant_len, e.row, from, language,
+        language_len, 0, &a);
   }
   if (rc == GDEFSTOR_OK && to > 0) {
-    rc = load_items(store, NULL, tenant, tenant_len, e.row, to, 0, &b);
+    rc = load_items(store, NULL, tenant, tenant_len, e.row, to, language,
+        language_len, 0, &b);
   }
   if (rc == GDEFSTOR_OK) {
     rc = sort_by_id(store->alloc, a.v, a.n, &ia);
@@ -2542,8 +3180,16 @@ GDEFSTOR_Result gdefstor_entity_diff(GDEFSTOR_Store * store,
       rc = GDEFSTOR_ERR_CORRUPT;
       break;
     }
+    if (x != NULL && y != NULL && x->item == y->item &&
+        !same_span(x->lang, x->lang_len, y->lang, y->lang_len)) {
+      /* An item belongs to one language for life. */
+      rc = GDEFSTOR_ERR_CORRUPT;
+      break;
+    }
     o->item = which->item;
     o->field = type->group_owner[which->group];
+    memcpy(o->lang, which->lang, which->lang_len);
+    o->lang_len = which->lang_len;
     d->n += 1;
   }
   gcu_allocator_free(store->alloc, ia);
@@ -2586,6 +3232,8 @@ GDEFSTOR_Result gdefstor_diff_item(const GDEFSTOR_Diff * diff, size_t index,
     out->field = diff->type->f[x->field].path;
     out->field_len = diff->type->f[x->field].path_len;
   }
+  out->language = x->lang;
+  out->language_len = x->lang_len;
   return GDEFSTOR_OK;
 }
 
@@ -2597,15 +3245,20 @@ typedef struct DraftCatch {
   char * type;
   size_t type_len;
   uint64_t base;
-  uint8_t * json;
+  uint8_t * json;     /* the draft document */
   size_t json_len;
+  GDEFSTOR_DraftPart * parts; /* its languages, in order */
+  size_t nparts;
 } DraftCatch;
 
 static void draft_catch_release(DraftCatch * c) {
   gcu_allocator_free(c->alloc, c->type);
   gcu_allocator_free(c->alloc, c->json);
+  gcu_allocator_free(c->alloc, c->parts);
   c->type = NULL;
   c->json = NULL;
+  c->parts = NULL;
+  c->nparts = 0;
 }
 
 static GDEFSTOR_Result catch_draft(void * ctx, const GDEFSTOR_ModelDraft * d) {
@@ -2626,6 +3279,15 @@ static GDEFSTOR_Result catch_draft(void * ctx, const GDEFSTOR_ModelDraft * d) {
   c->json_len = d->json_len;
   c->base = d->base_revision;
   c->seen = 1;
+  {
+    GDEFSTOR_Result rc = gdefstor_model_draft_unpack(c->alloc, c->json,
+        c->json_len, &c->parts, &c->nparts);
+    if (rc != GDEFSTOR_OK) {
+      draft_catch_release(c);
+      c->seen = 0;
+      return rc;
+    }
+  }
   return GDEFSTOR_OK;
 }
 
@@ -2671,32 +3333,101 @@ static GDEFSTOR_Result draft_exists(GDEFSTOR_Store * store, void * txn,
   return GDEFSTOR_OK;
 }
 
+static int by_draft_lang(const void * ctx, size_t a, size_t b) {
+  const GDEFSTOR_DraftTree * t = (const GDEFSTOR_DraftTree *)ctx;
+  return lang_cmp(t[a].language, t[a].language_len, t[b].language,
+      t[b].language_len);
+}
+
+/* The draft document of @p count trees: each checked, in language order. */
+static GDEFSTOR_Result draft_document(const GDEFSTOR_Allocator * alloc,
+    const GDEFSTOR_DraftTree * trees, size_t count, uint8_t ** out,
+    size_t * out_len) {
+  const GDEFSTOR_DraftTree ** sorted = NULL;
+  size_t * idx = NULL;
+  size_t i;
+  GDEFSTOR_Result rc = GDEFSTOR_OK;
+  if (trees == NULL && count != 0) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (count > GDEFSTOR_MODEL_MAX_LANGUAGES) {
+    return GDEFSTOR_ERR_LIMIT;
+  }
+  for (i = 0; rc == GDEFSTOR_OK && i < count; i++) {
+    if (trees[i].size != sizeof trees[i] || trees[i].json == NULL ||
+        !gdefstor_model_lang_ok(trees[i].language, trees[i].language_len)) {
+      rc = GDEFSTOR_ERR_INVALID;
+    } else {
+      rc = gdefstor_model_json_ok(alloc, trees[i].json, trees[i].json_len);
+    }
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = gdefstor_model_sort(alloc, count, by_draft_lang, trees, &idx);
+  }
+  if (rc == GDEFSTOR_OK) {
+    sorted = (const GDEFSTOR_DraftTree **)gdefstor_mem(alloc,
+        (count + 1) * sizeof *sorted);
+    if (sorted == NULL) {
+      rc = GDEFSTOR_ERR_OOM;
+    }
+  }
+  for (i = 0; rc == GDEFSTOR_OK && i < count; i++) {
+    sorted[i] = &trees[idx[i]];
+    if (i > 0 && by_draft_lang(trees, idx[i - 1], idx[i]) == 0) {
+      /* A language named twice. */
+      rc = GDEFSTOR_ERR_INVALID;
+    }
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = gdefstor_model_draft_pack(alloc, sorted, count, out, out_len);
+  }
+  gcu_allocator_free(alloc, (void *)sorted);
+  gcu_allocator_free(alloc, idx);
+  return rc;
+}
+
+static GDEFSTOR_Result draft_store(GDEFSTOR_Write * write,
+    GDEFSTOR_Store * store, void * txn, const char * type, size_t type_len,
+    const char * public_id, size_t public_id_len, uint64_t base_revision,
+    const uint8_t * json, size_t json_len);
+
 GDEFSTOR_Result gdefstor_draft_put(GDEFSTOR_Write * write, const char * type,
     size_t type_len, const char * public_id, size_t public_id_len,
-    uint64_t base_revision, const uint8_t * json, size_t json_len) {
+    uint64_t base_revision, const GDEFSTOR_DraftTree * trees, size_t count) {
   GDEFSTOR_Store * store;
-  GDEFSTOR_ModelDraft d;
-  GDEFSTOR_Type * t = NULL;
-  Ent e;
   void * txn = NULL;
-  int exists;
+  uint8_t * json = NULL;
+  size_t json_len = 0;
   GDEFSTOR_Result rc = write_store(write, &store);
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
-  if (json == NULL ||
-      !gdefstor_model_id_ok(public_id, public_id_len,
+  if (!gdefstor_model_id_ok(public_id, public_id_len,
           write->limits.max_public_id_bytes, 0)) {
     return GDEFSTOR_ERR_INVALID;
   }
-  rc = gdefstor_model_json_ok(store->alloc, json, json_len);
-  if (rc != GDEFSTOR_OK) {
-    return rc;
+  rc = draft_document(store->alloc, trees, count, &json, &json_len);
+  if (rc == GDEFSTOR_OK) {
+    rc = gdefstor_model_txn(write, &txn);
   }
-  rc = gdefstor_model_txn(write, &txn);
-  if (rc != GDEFSTOR_OK) {
-    return rc;
+  if (rc == GDEFSTOR_OK) {
+    rc = draft_store(write, store, txn, type, type_len, public_id,
+        public_id_len, base_revision, json, json_len);
   }
+  gcu_allocator_free(store->alloc, json);
+  return rc;
+}
+
+/* Store a draft document after the entity or the reservation is checked. */
+static GDEFSTOR_Result draft_store(GDEFSTOR_Write * write,
+    GDEFSTOR_Store * store, void * txn, const char * type, size_t type_len,
+    const char * public_id, size_t public_id_len, uint64_t base_revision,
+    const uint8_t * json, size_t json_len) {
+  GDEFSTOR_ModelDraft d;
+  GDEFSTOR_Type * t = NULL;
+  Ent e;
+  int exists;
+  GDEFSTOR_Result rc;
   rc = find_entity(store, txn, write->tenant, write->tenant_len, public_id,
       public_id_len, &e);
   if (rc != GDEFSTOR_OK && rc != GDEFSTOR_ERR_INVALID) {
@@ -2773,8 +3504,22 @@ GDEFSTOR_Result gdefstor_draft_info(const GDEFSTOR_Draft * draft,
   out->type = draft->c.type;
   out->type_len = draft->c.type_len;
   out->base_revision = draft->c.base;
-  out->json = draft->c.json;
-  out->json_len = draft->c.json_len;
+  out->language_count = draft->c.nparts;
+  return GDEFSTOR_OK;
+}
+
+GDEFSTOR_Result gdefstor_draft_tree(const GDEFSTOR_Draft * draft,
+    size_t index, GDEFSTOR_DraftTree * out) {
+  const GDEFSTOR_DraftPart * p;
+  if (draft == NULL || out == NULL || out->size != sizeof *out ||
+      index >= draft->c.nparts) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  p = &draft->c.parts[index];
+  out->language = p->lang;
+  out->language_len = p->lang_len;
+  out->json = draft->c.json + p->off;
+  out->json_len = p->len;
   return GDEFSTOR_OK;
 }
 
@@ -2820,7 +3565,12 @@ GDEFSTOR_Result gdefstor_draft_apply(GDEFSTOR_Write * write,
   GDEFSTOR_Store * store;
   DraftCatch c;
   GDEFSTOR_Type * type = NULL;
-  GDEFSTOR_Tree * tree = NULL;
+  GDEFSTOR_Tree ** trees = NULL;
+  GDEFSTOR_LanguageTree * lt = NULL;
+  Multi m;
+  int have_m = 0;
+  uint64_t row = 0;
+  size_t i;
   Ent e;
   void * txn = NULL;
   int exists;
@@ -2860,49 +3610,54 @@ GDEFSTOR_Result gdefstor_draft_apply(GDEFSTOR_Write * write,
         write->tenant_len, c.type, c.type_len, &type);
   }
   if (rc == GDEFSTOR_OK) {
-    rc = gdefstor_model_from_json(type, c.json, c.json_len, store->alloc,
-        &tree);
+    trees = (GDEFSTOR_Tree **)gdefstor_mem0(store->alloc,
+        (c.nparts + 1) * sizeof *trees);
+    lt = (GDEFSTOR_LanguageTree *)gdefstor_mem0(store->alloc,
+        (c.nparts + 1) * sizeof *lt);
+    if (trees == NULL || lt == NULL) {
+      rc = GDEFSTOR_ERR_OOM;
+    }
+  }
+  for (i = 0; rc == GDEFSTOR_OK && i < c.nparts; i++) {
+    const GDEFSTOR_DraftPart * p = &c.parts[i];
+    rc = gdefstor_model_from_json(type, c.json + p->off, p->len, store->alloc,
+        &trees[i]);
     if (rc == GDEFSTOR_ERR_FORMAT || rc == GDEFSTOR_ERR_CORRUPT) {
       rc = GDEFSTOR_ERR_INVALID;
     }
+    lt[i].size = sizeof lt[i];
+    lt[i].language = p->lang;
+    lt[i].language_len = p->lang_len;
+    lt[i].tree = trees[i];
   }
-  if (rc == GDEFSTOR_OK && exists) {
-    rc = save_tree(write, txn, &e, type, tree, meta, out_revision);
-  } else if (rc == GDEFSTOR_OK) {
-    /* A reserved id: check everything, then create the entity and write
-     * revision 1, so a draft that does not validate creates nothing. */
-    Save s;
-    size_t root;
-    rc = save_begin(&s, store, type, txn, write->tenant, write->tenant_len,
-        &e, write->limits.max_public_id_bytes);
-    if (rc == GDEFSTOR_OK) {
-      rc = tgt_new(&s, 0, GDEFSTOR_NONE, GDEFSTOR_NONE, &root);
+  /* Every language is checked first, then (a reserved id) the entity is
+   * created and the revision written, so a draft that does not validate
+   * creates nothing. */
+  if (rc == GDEFSTOR_OK) {
+    rc = multi_begin(&m, write, txn, &e, type);
+    have_m = 1;
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = multi_trees(&m, lt, c.nparts);
+  }
+  if (rc == GDEFSTOR_OK && !exists) {
+    GDEFSTOR_ModelEntity me;
+    memset(&me, 0, sizeof me);
+    me.type = c.type;
+    me.type_len = c.type_len;
+    me.public_id = public_id;
+    me.public_id_len = public_id_len;
+    me.creator = meta->who_len == 0 ? "" : meta->who;
+    me.creator_len = meta->who_len;
+    me.created_ms = meta->when_ms;
+    rc = store->model.entity_insert(store->model.ctx, txn, &me, &row);
+    if (rc != GDEFSTOR_OK) {
+      rc = gdefstor_model_break(write, rc);
     }
-    if (rc == GDEFSTOR_OK) {
-      rc = resolve_node(&s, tree, 0, root, GDEFSTOR_NONE);
-    }
-    if (rc == GDEFSTOR_OK) {
-      rc = save_plan(&s);
-    }
-    if (rc == GDEFSTOR_OK) {
-      GDEFSTOR_ModelEntity me;
-      uint64_t row = 0;
-      memset(&me, 0, sizeof me);
-      me.type = c.type;
-      me.type_len = c.type_len;
-      me.public_id = public_id;
-      me.public_id_len = public_id_len;
-      me.creator = meta->who_len == 0 ? "" : meta->who;
-      me.creator_len = meta->who_len;
-      me.created_ms = meta->when_ms;
-      rc = store->model.entity_insert(store->model.ctx, txn, &me, &row);
-      if (rc != GDEFSTOR_OK) {
-        rc = gdefstor_model_break(write, rc);
-      } else {
-        rc = save_apply(&s, write, txn, row, 0, meta, out_revision);
-      }
-    }
-    save_release(&s);
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = multi_apply(&m, write, exists ? e.row : row, e.revision, meta,
+        out_revision);
   }
   if (rc == GDEFSTOR_OK) {
     rc = store->model.draft_delete(store->model.ctx, txn, public_id,
@@ -2911,7 +3666,14 @@ GDEFSTOR_Result gdefstor_draft_apply(GDEFSTOR_Write * write,
       rc = gdefstor_model_break(write, rc);
     }
   }
-  gdefstor_tree_free(tree);
+  if (have_m) {
+    multi_release(&m);
+  }
+  for (i = 0; trees != NULL && i < c.nparts; i++) {
+    gdefstor_tree_free(trees[i]);
+  }
+  gcu_allocator_free(store->alloc, trees);
+  gcu_allocator_free(store->alloc, lt);
   gdefstor_type_free(type);
   draft_catch_release(&c);
   if (exists) {
@@ -3095,6 +3857,7 @@ static GDEFSTOR_Result dump_revision(void * ctx, uint64_t row,
   l_hex(l, r->who, r->who_len);
   l_i64(l, r->when_ms);
   l_hex(l, r->why, r->why_len);
+  l_hex(l, r->languages, r->languages_len);
   l_end(l);
   return l->rc;
 }
@@ -3124,6 +3887,8 @@ static GDEFSTOR_Result dump_item(void * ctx, uint64_t row,
       l_value(l, &i->values[j]);
     }
   }
+  /* Last, so that the words before it keep their places. */
+  l_hex(l, i->language, i->language_len);
   l_end(l);
   return l->rc;
 }
@@ -3154,6 +3919,7 @@ static GDEFSTOR_Result dump_blind(void * ctx, uint64_t row,
   l_hex(l, b->mac, GDEFSTOR_BLIND_MAC_BYTES);
   l_u64(l, b->key_id);
   l_u64(l, b->version);
+  l_hex(l, b->language, b->language_len);
   l_end(l);
   return l->rc;
 }

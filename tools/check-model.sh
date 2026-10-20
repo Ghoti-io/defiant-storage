@@ -25,10 +25,12 @@ plant_control testModel 'Model*'
 # A save that changes nothing writes a revision anyway.
 plant noop-adds-revision src/model.c testModel \
   'ModelSave.SameTreeWritesNothing ModelSweep.RandomHistoriesMatchAnIndependentModel' \
-  '  if (s->nclose == 0 && s->ninsert == 0) {
+  '  if (rc == GDEFSTOR_OK && touched.n == 0) {
+    langs_release(&touched);
     return GDEFSTOR_OK;
   }' \
   '  if (0) {
+    langs_release(&touched);
     return GDEFSTOR_OK;
   }'
 
@@ -123,5 +125,34 @@ plant blind-older-version src/model_query.c testModel \
   'ModelBlind.EqualityMatchesOnlyTheCurrentVersion ModelBlind.ARevertBringsBackTheBlindRowsOfTheValuesItRestores' \
   '      if (b->item == it->item && b->from == it->from && b->field == f->id &&' \
   '      if (b->item == it->item && b->field == f->id &&'
+
+# A query reading another language: the reference engine keeps every
+# language's items, so a field predicate or a sort sees them all (story S6a2).
+plant language-other-read src/model_query.c testModel \
+  'ModelLanguage.AQueryReadsOnlyItsLanguage ModelLanguageSweep.SeededHistoriesAgreeWithAModel' \
+  '    if (!in_language(e, it->lang, it->lang_len)) {' \
+  '    if (0) {'
+
+# A missing language matching: an entity with no tree in the query's language
+# falls back to its other languages instead of reading as all absent.
+plant language-missing-matches src/model_query.c testModel \
+  'ModelLanguage.AnEntityWithNoTreeInTheLanguageMatchesNoField' \
+  '  size_t k = 0;
+  for (i = 0; i < s->nitems; i++) {' \
+  '  size_t k = 0;
+  for (i = 0; i < s->nitems &&
+       !in_language(e, s->items[i].lang, s->items[i].lang_len); i++) {
+  }
+  if (i == s->nitems) {
+    return;
+  }
+  for (i = 0; i < s->nitems; i++) {'
+
+# An unchanged language rewritten: a language a save names gets a new version
+# of its root whether or not its tree changed.
+plant unchanged-language-rewritten src/model.c testModel \
+  'ModelLanguage.ChangingOneLanguageWritesOnlyItsItems' \
+  '      if (item_same(s, x, b)) {' \
+  '      if (item_same(s, x, b) && i != 0) {'
 
 plant_finish

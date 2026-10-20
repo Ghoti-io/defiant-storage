@@ -57,6 +57,7 @@ struct Ver {
   uint64_t from = 0;
   uint64_t to = 0;
   std::vector<OVal> vals;
+  std::string lang;
 };
 
 struct Rev {
@@ -65,6 +66,7 @@ struct Rev {
   std::string who;
   int64_t when = 0;
   std::string why;
+  std::string langs;
 };
 
 struct State {
@@ -83,6 +85,7 @@ struct Blind {
   std::string mac;
   uint32_t key_id = 0;
   uint32_t version = 0;
+  std::string lang;
 };
 
 struct Ent {
@@ -209,14 +212,20 @@ GDEFSTOR_Result visit_item(const GDEFSTOR_ModelVisitor * v, uint64_t row,
   m.valid_to = x.to;
   m.values = vals.empty() ? nullptr : vals.data();
   m.value_count = vals.size();
+  m.language = x.lang.data();
+  m.language_len = x.lang.size();
   return v->item(v->ctx, row, &m);
 }
 
-GDEFSTOR_Result visit_blinds(const GDEFSTOR_ModelVisitor * v, const Ent & e) {
+GDEFSTOR_Result visit_blinds(const GDEFSTOR_ModelVisitor * v, const Ent & e,
+    const std::string * lang = nullptr) {
   if (v->blind == nullptr) {
     return GDEFSTOR_OK;
   }
   for (const Blind & b : e.blinds) {
+    if (lang != nullptr && b.lang != *lang) {
+      continue;
+    }
     GDEFSTOR_ModelBlind m;
     std::memset(&m, 0, sizeof m);
     m.item = b.item;
@@ -227,6 +236,8 @@ GDEFSTOR_Result visit_blinds(const GDEFSTOR_ModelVisitor * v, const Ent & e) {
     m.mac = reinterpret_cast<const uint8_t *>(b.mac.data());
     m.key_id = b.key_id;
     m.version = b.version;
+    m.language = b.lang.data();
+    m.language_len = b.lang.size();
     GDEFSTOR_Result rc = v->blind(v->ctx, e.row, &m);
     if (rc != GDEFSTOR_OK) {
       return rc;
@@ -397,8 +408,10 @@ static GDEFSTOR_Result s_apply(void * ctx, void * txn,
   for (size_t i = 0; i < a->close_count; i++) {
     const GDEFSTOR_ModelClose & c = a->closes[i];
     bool done = false;
+    std::string lang(c.language, c.language_len);
     for (Ver & v : e.versions) {
-      if (v.group == c.group && v.item == c.item && v.from == c.valid_from) {
+      if (v.group == c.group && v.item == c.item && v.from == c.valid_from &&
+          v.lang == lang) {
         if (v.to != 0) {
           return GDEFSTOR_ERR_INTERNAL; /* valid_to is written once */
         }
@@ -425,6 +438,7 @@ static GDEFSTOR_Result s_apply(void * ctx, void * txn,
     v.order = m.order;
     v.from = n;
     v.to = 0;
+    v.lang.assign(m.language, m.language_len);
     for (size_t k = 0; k < m.value_count; k++) {
       v.vals.push_back(own(m.values[k]));
     }
@@ -449,6 +463,7 @@ static GDEFSTOR_Result s_apply(void * ctx, void * txn,
     b.mac.assign(reinterpret_cast<const char *>(m.mac), GDEFSTOR_BLIND_MAC_BYTES);
     b.key_id = m.key_id;
     b.version = m.version;
+    b.lang.assign(m.language, m.language_len);
     e.blinds.push_back(b);
   }
   if (x->seq == 0) {
@@ -461,6 +476,7 @@ static GDEFSTOR_Result s_apply(void * ctx, void * txn,
   r.who.assign(a->revision->who, a->revision->who_len);
   r.when = a->revision->when_ms;
   r.why.assign(a->revision->why, a->revision->why_len);
+  r.langs.assign(a->revision->languages, a->revision->languages_len);
   e.revs.push_back(r);
   e.revision = n;
   e.last_item = a->last_item;
@@ -485,6 +501,8 @@ static GDEFSTOR_Result s_history(void * ctx, void * txn, const char * t,
     m.when_ms = r.when;
     m.why = r.why.data();
     m.why_len = r.why.size();
+    m.languages = r.langs.data();
+    m.languages_len = r.langs.size();
     GDEFSTOR_Result rc = v->revision(v->ctx, row, &m);
     if (rc != GDEFSTOR_OK) {
       return rc;
@@ -507,16 +525,23 @@ static GDEFSTOR_Result s_history(void * ctx, void * txn, const char * t,
   return GDEFSTOR_OK;
 }
 
+/* This backend has no `languages` member: the port reads the root items
+ * through here, which is the fallback the header promises. */
 static GDEFSTOR_Result s_items(void * ctx, void * txn, const char * t,
-    size_t tl, uint64_t row, uint64_t as_of, const GDEFSTOR_ModelVisitor * v) {
+    size_t tl, uint64_t row, uint64_t as_of, const char * lang,
+    size_t lang_len, const GDEFSTOR_ModelVisitor * v) {
   Tenant * ten = view(static_cast<Scratch *>(ctx), txn, t, tl);
   if (ten == nullptr || row == 0 || row > ten->ents.size()) {
     return GDEFSTOR_ERR_INVALID;
   }
   const Ent & e = ten->ents[row - 1];
   const std::vector<Ver> & from = as_of == 0 ? e.current : e.versions;
+  std::string want(lang_len == 0 ? "" : std::string(lang, lang_len));
   for (const Ver & x : from) {
     if (as_of != 0 && !(x.from <= as_of && (x.to == 0 || x.to > as_of))) {
+      continue;
+    }
+    if (lang_len != 0 && x.lang != want) {
       continue;
     }
     GDEFSTOR_Result rc = visit_item(v, row, x);
@@ -524,7 +549,7 @@ static GDEFSTOR_Result s_items(void * ctx, void * txn, const char * t,
       return rc;
     }
   }
-  return visit_blinds(v, e);
+  return visit_blinds(v, e, lang_len == 0 ? nullptr : &want);
 }
 
 static GDEFSTOR_Result s_draft_put(void * ctx, void * txn,
@@ -726,6 +751,8 @@ static GDEFSTOR_Result s_blind_history(void * ctx, const char * t, size_t tl,
       h.subject_len = b.subject.size();
       h.key_id = b.key_id;
       h.version = b.version;
+      h.language = b.lang.data();
+      h.language_len = b.lang.size();
       GDEFSTOR_Result rc = fn(fn_ctx, &h);
       if (rc != GDEFSTOR_OK) {
         return rc;
@@ -763,6 +790,8 @@ static GDEFSTOR_Result s_subject_lookup(void * ctx, const char * t, size_t tl,
         h.item = x.item;
         h.valid_from = x.from;
         h.valid_to = x.to;
+        h.language = x.lang.data();
+        h.language_len = x.lang.size();
         GDEFSTOR_Result rc = fn(fn_ctx, &h);
         if (rc != GDEFSTOR_OK) {
           return rc;

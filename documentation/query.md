@@ -69,12 +69,14 @@ is not part of this form.
 
 `gdefstor_entity_query()` and `gdefstor_entity_count()` ask the same tree, a
 sort and a page of the current entities of one declared type (the entity
-port, `documentation/model.md`). The operators and the limits are the ones
+port, `documentation/model.md`), **in one language**: the query names it
+(`GDEFSTOR_Query::language`, a language tag; the count takes it as an
+argument) and it is required. The operators and the limits are the ones
 above; the operands are typed:
 
 | Operand | Its values on an entity | Type |
 |---|---|---|
-| `FIELD` `lines.taxes.amount` | the field's value on every current item that has one | the field's |
+| `FIELD` `lines.taxes.amount` | the field's value on every current item of the query's language that has one | the field's |
 | `VALUES` | the listed constants, all of one type | theirs |
 | `META` `PUBLISHED`, `DELETED` | the newest state | boolean |
 | `META` `CREATOR` | who created it (none for the system) | reference |
@@ -94,6 +96,14 @@ What it supports:
   their own: `lines.sku = "A-1" and lines.qty = 5` does not say it is the
   same line. An absent value adds nothing; an entity with no revision has no
   field values but still has its facts.
+- **One language.** Every `FIELD` operand and field sort key reads the
+  current tree of the query's language, inside an `EXISTS` too (an `OUTER`
+  field is the outer entity's, in the same language), and no other tree, so
+  two conditions on one entity are always about one language. An entity with
+  no tree in that language reads as one whose every field is absent: no `=`,
+  `in`, range or `BLIND` holds on it, `!=` and a `not` around a comparison
+  do, and it sorts as no value. `META` and `ENTITY` read alike in every
+  language.
 - `and`, `or`, `not`, `true`, `false`, as above.
 - `EXISTS` names another declared type and holds when some entity of it
   satisfies the child, whose `OUTER` operands read the entity being decided:
@@ -113,7 +123,7 @@ What it supports:
   which counts every match before the offset and the limit.
 
 What it refuses, with `GDEFSTOR_ERR_INVALID` unless a limit says otherwise:
-a type never declared; a path that is not an active scalar field (a group, a
+a query with no language, or a tag that is not one; a type never declared; a path that is not an active scalar field (a group, a
 retired field, a field that does not exist); a personal field anywhere but
 in `BLIND` (its value is ciphertext: never compared, ranged or sorted), and a
 `BLIND` on anything else or with a MAC of another length; sides of different

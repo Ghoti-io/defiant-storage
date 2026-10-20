@@ -13,13 +13,13 @@ the port hands it map one to one onto ordinary tables:
 |---|---|---|
 | entity | `T`: row, public id, creator, creation time; highest revision, last item id | inserted once; the two counters move forward |
 | state | `T_state`: published, deleted, actor, time | appended |
-| revision | `T_revision`: number, who, when, why, commit sequence | appended |
-| item version | one table per group: item id, parent item, order key, the group's columns, `valid_from`, `valid_to` | appended; `valid_to` set once |
+| revision | `T_revision`: number, who, when, why, commit sequence, the languages it changed | appended |
+| item version | one table per group: item id, language, parent item, order key, the group's columns, `valid_from`, `valid_to` | appended; `valid_to` set once |
 | current item | one current table per group: the open versions | derived, same transaction |
 | newest state | columns of `T` or a current table | derived, same transaction |
 | declaration | a catalog row per type, `defiant-type/1` text | replaced |
-| draft | one per entity, `defiant-tree/1` JSON and a base revision | replaced, deleted |
-| blind row | the blind table, per type: entity, item, `valid_from`, field, subject, MAC, key id, normalization version | inserted with the version it indexes; deleted per subject |
+| draft | one per entity, `defiant-draft/1` JSON (a `defiant-tree/1` tree per language) and a base revision | replaced, deleted |
+| blind row | the blind table, per type: entity, item, `valid_from`, field, subject, MAC, key id, normalization version, language | inserted with the version it indexes; deleted per subject |
 
 Everything that decides what a write means lives in the port, once, so every
 backend stores the same rows: which items changed, item ids, order keys, the
@@ -102,6 +102,65 @@ order items are added. The root's id is not looked at. A tree read back lists
 a parent before its children and siblings in order, with each item's id and
 stored order key.
 
+## Languages
+
+Decided 2026-10-19 (`ENTITY-STORAGE-DESIGN.md`, "Languages"; story S6a2).
+An entity holds **one tree per language**, and **one revision history covers
+all of them**: a revision's number, who, when and why are the entity's, never
+a language's. Translations with a history of their own (access spec D5) are
+not this; they stay deferred.
+
+- **Tags.** A language is 1 to 35 bytes of `[A-Za-z0-9-]` (the rule core
+  holds its languages to), compared byte for byte: `en`, `EN` and `en-GB` are
+  three languages, and the port never folds case or matches a prefix.
+- **Items.** Every item version carries its language. Each language's tree
+  has its own root item; item ids are the entity's, given out across its
+  languages, so no two languages share an id and an item belongs to the
+  language it was created in for life. A tree names only items of its own
+  language.
+- **Saves.** `gdefstor_entity_save_languages()` names the languages it writes
+  and gives each a whole tree; `gdefstor_entity_save()` is the same with one.
+  A language the save leaves out keeps its tree and gets no row. A named
+  language whose tree is unchanged gets no row either. A save in which no
+  language changed writes no revision. The rows of every language a save
+  changes are one revision, and that revision records which languages it
+  changed (sorted, joined by `,`: `GDEFSTOR_RevisionInfo::languages`).
+- **Removal** is explicit: `gdefstor_entity_remove_language()`, or a
+  `GDEFSTOR_LanguageTree` whose tree is NULL in a save, closes every current
+  item of the language in a revision. History keeps it: an as-of read of an
+  earlier revision finds the tree, and a later save of the language starts a
+  new tree with a new root. Removing a language the entity has no tree in
+  writes nothing.
+- **A revert** brings every language back to its tree at the revision: a
+  language changed since is reverted, one removed since comes back under its
+  old ids, and one that did not exist then is removed.
+- **Reads** name a language: `gdefstor_entity_tree()`, now or as of a
+  revision (no tree in that language then is `GDEFSTOR_ERR_INVALID`).
+  `gdefstor_entity_languages()` says which languages have a tree, now or as
+  of a revision. `gdefstor_entity_history()` takes a language (only the
+  revisions that changed it) or none; `gdefstor_entity_diff()` takes a
+  language or none, and each item it lists names its language, so the diff
+  from one revision to the next says which languages that revision touched.
+- **Queries** bind one language (`GDEFSTOR_Query::language`, required; the
+  count takes it too). Every field operand and field sort key of the query,
+  inside an EXISTS as well, reads that language's current items and no
+  other's, so two conditions on one entity are always about the same
+  language. An entity with no tree in the language is still an entity of the
+  type: it reads as one whose every field is absent, so `=`, `in`, ranges and
+  blind equality do not hold on it (`!=` and a NOT around a comparison do, as
+  for any absent value), and it sorts as no value. META and ENTITY operands
+  are the entity's and read alike in every language.
+- **Shared parts.** Blind rows carry the language of the version they index;
+  the history lookup and the subject lookup report each version's language.
+  A draft holds a tree per language it changes (below).
+- **Limits.** An entity holds trees in at most
+  `GDEFSTOR_MODEL_MAX_LANGUAGES` (64) languages at once; a save that would
+  leave more is `GDEFSTOR_ERR_LIMIT` and writes nothing. That is a cap per
+  entity, documented here, and the only one: a language is a column of every
+  row, never a table or a column per language, so nothing in the tables'
+  shape limits how many languages a tenant uses. Each language's tree is held
+  to the tree limits below on its own.
+
 ## Entities and states
 
 `gdefstor_entity_create()` makes the entity row: the public id (unused by any
@@ -140,24 +199,29 @@ two neighbours would be closer than `GDEFSTOR_MODEL_ORDER_EPSILON` (2^-20),
 the whole run is renumbered 1, 2, 3 ... in that same revision; the items
 whose key changed get new versions.
 
-**A revert** (`gdefstor_entity_revert()`) is an ordinary save whose tree is a
-past revision's: items keep their ids, an item removed since comes back under
+**A revert** (`gdefstor_entity_revert()`) is an ordinary save whose trees are
+a past revision's, in every language: items keep their ids, an item removed since comes back under
 its old id, keys are the old keys, and old rows are never touched, so every
 revision in between reads as it did. Retired fields keep their current data;
 an item brought back gets none. Reverting to the current tree writes nothing.
 
-**Reads.** `gdefstor_entity_tree()` with revision 0 reads the current tables;
-with a number, the versions valid at that revision. `gdefstor_entity_history()`
-lists revisions and state changes. `gdefstor_entity_diff()` lists the items
-added, changed (values, parent, order) and removed between two revisions,
-revision 0 being the empty tree.
+**Reads.** `gdefstor_entity_tree()` reads one language's tree: with revision
+0 from the current tables; with a number, the versions valid at that
+revision. `gdefstor_entity_history()` lists revisions (each with the
+languages it changed) and state changes. `gdefstor_entity_diff()` lists the
+items added, changed (values, parent, order) and removed between two
+revisions, revision 0 being the empty tree, each naming its language.
 
 ## Drafts
 
-One per entity, outside the revision tables: a `defiant-tree/1` JSON tree and
-the revision it was made from. `gdefstor_draft_put()` checks only that it is
-well formed; `gdefstor_draft_apply()` validates it against the type as it is
-then, writes it as a save on its base revision (`GDEFSTOR_ERR_CONFLICT` when
+One per entity, outside the revision tables, for all its languages: a
+`defiant-tree/1` JSON tree for each language the draft changes, and the
+revision it was made from. `gdefstor_draft_put()` checks only that each is
+well formed, and stores them as one `defiant-draft/1` document (Formats);
+`gdefstor_draft_tree()` reads each language's tree back exactly as it was put.
+`gdefstor_draft_apply()` validates every tree against the type as it is then,
+writes them as one save of those languages on its base revision (a language
+the draft leaves out keeps its tree; a draft cannot remove a language) (`GDEFSTOR_ERR_CONFLICT` when
 the head has moved: nothing is written and the draft stays) and deletes it,
 including when the tree equals the current one. A draft for a public id with
 no entity reserves the id; applying it creates the entity, with the
@@ -169,7 +233,8 @@ a draft at a time.
 ## Queries
 
 `gdefstor_entity_query()` and `gdefstor_entity_count()` take the query form
-of `query.h` over the current entities of one type: field paths into groups,
+of `query.h` over the current entities of one type, in one language: field
+paths into groups,
 typed constants, facts of the entity record (published, deleted, creator,
 creation time, newest revision) and the public id; equality, `in`, numeric
 and date comparison, `and`/`or`/`not`, the `EXISTS` semi-join that relations
@@ -314,17 +379,18 @@ sorted bytewise, strings in lower-case hex (`-` when empty), doubles as their
 T <type> <declaration>
 E <row> <type> <public id> <creator> <created> <revision> <last item> <published> <deleted>
 S <row> <seq> <published> <deleted> <actor> <when>
-R <row> <revision> <commit seq> <who> <when> <why>
-I <row> <group> <item> <valid_from> <valid_to> <parent> <order> <n> <value>...
+R <row> <revision> <commit seq> <who> <when> <why> <languages>
+I <row> <group> <item> <valid_from> <valid_to> <parent> <order> <n> <value>... <language>
 D <public id> <type> <base> <json>
-B <row> <item> <valid_from> <field id> <subject> <mac> <key id> <version>
+B <row> <item> <valid_from> <field id> <subject> <mac> <key id> <version> <language>
 K <namespace> <key> <value>
 C <kind> <name> <value>
 O <stream> <seq> <public id> <format> <payload> <lease until> <failures> <parked>
 ```
 
 A value is `v<type>`, then for a set value its integer, its double, its bytes
-and its subject. Trailing absent columns are left out, so a row written
+and its subject. The language is the last word of an `I` and a `B` row, so
+the words before it keep their places. Trailing absent columns are left out, so a row written
 before a column existed and one written after with it empty read alike.
 `GDEFSTOR_MODEL_TRUTH` dumps `T`, `E`, `S`, `R`, every `I` version, `D`,
 every blind row `B`, every record `K`, every counter `C` with a committed
@@ -348,7 +414,8 @@ A group field adds `"columns"` and `"fields"`. A stored declaration that does
 not parse, or whose ids, groups and columns do not fit together, is
 `GDEFSTOR_ERR_CORRUPT`.
 
-**`defiant-tree/1`**, a tree in JSON, which drafts hold:
+**`defiant-tree/1`**, a tree in JSON, which a draft holds one of per
+language:
 
 ```json
 {"format":"defiant-tree/1","root":{"@id":1,"title":"Hello","total":"34.99","placed":"2025-10-17",
@@ -370,6 +437,17 @@ A field the type does not have, or a value of the wrong shape, is
 `GDEFSTOR_ERR_UNSUPPORTED`. Parsing needs the declaration
 (`gdefstor_tree_from_json()`), which says what each name is.
 
+**`defiant-draft/1`**, a stored draft, written by the port:
+
+```json
+{"format":"defiant-draft/1","languages":{"de":{"format":"defiant-tree/1","root":{...}},"fr":{...}}}
+```
+
+The languages in ascending byte order, each once, each value the
+`defiant-tree/1` document the caller put, byte for byte (spaces around it
+included). A draft document this port did not write is `GDEFSTOR_ERR_CORRUPT`;
+a newer `defiant-draft` version is `GDEFSTOR_ERR_UNSUPPORTED`.
+
 ## Limits
 
 Fixed and documented here, so that no default becomes a capacity ceiling:
@@ -383,8 +461,10 @@ Fixed and documented here, so that no default becomes a capacity ceiling:
 | one text, reference or personal value | 1 MiB |
 | all values of one tree | 16 MiB |
 | the reason of a revision | 4096 bytes |
-| one draft | 32 MiB |
+| one draft, every language together | 32 MiB |
 | a decimal's scale | 18 |
+| languages one entity holds trees in at once | 64 |
+| a language tag | 35 bytes |
 
 Over a limit is `GDEFSTOR_ERR_LIMIT`, never a truncation. Public ids,
 creators, actors and subjects are held to `GDEFSTOR_Limits::max_public_id_bytes`.
@@ -430,14 +510,24 @@ the entities, leave them alone in `rebuild`, list them in `dump` through the
 visitor's `record`, `counter` and `outbox`, and keep each counter's floor so
 that an aborted transaction's value is never returned again
 (`model_backend.h` says each member's contract; the port checks names,
-values and what each answer holds).
+values and what each answer holds). With languages (story S6a2) every item
+version, close and blind row carries its language and every revision row
+the languages it changed, `items` takes a language (or none, every
+language), and an optional `languages` member, with `lang_ctx`, lists the
+languages an entity has a tree in from its root items; a backend without it
+(`GDEFSTOR_MODEL_BACKEND_SIZE_V4` is the size before it) is read through
+`items` instead, which reads every language's whole tree. A backend keeps the
+language as a column, never as a table or a column per language, and reads
+one language's items without the others' where it is asked for one.
 
 Every backend runs the conformance suite, installed beside the port:
 `model.inc` (named cases for every rule above, the purchase-order fixture,
 and a seeded random sweep of declarations, saves, drafts, reverts, reorders,
 conflicts, state changes and queries checked against a model written apart
 from the library), `system.inc` (records, counters and the outbox, which
-`model.inc` includes, with a seeded sweep of their own) and `keystore.inc`. `make check-model` here plants a defect
+`model.inc` includes, with a seeded sweep of their own), `language.inc` (the
+language axis, which `model.inc` includes, with a seeded multilingual sweep)
+and `keystore.inc`. `make check-model` here plants a defect
 in each rule the port decides and requires the named test to fail; a
 backend's own repository plants the defects a backend can make (a `valid_to`
 written twice, a revert that reopens old rows, a current table that drifts
@@ -488,9 +578,9 @@ still accepted; every call that needs them is `GDEFSTOR_ERR_UNSUPPORTED` on it.
 
 ## Not built here
 
-- **Languages.** The port has no language axis; a field has one value per
-  item. Translations with their own revision history, and language for
-  nested groups, are to be designed.
+- **Translations with their own revision history** (access spec D5): every
+  language shares the entity's one history. Designed with the first type
+  that needs it.
 - **Large values by content hash.** Values are stored inline, up to 1 MiB.
 - **Every use of the key store by the entity port**: computing MACs,
   encrypting and erasing are core's (S5b, S6).

@@ -55,6 +55,31 @@ int gdefstor_model_id_ok(const char * p, size_t n, size_t cap,
   return 1;
 }
 
+int gdefstor_model_lang_ok(const char * p, size_t n) {
+  size_t i;
+  if (p == NULL || n == 0 || n > GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES) {
+    return 0;
+  }
+  for (i = 0; i < n; i++) {
+    char c = p[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-')) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+int gdefstor_model_lang_cmp(const char * a, size_t an, const char * b,
+    size_t bn) {
+  size_t n = an < bn ? an : bn;
+  int c = n == 0 ? 0 : memcmp(a, b, n);
+  if (c != 0) {
+    return c < 0 ? -1 : 1;
+  }
+  return an < bn ? -1 : (an > bn ? 1 : 0);
+}
+
 int gdefstor_model_name_ok(const char * p, size_t n) {
   size_t i;
   if (p == NULL || n == 0 || n > GDEFSTOR_MODEL_MAX_NAME_BYTES) {

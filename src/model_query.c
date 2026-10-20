@@ -352,7 +352,9 @@ static GDEFSTOR_Result run(GDEFSTOR_Store * store, const char * tenant,
     return GDEFSTOR_ERR_LIMIT;
   }
   if ((q->sorts == NULL && q->sort_count != 0) || q->select_count != 0 ||
-      q->entity_numeric != 0) {
+      q->entity_numeric != 0 ||
+      !gdefstor_model_lang_ok(q->language, q->language_len)) {
+    /* One language, always: every field in the query reads it. */
     return GDEFSTOR_ERR_INVALID;
   }
   rc = gdefstor_model_type_load(store, NULL, tenant, tenant_len, type,
@@ -419,6 +421,7 @@ GDEFSTOR_Result gdefstor_entity_query(GDEFSTOR_Store * store,
 
 GDEFSTOR_Result gdefstor_entity_count(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * type, size_t type_len,
+    const char * language, size_t language_len,
     const GDEFSTOR_QueryNode * where, uint64_t * out_count) {
   GDEFSTOR_Query q;
   GDEFSTOR_ModelHits hits;
@@ -429,6 +432,8 @@ GDEFSTOR_Result gdefstor_entity_count(GDEFSTOR_Store * store,
   memset(&q, 0, sizeof q);
   q.size = sizeof q;
   q.where = where;
+  q.language = language;
+  q.language_len = language_len;
   rc = run(store, tenant, tenant_len, type, type_len, &q, 1, &hits);
   if (rc != GDEFSTOR_OK) {
     return rc;
@@ -464,6 +469,8 @@ typedef struct SItem {
   uint64_t from;
   GDEFSTOR_Value * vals;
   size_t nvals;
+  char lang[GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES];
+  size_t lang_len;
 } SItem;
 
 /* One blind row of an entity: the version and field it indexes, its MAC. */
@@ -472,6 +479,8 @@ typedef struct SBlind {
   uint64_t from;
   uint32_t field;
   uint8_t mac[GDEFSTOR_BLIND_MAC_BYTES];
+  char lang[GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES];
+  size_t lang_len;
 } SBlind;
 
 typedef struct Snap {
@@ -922,12 +931,46 @@ static GDEFSTOR_Result decide(Engine * e, const Snap * s) {
   return rc;
 }
 
+static int in_language(const Engine * e, const char * lang, size_t len) {
+  const GDEFSTOR_Query * q = e->plan->query;
+  return len == q->language_len && memcmp(lang, q->language, len) == 0;
+}
+
+/* Keep only the entity's tree in the query's language: a query reads one
+ * language, and an entity with no tree in it reads as one whose every field
+ * is absent, never as another language's. */
+static void keep_language(Engine * e, Snap * s) {
+  size_t i;
+  size_t k = 0;
+  for (i = 0; i < s->nitems; i++) {
+    SItem * it = &s->items[i];
+    if (!in_language(e, it->lang, it->lang_len)) {
+      size_t j;
+      for (j = 0; j < it->nvals; j++) {
+        gdefstor_model_value_clear(e->alloc, &it->vals[j]);
+      }
+      gcu_allocator_free(e->alloc, it->vals);
+      continue;
+    }
+    s->items[k++] = *it;
+  }
+  s->nitems = k;
+  k = 0;
+  for (i = 0; i < s->nblinds; i++) {
+    if (in_language(e, s->blinds[i].lang, s->blinds[i].lang_len)) {
+      s->blinds[k++] = s->blinds[i];
+    }
+  }
+  s->nblinds = k;
+}
+
 static GDEFSTOR_Result flush(Engine * e) {
   GDEFSTOR_Result rc = GDEFSTOR_OK;
   if (!e->have_cur) {
     return GDEFSTOR_OK;
   }
   e->have_cur = 0;
+  keep_language(e, &e->cur);
   if (e->into != NULL) {
     Inner * in = e->into;
     if (in->n == in->cap) {
@@ -999,6 +1042,11 @@ static GDEFSTOR_Result on_item(void * ctx, uint64_t row,
   it->group = i->group;
   it->item = i->item;
   it->from = i->valid_from;
+  if (!gdefstor_model_lang_ok(i->language, i->language_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  memcpy(it->lang, i->language, i->language_len);
+  it->lang_len = i->language_len;
   if (i->value_count > 0) {
     it->vals = (GDEFSTOR_Value *)gdefstor_mem0(e->alloc,
         i->value_count * sizeof *it->vals);
@@ -1026,6 +1074,9 @@ static GDEFSTOR_Result on_blind(void * ctx, uint64_t row,
   if (!e->have_cur || row != s->row || b->mac == NULL) {
     return GDEFSTOR_ERR_INTERNAL;
   }
+  if (!gdefstor_model_lang_ok(b->language, b->language_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
   if (s->nblinds == s->capblinds) {
     size_t grown = s->capblinds == 0 ? 4 : s->capblinds * 2;
     SBlind * next = (SBlind *)gcu_allocator_realloc(e->alloc, s->blinds,
@@ -1041,6 +1092,8 @@ static GDEFSTOR_Result on_blind(void * ctx, uint64_t row,
   o->from = b->valid_from;
   o->field = b->field;
   memcpy(o->mac, b->mac, GDEFSTOR_BLIND_MAC_BYTES);
+  memcpy(o->lang, b->language, b->language_len);
+  o->lang_len = b->language_len;
   s->nblinds += 1;
   return GDEFSTOR_OK;
 }

@@ -35,6 +35,7 @@
 /* Renames for symbols that are not part of the installed API. */
 #define gdefstor_model_id_ok GHOTIIO_DEFSTOR(gdefstor_model_id_ok)
 #define gdefstor_model_name_ok GHOTIIO_DEFSTOR(gdefstor_model_name_ok)
+#define gdefstor_model_lang_ok GHOTIIO_DEFSTOR(gdefstor_model_lang_ok)
 #define gdefstor_model_type_name_ok GHOTIIO_DEFSTOR(gdefstor_model_type_name_ok)
 #define gdefstor_model_utf8_ok GHOTIIO_DEFSTOR(gdefstor_model_utf8_ok)
 #define gdefstor_model_value_check GHOTIIO_DEFSTOR(gdefstor_model_value_check)
@@ -50,6 +51,9 @@
 #define gdefstor_model_tree_put GHOTIIO_DEFSTOR(gdefstor_model_tree_put)
 #define gdefstor_model_from_json GHOTIIO_DEFSTOR(gdefstor_model_from_json)
 #define gdefstor_model_json_ok GHOTIIO_DEFSTOR(gdefstor_model_json_ok)
+#define gdefstor_model_draft_pack GHOTIIO_DEFSTOR(gdefstor_model_draft_pack)
+#define gdefstor_model_draft_unpack GHOTIIO_DEFSTOR(gdefstor_model_draft_unpack)
+#define gdefstor_model_lang_cmp GHOTIIO_DEFSTOR(gdefstor_model_lang_cmp)
 #define gdefstor_model_sort GHOTIIO_DEFSTOR(gdefstor_model_sort)
 #define gdefstor_query_result_adopt GHOTIIO_DEFSTOR(gdefstor_query_result_adopt)
 #define gdefstor_model_ready GHOTIIO_DEFSTOR(gdefstor_model_ready)
@@ -146,6 +150,9 @@ struct GDEFSTOR_Tree {
 int gdefstor_model_id_ok(const char * p, size_t n, size_t cap,
     int allow_empty);
 
+/* A language tag: `[A-Za-z0-9-]{1,35}` (model.h). */
+int gdefstor_model_lang_ok(const char * p, size_t n);
+
 /* A field name: `[A-Za-z0-9_]{1,64}`. */
 int gdefstor_model_name_ok(const char * p, size_t n);
 
@@ -209,6 +216,31 @@ GDEFSTOR_Result gdefstor_model_from_json(const GDEFSTOR_Type * type,
  * before the type is consulted at apply. */
 GDEFSTOR_Result gdefstor_model_json_ok(const GDEFSTOR_Allocator * alloc,
     const uint8_t * json, size_t len);
+
+/* Two language tags in byte order: negative, 0, positive. */
+int gdefstor_model_lang_cmp(const char * a, size_t an, const char * b,
+    size_t bn);
+
+/* One language of a stored draft: its tag, and where its tree's JSON is in
+ * the draft document. */
+typedef struct GDEFSTOR_DraftPart {
+  char lang[GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES];
+  size_t lang_len;
+  size_t off;
+  size_t len;
+} GDEFSTOR_DraftPart;
+
+/* The draft document (`defiant-draft/1`, model.md) of @p count trees already
+ * checked and sorted by language: ERR_LIMIT past the draft limit. */
+GDEFSTOR_Result gdefstor_model_draft_pack(const GDEFSTOR_Allocator * alloc,
+    const GDEFSTOR_DraftTree * const * trees, size_t count, uint8_t ** out,
+    size_t * out_len);
+
+/* The languages of a stored draft document, in order: ERR_CORRUPT for one
+ * this port did not write, ERR_UNSUPPORTED for a newer version. */
+GDEFSTOR_Result gdefstor_model_draft_unpack(const GDEFSTOR_Allocator * alloc,
+    const uint8_t * json, size_t len, GDEFSTOR_DraftPart ** out,
+    size_t * out_count);
 
 /* A stable merge sort of the indexes 0..n-1 by @p cmp (C's qsort takes no
  * context). The array comes from @p alloc. */

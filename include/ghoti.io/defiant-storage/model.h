@@ -47,6 +47,13 @@
  * GDEFSTOR_Limits::max_public_id_bytes bytes of `[0-9A-Za-z_-]` (an actor or a
  * creator may also be empty: the system). Nothing here generates a public id
  * (AD-22 is the caller's).
+ *
+ * Languages: an entity holds one tree per language, all under one revision
+ * history (model.md, "Languages"). A language is a tag of 1 to
+ * ::GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES bytes of `[A-Za-z0-9-]` (`en`, `fr`,
+ * `pt-BR`), compared byte for byte: `en` and `EN` are two languages. Every
+ * call that reads or writes a tree names its language, and a query binds one
+ * (query.h).
  */
 
 #ifndef GHOTI_IO_GDEFSTOR_MODEL_H
@@ -92,6 +99,14 @@ extern "C" {
  * the key 1, 2, 3 ... as a new item version, in the same revision.
  */
 #define GDEFSTOR_MODEL_ORDER_EPSILON (1.0 / 1048576.0)
+/** Bytes of a language tag: `[A-Za-z0-9-]`, at least one. */
+#define GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES 35
+/**
+ * Languages one entity holds trees in at once. A save that would leave more
+ * is ::GDEFSTOR_ERR_LIMIT and writes nothing; it is a cap per entity, and the
+ * tables have no column or row per language that would set another.
+ */
+#define GDEFSTOR_MODEL_MAX_LANGUAGES 64
 
 /* ---- the store ------------------------------------------------------------ */
 
@@ -489,37 +504,84 @@ typedef struct GDEFSTOR_RevisionMeta {
   size_t why_len;       ///< Its length.
 } GDEFSTOR_RevisionMeta;
 
+/** One language's part of a save. @ref size is `sizeof(GDEFSTOR_LanguageTree)`. */
+typedef struct GDEFSTOR_LanguageTree {
+  size_t size;              ///< `sizeof(GDEFSTOR_LanguageTree)`.
+  const char * language;    ///< A language tag.
+  size_t language_len;      ///< Its length.
+  /** The language's whole new tree, or NULL to remove the language: every
+   * item of it is closed, and it has no tree from this revision on. */
+  const GDEFSTOR_Tree * tree;
+} GDEFSTOR_LanguageTree;
+
 /**
- * @brief Write revision N+1 of an entity from its full new field tree.
+ * @brief Write revision N+1 of an entity from the whole new trees of the
+ * languages it names.
  *
  * @p base_revision must be the entity's newest revision (0 before the first);
  * when the head has moved this is ::GDEFSTOR_ERR_CONFLICT and nothing is
- * written. The tree is validated against the type as declared now. Only the
- * items that changed are written: each gets a new version, its old one closed;
- * an item missing from the tree is closed; an unchanged item is not touched.
+ * written. Each tree is validated against the type as declared now. Per
+ * language, only the items that changed are written: each gets a new version,
+ * its old one closed; an item missing from the tree is closed; an unchanged
+ * item is not touched. A language the save does not name keeps its tree and
+ * gets no row; a named language whose tree is unchanged gets none either. All
+ * the languages' rows are one revision: one number, one who, when and why.
  * Moving an item changes only its order key (the midpoint of its new
  * neighbours), unless the gap is below ::GDEFSTOR_MODEL_ORDER_EPSILON, when
  * all its siblings are renumbered in this same revision. Retired fields keep
  * their stored data; a tree may restate it but not change it.
  *
- * @param out_revision Receives N+1, or 0 when the tree equals the current one
- *   and nothing was written. May be NULL.
- * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_CONFLICT, ::GDEFSTOR_ERR_INVALID,
- *   ::GDEFSTOR_ERR_LIMIT, or a backend's error.
+ * Item ids are the entity's, across languages: an item belongs to the
+ * language it was created in, and a tree names only items of its own
+ * language. The first tree of a language gets a new root item.
+ *
+ * @param trees The languages, each at most once, at most
+ *   ::GDEFSTOR_MODEL_MAX_LANGUAGES. May be NULL when @p count is 0 (a save
+ *   that changes nothing).
+ * @param out_revision Receives N+1, or 0 when no language changed and nothing
+ *   was written. May be NULL.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_CONFLICT, ::GDEFSTOR_ERR_INVALID (a
+ *   tag that is not one, a language named twice, a tree that is wrong),
+ *   ::GDEFSTOR_ERR_LIMIT (among others, more than
+ *   ::GDEFSTOR_MODEL_MAX_LANGUAGES languages afterwards), or a backend's error.
  */
-GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_save(GDEFSTOR_Write * write,
-    const char * public_id, size_t public_id_len, uint64_t base_revision,
-    const GDEFSTOR_RevisionMeta * meta, const GDEFSTOR_Tree * tree,
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_save_languages(
+    GDEFSTOR_Write * write, const char * public_id, size_t public_id_len,
+    uint64_t base_revision, const GDEFSTOR_RevisionMeta * meta,
+    const GDEFSTOR_LanguageTree * trees, size_t count,
     uint64_t * out_revision);
 
 /**
- * @brief Write a revision whose tree is revision @p to_revision's.
+ * @brief Write revision N+1 from one language's whole new tree:
+ * gdefstor_entity_save_languages() with that one language.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_save(GDEFSTOR_Write * write,
+    const char * public_id, size_t public_id_len, uint64_t base_revision,
+    const GDEFSTOR_RevisionMeta * meta, const char * language,
+    size_t language_len, const GDEFSTOR_Tree * tree, uint64_t * out_revision);
+
+/**
+ * @brief Remove a language: a revision that closes every current item of its
+ * tree. History keeps it (an as-of read of an earlier revision finds it), and
+ * a later save of the language starts a new tree.
  *
- * An ordinary save, built from the past tree: items keep their ids (an item
+ * A language the entity has no tree in writes nothing: @p out_revision is 0.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_remove_language(
+    GDEFSTOR_Write * write, const char * public_id, size_t public_id_len,
+    uint64_t base_revision, const GDEFSTOR_RevisionMeta * meta,
+    const char * language, size_t language_len, uint64_t * out_revision);
+
+/**
+ * @brief Write a revision whose trees are revision @p to_revision's, in every
+ * language.
+ *
+ * An ordinary save, built from the past trees: items keep their ids (an item
  * removed since comes back under its old id) and their old order keys, old
  * rows are never touched, and every revision in between still reads as it did.
- * Retired fields keep their current data. Reverting to the current tree writes
- * nothing.
+ * A language that had no tree at @p to_revision is removed; one removed since
+ * comes back. Retired fields keep their current data. Reverting to the current
+ * trees writes nothing.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_revert(GDEFSTOR_Write * write,
     const char * public_id, size_t public_id_len, uint64_t base_revision,
@@ -527,15 +589,44 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_revert(GDEFSTOR_Write * write,
     uint64_t * out_revision);
 
 /**
- * @brief Read an entity's tree: the current one, from the current tables,
- * when @p revision is 0; otherwise the tree as of that revision, from history.
+ * @brief Read an entity's tree in one language: the current one, from the
+ * current tables, when @p revision is 0; otherwise the tree as of that
+ * revision, from history.
  *
  * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID for no such entity or
- *   revision (an entity with no revision has no tree).
+ *   revision, a tag that is not one, or no tree in that language then (an
+ *   entity with no revision has no tree; gdefstor_entity_languages() says
+ *   which languages there are).
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_tree(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * public_id,
-    size_t public_id_len, uint64_t revision, GDEFSTOR_Tree ** out_tree);
+    size_t public_id_len, const char * language, size_t language_len,
+    uint64_t revision, GDEFSTOR_Tree ** out_tree);
+
+/** The languages an entity has trees in. Opaque. */
+typedef struct GDEFSTOR_Languages GDEFSTOR_Languages;
+
+/**
+ * @brief The languages an entity has a tree in: now (from the current tables)
+ * when @p revision is 0, otherwise as of that revision. Sorted by bytes.
+ *
+ * @return ::GDEFSTOR_OK (an entity with no revision has none), or
+ *   ::GDEFSTOR_ERR_INVALID for no such entity or revision.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_languages(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const char * public_id,
+    size_t public_id_len, uint64_t revision, GDEFSTOR_Languages ** out);
+
+/** @return The languages in the list. */
+GDEFSTOR_API size_t gdefstor_languages_count(const GDEFSTOR_Languages * l);
+
+/** @brief Language @p index (0 is the lowest by bytes). Borrowed until freed;
+ * not NUL-terminated by contract. */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_languages_get(const GDEFSTOR_Languages * l,
+    size_t index, const char ** out_language, size_t * out_len);
+
+/** @brief Release a list. NULL is ignored. */
+GDEFSTOR_API void gdefstor_languages_free(GDEFSTOR_Languages * l);
 
 /** An entity's revisions and states. Opaque. */
 typedef struct GDEFSTOR_History GDEFSTOR_History;
@@ -550,6 +641,10 @@ typedef struct GDEFSTOR_RevisionInfo {
   int64_t when_ms;       ///< When.
   const char * why;      ///< Why.
   size_t why_len;        ///< Its length.
+  /** The languages whose trees it changed (saved, removed, reverted), sorted
+   * by bytes and joined by `,`: `de,fr`. */
+  const char * languages;
+  size_t languages_len;  ///< Its length.
 } GDEFSTOR_RevisionInfo;
 
 /** One state change. Pointers are valid until the history is freed. */
@@ -562,10 +657,17 @@ typedef struct GDEFSTOR_StateInfo {
   int64_t when_ms;       ///< When.
 } GDEFSTOR_StateInfo;
 
-/** @brief Read an entity's revisions and state changes, oldest first. */
+/**
+ * @brief Read an entity's revisions and state changes, oldest first.
+ *
+ * With a @p language, only the revisions that changed that language's tree;
+ * with NULL (and @p language_len 0), every revision. State changes are the
+ * entity's, in either case all of them.
+ */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_history(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * public_id,
-    size_t public_id_len, GDEFSTOR_History ** out_history);
+    size_t public_id_len, const char * language, size_t language_len,
+    GDEFSTOR_History ** out_history);
 
 /** @return Revisions in the history. */
 GDEFSTOR_API size_t gdefstor_history_revision_count(const GDEFSTOR_History * h);
@@ -609,16 +711,22 @@ typedef struct GDEFSTOR_DiffItem {
   uint64_t item;        ///< The item's id.
   const char * field;   ///< The path of the field it sits under ("" for the root item).
   size_t field_len;     ///< Its length.
+  const char * language; ///< The language of the tree it is in.
+  size_t language_len;  ///< Its length.
 } GDEFSTOR_DiffItem;
 
 /**
  * @brief The items added, changed and removed from revision @p from to @p to.
  *
- * Revision 0 is the empty tree before the first. Items are listed by id.
+ * Revision 0 is the empty tree before the first. With a @p language, the
+ * items of that language's tree; with NULL (and @p language_len 0), of every
+ * language, each item naming its own, so the languages a revision touched
+ * are those of the diff from the one before it. Items are listed by id.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_diff(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * public_id,
-    size_t public_id_len, uint64_t from, uint64_t to, GDEFSTOR_Diff ** out_diff);
+    size_t public_id_len, const char * language, size_t language_len,
+    uint64_t from, uint64_t to, GDEFSTOR_Diff ** out_diff);
 
 /** @return Items in the difference. */
 GDEFSTOR_API size_t gdefstor_diff_count(const GDEFSTOR_Diff * diff);
@@ -632,21 +740,40 @@ GDEFSTOR_API void gdefstor_diff_free(GDEFSTOR_Diff * diff);
 
 /* ---- drafts --------------------------------------------------------------- */
 
+/** One language of a draft. @ref size is `sizeof(GDEFSTOR_DraftTree)`. */
+typedef struct GDEFSTOR_DraftTree {
+  size_t size;            ///< `sizeof(GDEFSTOR_DraftTree)`.
+  const char * language;  ///< A language tag.
+  size_t language_len;    ///< Its length.
+  const uint8_t * json;   ///< The language's whole tree, `defiant-tree/1`.
+  size_t json_len;        ///< Its length.
+} GDEFSTOR_DraftTree;
+
 /**
- * @brief Store the draft of an entity: a JSON tree (`defiant-tree/1`) and the
- * revision it was made from. One per entity; a second put replaces it.
+ * @brief Store the draft of an entity: a JSON tree (`defiant-tree/1`) for each
+ * language it changes, and the revision it was made from. One per entity, for
+ * all its languages; a second put replaces it.
  *
  * For an entity that exists, @p type is NULL or its type and @p base_revision
  * is at most its newest. For a public id with no entity, the draft reserves it
  * (gdefstor_entity_create() then refuses it): @p type is required and
- * declared, and @p base_revision is 0. The JSON is checked to be well formed
+ * declared, and @p base_revision is 0. Each JSON is checked to be well formed
  * now; it is validated against the type when applied. Nothing outside the
- * draft is written.
+ * draft is written. The stored draft is one JSON document (`defiant-draft/1`,
+ * model.md) holding each language's tree as given.
+ *
+ * @param trees The languages, each at most once, at most
+ *   ::GDEFSTOR_MODEL_MAX_LANGUAGES; NULL when @p count is 0. A language the
+ *   draft leaves out keeps its tree when the draft is applied; a draft cannot
+ *   remove a language.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID, ::GDEFSTOR_ERR_LIMIT (the
+ *   languages, or more than ::GDEFSTOR_MODEL_MAX_DRAFT_BYTES together), or a
+ *   backend's error.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_put(GDEFSTOR_Write * write,
     const char * type, size_t type_len, const char * public_id,
-    size_t public_id_len, uint64_t base_revision, const uint8_t * json,
-    size_t json_len);
+    size_t public_id_len, uint64_t base_revision,
+    const GDEFSTOR_DraftTree * trees, size_t count);
 
 /** A stored draft. Opaque. */
 typedef struct GDEFSTOR_Draft GDEFSTOR_Draft;
@@ -657,8 +784,7 @@ typedef struct GDEFSTOR_DraftInfo {
   const char * type;      ///< The entity's type.
   size_t type_len;        ///< Its length.
   uint64_t base_revision; ///< The revision it was made from; 0 for a new entity.
-  const uint8_t * json;   ///< The tree.
-  size_t json_len;        ///< Its length.
+  size_t language_count;  ///< Its languages: gdefstor_draft_tree() reads each.
 } GDEFSTOR_DraftInfo;
 
 /**
@@ -673,6 +799,14 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_get(GDEFSTOR_Store * store,
 GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_info(const GDEFSTOR_Draft * draft,
     GDEFSTOR_DraftInfo * out);
 
+/**
+ * @brief Language @p index of a draft (sorted by bytes), and its tree's JSON
+ * exactly as it was put. Pointers are borrowed until the draft is freed.
+ * @param out Its @ref GDEFSTOR_DraftTree::size is set by the caller.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_tree(const GDEFSTOR_Draft * draft,
+    size_t index, GDEFSTOR_DraftTree * out);
+
 /** @brief Release a draft. NULL is ignored. */
 GDEFSTOR_API void gdefstor_draft_free(GDEFSTOR_Draft * draft);
 
@@ -684,8 +818,8 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_delete(GDEFSTOR_Write * write,
     const char * public_id, size_t public_id_len);
 
 /**
- * @brief Apply a draft: gdefstor_entity_save() with the draft's tree and base
- * revision, then delete the draft.
+ * @brief Apply a draft: gdefstor_entity_save_languages() with the draft's
+ * trees and base revision, then delete the draft.
  *
  * For a reserved id this first creates the entity, with @p meta's who and when
  * as its creator and creation time. When the head has moved since the draft's
@@ -718,12 +852,15 @@ typedef struct GDEFSTOR_BlindHit {
   size_t subject_len;       ///< Its length.
   uint32_t key_id;          ///< As written (GDEFSTOR_BlindMac::key_id).
   uint32_t version;         ///< As written (GDEFSTOR_BlindMac::version).
+  const char * language;    ///< The language of the tree the version is in.
+  size_t language_len;      ///< Its length.
 } GDEFSTOR_BlindHit;
 
 /**
  * @brief The history lookup: every entity of @p type with any value version
  * of personal field @p field whose blind row holds @p mac, as of the last
- * commit, with the revisions that held it.
+ * commit, with the revisions that held it, in every language (each hit names
+ * its own).
  *
  * One hit per value version, ordered by row, item and valid_from. History is
  * searchable while the subject exists: after gdefstor_blind_delete_subject()
@@ -766,6 +903,8 @@ typedef struct GDEFSTOR_SubjectHit {
   uint64_t item;            ///< The item.
   uint64_t valid_from;      ///< The first revision that held this version.
   uint64_t valid_to;        ///< The revision that superseded it, or 0 (current).
+  const char * language;    ///< The language of the tree the version is in.
+  size_t language_len;      ///< Its length.
 } GDEFSTOR_SubjectHit;
 
 /**
@@ -1108,7 +1247,8 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_model_outbox_parked(
 GDEFSTOR_API GDEFSTOR_Result gdefstor_model_rebuild(GDEFSTOR_Write * write);
 
 /** gdefstor_model_dump(): the truth (entities, states, revisions, every item
- * version, declarations, drafts, blind rows, records, counters, outbox rows). */
+ * version with its language, declarations, drafts, blind rows, records,
+ * counters, outbox rows). */
 #define GDEFSTOR_MODEL_TRUTH 1
 /** gdefstor_model_dump(): the derived data (current items, current state). */
 #define GDEFSTOR_MODEL_CURRENT 2

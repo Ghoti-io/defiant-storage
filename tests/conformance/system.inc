@@ -675,7 +675,7 @@ TEST_F(ModelSystem, AnEntitySaveARecordACounterAndAnAppendCommitTogetherOrNotAtA
     now.Set("total", Decimal(4100 + commit));
     GDEFSTOR_Tree * t = Build(now);
     GDEFSTOR_RevisionMeta m = Meta();
-    ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_save(w, "po1", 3, 1, &m, t, nullptr));
+    ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_save(w, "po1", 3, 1, &m, kLang, kLangLen, t, nullptr));
     gdefstor_tree_free(t);
     ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "core.module", 11, "blog", 4,
         reinterpret_cast<const uint8_t *>("on"), 2));

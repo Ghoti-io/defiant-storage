@@ -93,6 +93,8 @@ typedef struct BHit {
   size_t subject_len;
   uint32_t key_id;
   uint32_t version;
+  char lang[GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES];
+  size_t lang_len;
 } BHit;
 
 struct GDEFSTOR_BlindHits {
@@ -120,7 +122,8 @@ static GDEFSTOR_Result take_blind(void * ctx, const GDEFSTOR_ModelBlindHit * h) 
   BHit * o;
   if (h == NULL || (h->public_id == NULL && h->public_id_len != 0) ||
       (h->subject == NULL && h->subject_len != 0) || h->item == 0 ||
-      h->valid_from == 0 || (h->valid_to != 0 && h->valid_to <= h->valid_from)) {
+      h->valid_from == 0 || (h->valid_to != 0 && h->valid_to <= h->valid_from) ||
+      !gdefstor_model_lang_ok(h->language, h->language_len)) {
     return GDEFSTOR_ERR_CORRUPT;
   }
   if (out->n == out->cap) {
@@ -151,6 +154,8 @@ static GDEFSTOR_Result take_blind(void * ctx, const GDEFSTOR_ModelBlindHit * h) 
   o->subject_len = h->subject_len;
   o->key_id = h->key_id;
   o->version = h->version;
+  memcpy(o->lang, h->language, h->language_len);
+  o->lang_len = h->language_len;
   out->n += 1;
   return GDEFSTOR_OK;
 }
@@ -243,6 +248,8 @@ GDEFSTOR_Result gdefstor_blind_hit(const GDEFSTOR_BlindHits * hits,
   out->subject_len = h->subject_len;
   out->key_id = h->key_id;
   out->version = h->version;
+  out->language = h->lang;
+  out->language_len = h->lang_len;
   return GDEFSTOR_OK;
 }
 
@@ -262,6 +269,8 @@ typedef struct SHit {
   uint64_t item;
   uint64_t from;
   uint64_t to;
+  char lang[GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES];
+  size_t lang_len;
 } SHit;
 
 struct GDEFSTOR_SubjectHits {
@@ -297,7 +306,8 @@ static GDEFSTOR_Result take_subject(void * ctx,
   SHit * o;
   if (h == NULL || h->type == NULL || h->type_len == 0 ||
       (h->public_id == NULL && h->public_id_len != 0) || h->item == 0 ||
-      h->valid_from == 0 || (h->valid_to != 0 && h->valid_to <= h->valid_from)) {
+      h->valid_from == 0 || (h->valid_to != 0 && h->valid_to <= h->valid_from) ||
+      !gdefstor_model_lang_ok(h->language, h->language_len)) {
     return GDEFSTOR_ERR_CORRUPT;
   }
   if (out->n == out->cap) {
@@ -327,6 +337,8 @@ static GDEFSTOR_Result take_subject(void * ctx,
   o->item = h->item;
   o->from = h->valid_from;
   o->to = h->valid_to;
+  memcpy(o->lang, h->language, h->language_len);
+  o->lang_len = h->language_len;
   out->n += 1;
   return GDEFSTOR_OK;
 }
@@ -481,6 +493,8 @@ GDEFSTOR_Result gdefstor_subject_hit(const GDEFSTOR_SubjectHits * hits,
   out->item = h->item;
   out->valid_from = h->from;
   out->valid_to = h->to;
+  out->language = h->lang;
+  out->language_len = h->lang_len;
   return GDEFSTOR_OK;
 }
 

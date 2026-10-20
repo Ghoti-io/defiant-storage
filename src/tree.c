@@ -911,6 +911,189 @@ GDEFSTOR_Result gdefstor_model_json_ok(const GDEFSTOR_Allocator * alloc,
   return rc;
 }
 
+/* ---- the draft document, defiant-draft/1 ---------------------------------- */
+
+#define DRAFT_HEAD "{\"format\":\"defiant-draft/1\",\"languages\":{"
+#define DRAFT_NAME "{\"format\":\"defiant-draft/"
+
+GDEFSTOR_Result gdefstor_model_draft_pack(const GDEFSTOR_Allocator * alloc,
+    const GDEFSTOR_DraftTree * const * trees, size_t count, uint8_t ** out,
+    size_t * out_len) {
+  char * buf = NULL;
+  size_t len = 0;
+  size_t cap = 0;
+  size_t i;
+  GDEFSTOR_Result rc = gdefstor_buf_append(&buf, &len, &cap, alloc,
+      DRAFT_HEAD, strlen(DRAFT_HEAD));
+  for (i = 0; rc == GDEFSTOR_OK && i < count; i++) {
+    const GDEFSTOR_DraftTree * t = trees[i];
+    if (i > 0) {
+      rc = gdefstor_buf_append(&buf, &len, &cap, alloc, ",", 1);
+    }
+    /* A tag is [A-Za-z0-9-]: a JSON string as it is. */
+    if (rc == GDEFSTOR_OK) {
+      rc = gdefstor_buf_append(&buf, &len, &cap, alloc, "\"", 1);
+    }
+    if (rc == GDEFSTOR_OK) {
+      rc = gdefstor_buf_append(&buf, &len, &cap, alloc, t->language,
+          t->language_len);
+    }
+    if (rc == GDEFSTOR_OK) {
+      rc = gdefstor_buf_append(&buf, &len, &cap, alloc, "\":", 2);
+    }
+    if (rc == GDEFSTOR_OK) {
+      rc = gdefstor_buf_append(&buf, &len, &cap, alloc,
+          (const char *)t->json, t->json_len);
+    }
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = gdefstor_buf_append(&buf, &len, &cap, alloc, "}}", 2);
+  }
+  if (rc == GDEFSTOR_OK && len > GDEFSTOR_MODEL_MAX_DRAFT_BYTES) {
+    rc = GDEFSTOR_ERR_LIMIT;
+  }
+  if (rc != GDEFSTOR_OK) {
+    gcu_allocator_free(alloc, buf);
+    return rc;
+  }
+  *out = (uint8_t *)buf;
+  *out_len = len;
+  return GDEFSTOR_OK;
+}
+
+static int json_space(uint8_t c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/* The end of the object or array at @p at, or SIZE_MAX. Bounded on any
+ * bytes; exact on JSON. */
+static size_t skip_compound(const uint8_t * p, size_t n, size_t at) {
+  size_t depth = 0;
+  int in_str = 0;
+  if (at >= n || (p[at] != '{' && p[at] != '[')) {
+    return SIZE_MAX;
+  }
+  for (; at < n; at++) {
+    uint8_t c = p[at];
+    if (in_str) {
+      if (c == '\\') {
+        at += 1;
+      } else if (c == '"') {
+        in_str = 0;
+      }
+      continue;
+    }
+    if (c == '"') {
+      in_str = 1;
+    } else if (c == '{' || c == '[') {
+      depth += 1;
+    } else if (c == '}' || c == ']') {
+      depth -= 1;
+      if (depth == 0) {
+        return at + 1;
+      }
+    }
+  }
+  return SIZE_MAX;
+}
+
+GDEFSTOR_Result gdefstor_model_draft_unpack(const GDEFSTOR_Allocator * alloc,
+    const uint8_t * json, size_t len, GDEFSTOR_DraftPart ** out,
+    size_t * out_count) {
+  const size_t head = strlen(DRAFT_HEAD);
+  GDEFSTOR_DraftPart * v = NULL;
+  size_t n = 0;
+  size_t cap = 0;
+  size_t at = head;
+  GDEFSTOR_Result rc = GDEFSTOR_OK;
+  *out = NULL;
+  *out_count = 0;
+  if (json == NULL || len < head || memcmp(json, DRAFT_HEAD, head) != 0) {
+    /* Another version is newer, anything else is not a draft. */
+    return json != NULL && len > strlen(DRAFT_NAME) &&
+                   memcmp(json, DRAFT_NAME, strlen(DRAFT_NAME)) == 0
+               ? GDEFSTOR_ERR_UNSUPPORTED
+               : GDEFSTOR_ERR_CORRUPT;
+  }
+  if (at < len && json[at] == '}') {
+    at += 1;
+  } else {
+    for (;;) {
+      size_t tag = at + 1;
+      size_t end;
+      GDEFSTOR_DraftPart * o;
+      if (at >= len || json[at] != '"') {
+        rc = GDEFSTOR_ERR_CORRUPT;
+        break;
+      }
+      end = tag;
+      while (end < len && json[end] != '"') {
+        end += 1;
+      }
+      if (end >= len || !gdefstor_model_lang_ok((const char *)json + tag,
+                            end - tag) ||
+          end + 1 >= len || json[end + 1] != ':' ||
+          n >= GDEFSTOR_MODEL_MAX_LANGUAGES ||
+          (n > 0 && gdefstor_model_lang_cmp(v[n - 1].lang, v[n - 1].lang_len,
+                        (const char *)json + tag, end - tag) >= 0)) {
+        rc = GDEFSTOR_ERR_CORRUPT;
+        break;
+      }
+      if (n == cap) {
+        size_t grown = cap == 0 ? 4 : cap * 2;
+        GDEFSTOR_DraftPart * next = (GDEFSTOR_DraftPart *)
+            gcu_allocator_realloc(alloc, v, grown * sizeof *next);
+        if (next == NULL) {
+          rc = GDEFSTOR_ERR_OOM;
+          break;
+        }
+        v = next;
+        cap = grown;
+      }
+      o = &v[n];
+      memset(o, 0, sizeof *o);
+      memcpy(o->lang, json + tag, end - tag);
+      o->lang_len = end - tag;
+      /* The tree's bytes exactly as put, spaces around it included. */
+      o->off = end + 2;
+      at = o->off;
+      while (at < len && json_space(json[at])) {
+        at += 1;
+      }
+      at = skip_compound(json, len, at);
+      if (at == SIZE_MAX) {
+        rc = GDEFSTOR_ERR_CORRUPT;
+        break;
+      }
+      while (at < len && json_space(json[at])) {
+        at += 1;
+      }
+      o->len = at - o->off;
+      n += 1;
+      if (at < len && json[at] == ',') {
+        at += 1;
+        continue;
+      }
+      if (at < len && json[at] == '}') {
+        at += 1;
+        break;
+      }
+      rc = GDEFSTOR_ERR_CORRUPT;
+      break;
+    }
+  }
+  if (rc == GDEFSTOR_OK && (at + 1 != len || json[at] != '}')) {
+    rc = GDEFSTOR_ERR_CORRUPT;
+  }
+  if (rc != GDEFSTOR_OK) {
+    gcu_allocator_free(alloc, v);
+    return rc;
+  }
+  *out = v;
+  *out_count = n;
+  return GDEFSTOR_OK;
+}
+
 GDEFSTOR_Result gdefstor_tree_from_json(const GDEFSTOR_Type * type,
     const uint8_t * json, size_t len, const GDEFSTOR_Allocator * allocator,
     GDEFSTOR_Tree ** out_tree) {

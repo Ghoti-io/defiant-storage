@@ -91,7 +91,17 @@
  *
  * gdefstor_entity_query() and gdefstor_entity_count() ask the same form of
  * the entities of one declared type (model.h), over their current trees. The
- * operands are typed there, and the text operands above are refused:
+ * operands are typed there, and the text operands above are refused.
+ *
+ * A query binds **one language** (GDEFSTOR_Query::language, required there):
+ * every FIELD operand and every FIELD sort key in it, inside an EXISTS too,
+ * reads the current items of that language's tree and of no other, so two
+ * conditions on one entity are always about the same language. An entity
+ * with no tree in that language is still an entity of the type: it reads as
+ * one whose every field is absent, so no comparison of a field matches it
+ * (a NOT around one does, as for an absent value) and it sorts as no value.
+ * META and ENTITY operands are the entity's and read the same in every
+ * language.
  *
  * - ::GDEFSTOR_QUERY_FIELD: a field path (`lines.taxes.amount`) to an active,
  *   non-personal scalar field. Its set is that field's values on every current
@@ -122,9 +132,10 @@
  * operand a FIELD naming an active personal scalar field (no OUTER), the
  * right a ::GDEFSTOR_QUERY_CONST of exactly one text of
  * ::GDEFSTOR_BLIND_MAC_BYTES bytes. It holds when some current item of the
- * field's group has a value whose current version has a blind row with that
- * MAC (gdefstor_tree_set_blind()), so "some item matches" for multiples and
- * groups, and an older version's MAC does not match. It composes with every
+ * field's group, in the query's language, has a value whose current version
+ * has a blind row with that MAC (gdefstor_tree_set_blind()), so "some item
+ * matches" for multiples and groups, and an older version's MAC does not
+ * match. It composes with every
  * other node, inside an EXISTS too. A personal field is never a sort key and
  * never compared by range. On a store whose backend has no blind table the
  * node is ::GDEFSTOR_ERR_UNSUPPORTED.
@@ -263,6 +274,11 @@ typedef struct GDEFSTOR_Query {
   uint64_t limit;                         ///< Rows returned, 0 for all.
   const GDEFSTOR_QueryOperand * select;   ///< Columns to return, or NULL.
   size_t select_count;                    ///< How many.
+  /** Over entities: the one language every field operand and sort key reads
+   * (a language tag, model.h); required there. The projection form does not
+   * read it. */
+  const char * language;
+  size_t language_len;                    ///< Its length.
 } GDEFSTOR_Query;
 
 /** The rows of a query. Opaque. */
@@ -344,12 +360,14 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_query(GDEFSTOR_Store * store,
     const GDEFSTOR_Query * query, GDEFSTOR_QueryResult ** out_result);
 
 /**
- * @brief Count the current entities of one declared type that match.
+ * @brief Count the current entities of one declared type that match, with
+ * the predicate's fields read in @p language.
  *
  * The same predicate and refusals as gdefstor_entity_query().
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_count(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * type, size_t type_len,
+    const char * language, size_t language_len,
     const GDEFSTOR_QueryNode * where, uint64_t * out_count);
 
 /* ---- for the authors of a backend --------------------------------------- */

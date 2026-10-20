@@ -57,6 +57,13 @@
  *   again for that tenant and name, even when the transaction aborts (`abort`,
  *   or a `commit` that fails): the backend keeps a floor apart from the
  *   committed value, which is what `counter_get` and `dump` read.
+ * - **Languages are a column, never a table.** Every item version, close and
+ *   blind row carries the language of the tree it is in (model.h), and the
+ *   backend keeps it beside the row. Item ids are unique within an entity
+ *   across languages, so (group, item, valid_from) still names one version.
+ *   A backend reads one language's items without reading the others' where
+ *   it is asked for one (`items`), and has no table, column or index per
+ *   language.
  * - Strings in visited rows are borrowed for the call; the port copies them.
  *   Rows are visited in no particular order, except where a member says.
  */
@@ -116,6 +123,11 @@ typedef struct GDEFSTOR_ModelRevision {
   int64_t when_ms;        ///< When.
   const char * why;       ///< Why; may be empty.
   size_t why_len;         ///< Its length.
+  /** Added with languages: the languages whose items this revision wrote
+   * (inserted or closed), sorted by bytes and joined by `,`; from the port,
+   * stored as given. */
+  const char * languages;
+  size_t languages_len;   ///< Its length.
 } GDEFSTOR_ModelRevision;
 
 /** One version of one item: a row of a group table. */
@@ -130,6 +142,8 @@ typedef struct GDEFSTOR_ModelItem {
    * column existed has fewer, and the missing ones are no value. */
   const GDEFSTOR_Value * values;
   size_t value_count;     ///< How many.
+  const char * language;  ///< The language of the tree it is in (model.h).
+  size_t language_len;    ///< Its length.
 } GDEFSTOR_ModelItem;
 
 /** Close one open item version. */
@@ -137,6 +151,8 @@ typedef struct GDEFSTOR_ModelClose {
   uint32_t group;         ///< Its group.
   uint64_t item;          ///< Its item.
   uint64_t valid_from;    ///< The version's valid_from; it must be open.
+  const char * language;  ///< The version's language, as it was written.
+  size_t language_len;    ///< Its length.
 } GDEFSTOR_ModelClose;
 
 /**
@@ -155,6 +171,8 @@ typedef struct GDEFSTOR_ModelBlind {
   const uint8_t * mac;    ///< ::GDEFSTOR_BLIND_MAC_BYTES bytes.
   uint32_t key_id;        ///< GDEFSTOR_BlindMac::key_id.
   uint32_t version;       ///< GDEFSTOR_BlindMac::version.
+  const char * language;  ///< The language of the version it indexes.
+  size_t language_len;    ///< Its length.
 } GDEFSTOR_ModelBlind;
 
 /** One revision write, computed by the port. Applied all or nothing. */
@@ -250,6 +268,10 @@ typedef struct GDEFSTOR_ModelVisitor {
   /** Added with the outbox: an outbox row, from `outbox_claim` and `dump`
    * (GDEFSTOR_MODEL_TRUTH, every row, parked or not). Called only when set. */
   GDEFSTOR_Result (*outbox)(void * ctx, const GDEFSTOR_ModelOutbox * o);
+  /** Added with languages: a language entity @p row has a tree in, from
+   * `languages`. */
+  GDEFSTOR_Result (*language)(void * ctx, uint64_t row, const char * language,
+      size_t language_len);
 } GDEFSTOR_ModelVisitor;
 
 /** What a backend's `query` is handed: a query the port has checked. */
@@ -275,8 +297,9 @@ typedef struct GDEFSTOR_ModelHits {
 } GDEFSTOR_ModelHits;
 
 /** gdefstor_model_scan(): visit every current entity of @p type (entity, then its
- * current items, and, when the visitor's `blind` is set, its blind rows), for
- * the reference engine. */
+ * current items of every language, and, when the visitor's `blind` is set,
+ * its blind rows), for the reference engine, which keeps those of the
+ * query's language. */
 typedef GDEFSTOR_Result (*GDEFSTOR_ModelScanFn)(void * ctx, const char * type,
     size_t type_len, const GDEFSTOR_ModelVisitor * visitor);
 
@@ -293,6 +316,8 @@ typedef struct GDEFSTOR_ModelBlindHit {
   size_t subject_len;       ///< Its length.
   uint32_t key_id;          ///< As stored.
   uint32_t version;         ///< As stored.
+  const char * language;    ///< The version's language.
+  size_t language_len;      ///< Its length.
 } GDEFSTOR_ModelBlindHit;
 
 /** Where `blind_history` hands its rows, in no particular order. */
@@ -312,6 +337,8 @@ typedef struct GDEFSTOR_ModelSubjectHit {
   uint64_t item;            ///< The item.
   uint64_t valid_from;      ///< The version's valid_from.
   uint64_t valid_to;        ///< Its valid_to, or 0 while it is open.
+  const char * language;    ///< The version's language.
+  size_t language_len;      ///< Its length.
 } GDEFSTOR_ModelSubjectHit;
 
 /** Where `subject_lookup` hands its rows, in no particular order. */
@@ -357,14 +384,15 @@ typedef struct GDEFSTOR_ModelBackend {
   /** Visit (`revision`, `state`) every revision and state row of an entity. */
   GDEFSTOR_Result (*history)(void * ctx, void * txn, const char * tenant,
       size_t tenant_len, uint64_t row, const GDEFSTOR_ModelVisitor * visitor);
-  /** Visit (`item`) an entity's items: with @p as_of 0, its current tables;
-   * otherwise every version with valid_from <= as_of and valid_to either 0 or
-   * > as_of, from the truth. When the visitor's `blind` is set (only on a
-   * backend that serves the blind index), also every blind row of the
-   * entity. */
+  /** Visit (`item`) an entity's items of @p language (of every language when
+   * @p language_len is 0): with @p as_of 0, its current tables; otherwise
+   * every version with valid_from <= as_of and valid_to either 0 or > as_of,
+   * from the truth. When the visitor's `blind` is set (only on a backend that
+   * serves the blind index), also every blind row of the entity in that
+   * language (every language when @p language_len is 0). */
   GDEFSTOR_Result (*items)(void * ctx, void * txn, const char * tenant,
-      size_t tenant_len, uint64_t row, uint64_t as_of,
-      const GDEFSTOR_ModelVisitor * visitor);
+      size_t tenant_len, uint64_t row, uint64_t as_of, const char * language,
+      size_t language_len, const GDEFSTOR_ModelVisitor * visitor);
   /** Insert or replace the draft of a public id. */
   GDEFSTOR_Result (*draft_put)(void * ctx, void * txn,
       const GDEFSTOR_ModelDraft * d);
@@ -391,8 +419,11 @@ typedef struct GDEFSTOR_ModelBackend {
    * A backend built against the struct that ends at @ref dump sets @ref size
    * to that size (GDEFSTOR_MODEL_BACKEND_SIZE_V1), and one built against the
    * struct that ends at @ref index_state to GDEFSTOR_MODEL_BACKEND_SIZE_V2,
-   * and at @ref blind_delete to GDEFSTOR_MODEL_BACKEND_SIZE_V3; the port
-   * treats every member past its size as NULL. */
+   * at @ref blind_delete to GDEFSTOR_MODEL_BACKEND_SIZE_V3, and at
+   * @ref outbox_parked to GDEFSTOR_MODEL_BACKEND_SIZE_V4; the port treats
+   * every member past its size as NULL. (The rows above gained a language
+   * with languages, so a backend is built against this header whatever its
+   * size.) */
   /** The context @ref index_state is called with. A member of its own, not
    * @ref ctx, so that a wrapper that copies this struct and replaces @ref ctx
    * to intercept the other members still reaches the backend that owns the
@@ -510,6 +541,18 @@ typedef struct GDEFSTOR_ModelBackend {
   GDEFSTOR_Result (*outbox_parked)(void * sys_ctx, const char * tenant,
       size_t tenant_len, const char * stream, size_t stream_len,
       uint64_t * out_count);
+  /* ---- languages (model.h): optional ------------------------------------- */
+  /** The context @ref languages is called with, kept apart from @ref ctx for
+   * the reason @ref index_ctx is. */
+  void * lang_ctx;
+  /** Visit (`language`) each language entity @p row has a tree in, once:
+   * with @p as_of 0 by its current root items, otherwise by the root-group
+   * versions valid at @p as_of (a language's tree is the one with a root
+   * item). May be NULL: the port then reads the root items through `items`,
+   * which reads every language's whole tree. */
+  GDEFSTOR_Result (*languages)(void * lang_ctx, void * txn, const char * tenant,
+      size_t tenant_len, uint64_t row, uint64_t as_of,
+      const GDEFSTOR_ModelVisitor * visitor);
 } GDEFSTOR_ModelBackend;
 
 /** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::index_ctx
@@ -526,6 +569,11 @@ typedef struct GDEFSTOR_ModelBackend {
  * was added; gdefstor_store_create_model() accepts it. */
 #define GDEFSTOR_MODEL_BACKEND_SIZE_V3 \
   offsetof(GDEFSTOR_ModelBackend, sys_ctx)
+
+/** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::lang_ctx
+ * was added; gdefstor_store_create_model() accepts it. */
+#define GDEFSTOR_MODEL_BACKEND_SIZE_V4 \
+  offsetof(GDEFSTOR_ModelBackend, lang_ctx)
 
 /**
  * @brief The reference query engine: answer @p plan over the entities
