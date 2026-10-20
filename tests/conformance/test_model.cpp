@@ -639,6 +639,22 @@ static GDEFSTOR_Result s_scan(void * ctx, const char * type, size_t type_len,
     if (rc == GDEFSTOR_OK) {
       rc = visit_blinds(v, e);
     }
+    if (rc == GDEFSTOR_OK && v->revision != nullptr && !e.revs.empty()) {
+      /* The newest revision, for META REVISION_WHO. */
+      const Rev & r = e.revs.back();
+      GDEFSTOR_ModelRevision m;
+      std::memset(&m, 0, sizeof m);
+      m.revision = r.revision;
+      m.commit_seq = r.commit_seq;
+      m.who = r.who.data();
+      m.who_len = r.who.size();
+      m.when_ms = r.when;
+      m.why = r.why.data();
+      m.why_len = r.why.size();
+      m.languages = r.langs.data();
+      m.languages_len = r.langs.size();
+      rc = v->revision(v->ctx, e.row, &m);
+    }
     if (rc != GDEFSTOR_OK) {
       return rc;
     }

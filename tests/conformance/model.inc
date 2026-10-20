@@ -2342,6 +2342,241 @@ TEST_F(ModelQuery, RefusesWhatItCannotAnswer) {
       &bad, &r));
 }
 
+/* ---- the forms a caller of text values reads ----------------------------- */
+
+inline GDEFSTOR_QueryOperand Flagged(GDEFSTOR_QueryOperand o, int flags) {
+  o.flags |= flags;
+  return o;
+}
+
+TEST_F(ModelQuery, EmptyIfNoneReadsNoValueAsTheEmptyText) {
+  Q q;
+  const int E = GDEFSTOR_QUERY_EMPTY_IF_NONE;
+  /* po4 was never saved: it has no number. Without the flag no comparison of
+   * it holds; with it the number is the single empty text. */
+  EXPECT_EQ(Ids({}, 0), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      q.Field("number"), q.Values({Text("")}))));
+  EXPECT_EQ(Ids({"po4"}, 1), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      Flagged(q.Field("number"), E), q.Values({Text("")}))));
+  EXPECT_EQ(Ids({"po1", "po2", "po3"}, 3), Ask(store, kPo, q.Cmp(
+      GDEFSTOR_QUERY_NE, Flagged(q.Field("number"), E), q.Values({Text("")}))));
+  EXPECT_EQ(Ids({"po4"}, 1), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_IN,
+      Flagged(q.Field("number"), E), q.Values({Text("x"), Text("")}))));
+  /* A multiple with no item, and a reference with no value. */
+  EXPECT_EQ(Ids({"po3", "po4"}, 2), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      Flagged(q.Field("notes"), E), q.Values({Text("")}))));
+  EXPECT_EQ(Ids({"po4"}, 1), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      Flagged(q.Field("customer"), E), q.Values({Ref("")}))));
+  /* Two flagged fields with no value are equal: both are the empty text. */
+  EXPECT_EQ(Ids({"po3", "po4"}, 2), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      Flagged(q.Field("notes"), E), Flagged(q.Field("lines.sku"), E))));
+  EXPECT_EQ(Ids({}, 0), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      q.Field("notes"), q.Field("lines.sku"))));
+  /* Only on a text or reference field. */
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      Flagged(q.Field("total"), E), q.Values({Decimal(1)}))).rc);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      q.Field("number"), Flagged(q.Values({Text("")}), E))).rc);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      Flagged(q.Entity(), E), q.Values({Ref("po1")}))).rc);
+  /* As a sort key no value is the empty text, tied with it, and ties go by
+   * row: t2 was made before t1. */
+  ASSERT_EQ(GDEFSTOR_OK, Declare("site.tag", {F("title", GDEFSTOR_FIELD_TEXT)}));
+  for (const char * id : {"t2", "t1", "t3"}) {
+    ASSERT_EQ(GDEFSTOR_OK, Create("site.tag", id));
+  }
+  Node empty;
+  empty.Set("title", Text(""));
+  Node a;
+  a.Set("title", Text("a"));
+  GDEFSTOR_Tree * te = Build(empty);
+  GDEFSTOR_Tree * ta = Build(a);
+  ASSERT_EQ(GDEFSTOR_OK, Save("t2", 0, te));
+  ASSERT_EQ(GDEFSTOR_OK, Save("t3", 0, ta));
+  gdefstor_tree_free(te);
+  gdefstor_tree_free(ta);
+  const GDEFSTOR_QueryNode * all = q.Op(GDEFSTOR_QUERY_TRUE, {});
+  EXPECT_EQ(Ids({"t1", "t2", "t3"}, 3), Ask(store, "site.tag", all,
+      {By(q.Field("title"))}));
+  EXPECT_EQ(Ids({"t2", "t1", "t3"}, 3), Ask(store, "site.tag", all,
+      {By(Flagged(q.Field("title"), E))}));
+  EXPECT_EQ(Ids({"t3", "t2", "t1"}, 3), Ask(store, "site.tag", all,
+      {By(Flagged(q.Field("title"), E), true)}));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, all,
+      {By(Flagged(q.Field("total"), E))}).rc);
+}
+
+TEST_F(ModelQuery, AsTextComparesAReferenceWithText) {
+  Q q;
+  const int A = GDEFSTOR_QUERY_AS_TEXT;
+  EXPECT_EQ(Ids({"po1", "po3"}, 2), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      Flagged(q.Field("customer"), A), q.Values({Text("c1")}))));
+  EXPECT_EQ(Ids({"po2"}, 1), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_IN,
+      Flagged(q.Entity(), A), q.Values({Text("po2"), Text("zz")}))));
+  EXPECT_EQ(Ids({"po1", "po2", "po3"}, 3), Ask(store, kPo, q.Cmp(
+      GDEFSTOR_QUERY_EQ, Flagged(q.Meta(GDEFSTOR_META_CREATOR), A),
+      q.Values({Text("u1")}))));
+  /* Against a text field: no order's number is its customer's id. */
+  EXPECT_EQ(Ids({}, 0), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      q.Field("number"), Flagged(q.Field("customer"), A))));
+  /* Inside an EXISTS, against the outer entity's text field. */
+  EXPECT_EQ(Ids({"c1"}, 1), Ask(store, "site.customer", q.Op(
+      GDEFSTOR_QUERY_EXISTS, {q.Op(GDEFSTOR_QUERY_AND,
+          {q.Cmp(GDEFSTOR_QUERY_EQ, Flagged(q.Field("customer"), A),
+              Flagged(q.Entity(true), A)),
+              q.Cmp(GDEFSTOR_QUERY_EQ, q.Field("number"),
+                  q.Values({Text("PO-3")}))})}, kPo)));
+  /* Without the flag a reference is not text; with it, only a reference. */
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      q.Field("customer"), q.Values({Text("c1")}))).rc);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      Flagged(q.Field("number"), A), q.Values({Text("PO-1")}))).rc);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      Flagged(q.Meta(GDEFSTOR_META_REVISION), A), q.Values({Text("1")}))).rc);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      q.Field("number"), Flagged(q.Values({Ref("c1")}), A))).rc);
+}
+
+TEST_F(ModelQuery, FirstSortsAMultipleByItsFirstItem) {
+  Q q;
+  const int FIRST = GDEFSTOR_QUERY_FIRST;
+  ASSERT_EQ(GDEFSTOR_OK, Declare("site.tagged",
+      {F("tags", GDEFSTOR_FIELD_TEXT, GDEFSTOR_FIELD_MULTIPLE)}));
+  auto make = [&](const char * id, std::vector<const char *> tags) {
+    ASSERT_EQ(GDEFSTOR_OK, Create("site.tagged", id));
+    if (tags.empty()) {
+      return;
+    }
+    Node n;
+    for (const char * t : tags) {
+      n.Add("tags", One(Text(t)));
+    }
+    GDEFSTOR_Tree * t = Build(n);
+    ASSERT_EQ(GDEFSTOR_OK, Save(id, 0, t));
+    gdefstor_tree_free(t);
+  };
+  /* e1's first tag is b, though it also has a. */
+  make("e1", {"b", "a"});
+  make("e2", {"a", "z"});
+  make("e3", {});
+  make("e4", {"c"});
+  const GDEFSTOR_QueryNode * all = q.Op(GDEFSTOR_QUERY_TRUE, {});
+  EXPECT_EQ(Ids({"e3", "e2", "e1", "e4"}, 4), Ask(store, "site.tagged", all,
+      {By(Flagged(q.Field("tags"), FIRST))}));
+  EXPECT_EQ(Ids({"e4", "e1", "e2", "e3"}, 4), Ask(store, "site.tagged", all,
+      {By(Flagged(q.Field("tags"), FIRST), true)}));
+  EXPECT_EQ(Ids({"e3", "e2", "e1", "e4"}, 4), Ask(store, "site.tagged", all,
+      {By(Flagged(q.Field("tags"), FIRST | GDEFSTOR_QUERY_EMPTY_IF_NONE))}));
+  /* Moving a above b makes it e1's first, tied with e2's and after it by
+   * row. */
+  GDEFSTOR_Tree * cur = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_tree(store, kTenant, 2, "e1", 2,
+      kLang, kLangLen, 0, &cur));
+  GDEFSTOR_TreeItem b;
+  GDEFSTOR_TreeItem a;
+  std::memset(&b, 0, sizeof b);
+  std::memset(&a, 0, sizeof a);
+  b.size = sizeof b;
+  a.size = sizeof a;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_tree_item(cur, 1, &b));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_tree_item(cur, 2, &a));
+  gdefstor_tree_free(cur);
+  Node moved;
+  moved.Add("tags", One(Text("a"), a.id));
+  moved.Add("tags", One(Text("b"), b.id));
+  GDEFSTOR_Tree * t = Build(moved);
+  ASSERT_EQ(GDEFSTOR_OK, Save("e1", 1, t));
+  gdefstor_tree_free(t);
+  EXPECT_EQ(Ids({"e3", "e1", "e2", "e4"}, 4), Ask(store, "site.tagged", all,
+      {By(Flagged(q.Field("tags"), FIRST))}));
+  /* FIRST is for a root multiple; a plain sort of one is still refused. */
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, "site.tagged", all,
+      {By(q.Field("tags"))}).rc);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, all,
+      {By(Flagged(q.Field("number"), FIRST))}).rc);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, all,
+      {By(Flagged(q.Field("lines.sku"), FIRST))}).rc);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, all,
+      {By(Flagged(q.Entity(), FIRST))}).rc);
+}
+
+TEST_F(ModelQuery, RevisionWhoIsTheNewestRevisionsAuthor) {
+  Q q;
+  const GDEFSTOR_QueryOperand who = q.Meta(GDEFSTOR_META_REVISION_WHO);
+  /* Every saved order's newest revision is u1's; po4 has none. */
+  EXPECT_EQ(Ids({"po1", "po2", "po3"}, 3), Ask(store, kPo, q.Cmp(
+      GDEFSTOR_QUERY_EQ, who, q.Values({Ref("u1")}))));
+  Node two = PoTree("PO-2b", 10000, "c2");
+  GDEFSTOR_Tree * t = Build(two);
+  ASSERT_EQ(GDEFSTOR_OK, Save("po2", 1, t, nullptr, "u2"));
+  gdefstor_tree_free(t);
+  /* The system's save has no author. */
+  Node three;
+  three.Set("number", Text("PO-3b"));
+  t = Build(three);
+  ASSERT_EQ(GDEFSTOR_OK, Save("po3", 1, t, nullptr, ""));
+  gdefstor_tree_free(t);
+  EXPECT_EQ(Ids({"po2"}, 1), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ, who,
+      q.Values({Ref("u2")}))));
+  EXPECT_EQ(Ids({"po1"}, 1), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ, who,
+      q.Values({Ref("u1")}))));
+  EXPECT_EQ(Ids({"po2", "po3", "po4"}, 3), Ask(store, kPo, q.Cmp(
+      GDEFSTOR_QUERY_NE, who, q.Values({Ref("u1")}))));
+  EXPECT_EQ(Ids({"po1", "po2"}, 2), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      who, who)));
+  EXPECT_EQ(Ids({"po2"}, 1), Ask(store, kPo, q.Cmp(GDEFSTOR_QUERY_EQ,
+      Flagged(who, GDEFSTOR_QUERY_AS_TEXT), q.Values({Text("u2")}))));
+  /* The creator stays the creator. */
+  EXPECT_EQ(Ids({"po1", "po2", "po3"}, 3), Ask(store, kPo, q.Cmp(
+      GDEFSTOR_QUERY_EQ, q.Meta(GDEFSTOR_META_CREATOR), q.Values({Ref("u1")}))));
+  /* Inside an EXISTS: customers whose order u2 wrote last. */
+  EXPECT_EQ(Ids({"c2"}, 1), Ask(store, "site.customer", q.Op(
+      GDEFSTOR_QUERY_EXISTS, {q.Op(GDEFSTOR_QUERY_AND,
+          {q.Cmp(GDEFSTOR_QUERY_EQ, q.Field("customer"), q.Entity(true)),
+              q.Cmp(GDEFSTOR_QUERY_EQ, q.Meta(GDEFSTOR_META_REVISION_WHO),
+                  q.Values({Ref("u2")}))})}, kPo)));
+  /* As a sort key: no author first, then by bytes. */
+  EXPECT_EQ(Ids({"po3", "po4", "po1", "po2"}, 4), Ask(store, kPo,
+      q.Op(GDEFSTOR_QUERY_TRUE, {}), {By(who)}));
+}
+
+TEST_F(ModelQuery, AnExistsReadsTheLanguageItNames) {
+  Q q;
+  /* c1 has a French name too. */
+  Node fr;
+  fr.Set("name", Text("Anne")).Set("vip", Int(GDEFSTOR_FIELD_BOOLEAN, 1));
+  GDEFSTOR_Tree * t = Build(fr);
+  GDEFSTOR_RevisionMeta m = Meta("u1", 2500);
+  ASSERT_EQ(GDEFSTOR_OK, InWrite([&](GDEFSTOR_Write * w) {
+    return gdefstor_entity_save(w, "c1", 2, 1, &m, "fr", 2, t, nullptr);
+  }));
+  gdefstor_tree_free(t);
+  auto named = [&](const char * name, const char * lang) {
+    GDEFSTOR_QueryNode * x = const_cast<GDEFSTOR_QueryNode *>(q.Op(
+        GDEFSTOR_QUERY_EXISTS, {q.Op(GDEFSTOR_QUERY_AND,
+            {q.Cmp(GDEFSTOR_QUERY_EQ, q.Entity(), q.Field("customer", true)),
+                q.Cmp(GDEFSTOR_QUERY_EQ, q.Field("name"),
+                    q.Values({Text(name)}))})}, "site.customer"));
+    if (lang != nullptr) {
+      x->exists_language = lang;
+      x->exists_language_len = std::strlen(lang);
+    }
+    return static_cast<const GDEFSTOR_QueryNode *>(x);
+  };
+  /* The orders are read in English, their customer's name in French. */
+  EXPECT_EQ(Ids({"po1", "po3"}, 2), Ask(store, kPo, named("Anne", "fr")));
+  EXPECT_EQ(Ids({}, 0), Ask(store, kPo, named("Anne", nullptr)));
+  EXPECT_EQ(Ids({"po1", "po3"}, 2), Ask(store, kPo, named("Ann", nullptr)));
+  EXPECT_EQ(Ids({}, 0), Ask(store, kPo, named("Ann", "fr")));
+  /* A language nobody has a tree in matches nothing, and a tag that is not
+   * one is refused. */
+  EXPECT_EQ(Ids({}, 0), Ask(store, kPo, named("Anne", "de")));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Ask(store, kPo, named("Anne", "e n")).rc);
+  /* The outer entity's operands read the query's language: in French the
+   * orders have no tree, so no customer. */
+  EXPECT_EQ(Ids({}, 0), Ask(store, kPo, named("Anne", "fr"), {}, 0, 0, "fr"));
+}
+
 /* ---- derived data -------------------------------------------------------- */
 
 class ModelDerived : public ModelQuery {};

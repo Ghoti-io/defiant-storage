@@ -215,4 +215,41 @@ plant snapshot-import-resets-a-counter src/model_snapshot.c testModel \
   '        c->name, c->name_len,
         c->kind == GDEFSTOR_MODEL_COUNTER ? 0 : c->value);'
 
+# An EXISTS read in the query's language, whatever language it names (story
+# S6b: relation rows are kept in one language, the outer list in another).
+plant exists-language-ignored src/model_query.c testModel \
+  'ModelQuery.AnExistsReadsTheLanguageItNames' \
+  '    if (x->exists_language != NULL) {' \
+  '    if (x->exists_language != NULL && 0) {'
+
+# A flagged field with no value read as no value, not as the empty text.
+plant empty-if-none-ignored src/model_query.c testModel \
+  'ModelQuery.EmptyIfNoneReadsNoValueAsTheEmptyText' \
+  '    if (out->n == 0 && (o->flags & GDEFSTOR_QUERY_EMPTY_IF_NONE) != 0) {' \
+  '    if (out->n == 0 && (o->flags & GDEFSTOR_QUERY_EMPTY_IF_NONE) != 0 && 0) {'
+
+# FIRST sorts by whichever item the scan meets first, not the first in order.
+plant first-is-any-item src/model_query.c testModel \
+  'ModelQuery.FirstSortsAMultipleByItsFirstItem' \
+  '    if (best == NULL || it->order < best->order ||
+        (it->order == best->order && it->item < best->item)) {' \
+  '    if (best == NULL) {'
+
+# REVISION_WHO reads the entity'"'"'s creator instead of the newest author.
+plant revision-who-is-the-creator src/model_query.c testModel \
+  'ModelQuery.RevisionWhoIsTheNewestRevisionsAuthor' \
+  '      out->own.bytes = (const uint8_t *)s->rwho;
+      out->own.len = s->rwho_len;' \
+  '      out->own.bytes = (const uint8_t *)s->creator;
+      out->own.len = s->creator_len;'
+
+# AS_TEXT leaves a reference a reference, so it never meets text.
+plant as-text-ignored src/model_query.c testModel \
+  'ModelQuery.AsTextComparesAReferenceWithText' \
+  '    out->type = GDEFSTOR_FIELD_TEXT;
+  }
+  return GDEFSTOR_OK;' \
+  '  }
+  return GDEFSTOR_OK;'
+
 plant_finish

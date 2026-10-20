@@ -116,14 +116,8 @@ static GDEFSTOR_Result check_values(const GDEFSTOR_QueryOperand * o,
   return GDEFSTOR_OK;
 }
 
-static GDEFSTOR_Result check_operand(const Check * c,
-    const GDEFSTOR_QueryOperand * o, const GDEFSTOR_Type * here,
-    int in_exists, Class * out) {
-  int outer = (o->flags & GDEFSTOR_QUERY_OUTER) != 0;
-  const GDEFSTOR_Type * t = outer ? c->outer : here;
-  if ((o->flags & ~GDEFSTOR_QUERY_OUTER) != 0 || (outer && !in_exists)) {
-    return GDEFSTOR_ERR_INVALID;
-  }
+static GDEFSTOR_Result operand_class(const GDEFSTOR_QueryOperand * o,
+    const GDEFSTOR_Type * t, int outer, Class * out) {
   switch (o->kind) {
   case GDEFSTOR_QUERY_FIELD: {
     size_t fi;
@@ -156,6 +150,9 @@ static GDEFSTOR_Result check_operand(const Check * c,
     case GDEFSTOR_META_REVISION:
       out->type = GDEFSTOR_FIELD_INTEGER;
       return GDEFSTOR_OK;
+    case GDEFSTOR_META_REVISION_WHO:
+      out->type = GDEFSTOR_FIELD_REFERENCE;
+      return GDEFSTOR_OK;
     default:
       return GDEFSTOR_ERR_INVALID;
     }
@@ -167,6 +164,40 @@ static GDEFSTOR_Result check_operand(const Check * c,
     /* COLUMN and CONST are the projection form's. */
     return GDEFSTOR_ERR_INVALID;
   }
+}
+
+/* An operand of a comparison: its type, with the flags of "Over entities"
+ * (query.h). EMPTY_IF_NONE reads a text or reference field with no value as
+ * the single empty text; AS_TEXT makes a reference operand a text one. */
+static GDEFSTOR_Result check_operand(const Check * c,
+    const GDEFSTOR_QueryOperand * o, const GDEFSTOR_Type * here,
+    int in_exists, Class * out) {
+  int outer = (o->flags & GDEFSTOR_QUERY_OUTER) != 0;
+  const GDEFSTOR_Type * t = outer ? c->outer : here;
+  GDEFSTOR_Result rc;
+  if ((o->flags & ~(GDEFSTOR_QUERY_OUTER | GDEFSTOR_QUERY_EMPTY_IF_NONE |
+           GDEFSTOR_QUERY_AS_TEXT)) != 0 ||
+      (outer && !in_exists)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  rc = operand_class(o, t, outer, out);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  if ((o->flags & GDEFSTOR_QUERY_EMPTY_IF_NONE) != 0 &&
+      (o->kind != GDEFSTOR_QUERY_FIELD ||
+          (out->type != GDEFSTOR_FIELD_TEXT &&
+              out->type != GDEFSTOR_FIELD_REFERENCE))) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if ((o->flags & GDEFSTOR_QUERY_AS_TEXT) != 0) {
+    if (o->kind == GDEFSTOR_QUERY_VALUES ||
+        out->type != GDEFSTOR_FIELD_REFERENCE) {
+      return GDEFSTOR_ERR_INVALID;
+    }
+    out->type = GDEFSTOR_FIELD_TEXT;
+  }
+  return GDEFSTOR_OK;
 }
 
 static int ordered_type(int type) {
@@ -224,7 +255,11 @@ static GDEFSTOR_Result check_node(Check * c, const GDEFSTOR_QueryNode * n,
   case GDEFSTOR_QUERY_EXISTS: {
     GDEFSTOR_Type * inner = NULL;
     if (in_exists || n->child_count != 1 || n->children == NULL ||
-        n->exists_type == NULL) {
+        n->exists_type == NULL ||
+        (n->exists_language == NULL ? n->exists_language_len != 0
+                                    : !gdefstor_model_lang_ok(
+                                          n->exists_language,
+                                          n->exists_language_len))) {
       return GDEFSTOR_ERR_INVALID;
     }
     rc = gdefstor_model_type_load(c->store, NULL, c->tenant, c->tenant_len,
@@ -310,21 +345,34 @@ static GDEFSTOR_Result check_node(Check * c, const GDEFSTOR_QueryNode * n,
 static GDEFSTOR_Result check_sort(const Check * c, const GDEFSTOR_QuerySort * s) {
   const GDEFSTOR_QueryOperand * o = &s->key;
   Class k;
-  if (s->numeric != 0 || o->flags != 0) {
+  if (s->numeric != 0 ||
+      (o->flags & ~(GDEFSTOR_QUERY_EMPTY_IF_NONE | GDEFSTOR_QUERY_FIRST)) !=
+          0) {
     return GDEFSTOR_ERR_INVALID;
   }
   if (o->kind == GDEFSTOR_QUERY_FIELD) {
     size_t fi;
+    int first = (o->flags & GDEFSTOR_QUERY_FIRST) != 0;
+    const GDEFSTOR_MField * f;
     GDEFSTOR_Result rc = resolve_field(c->outer, o, &fi);
     if (rc != GDEFSTOR_OK) {
       return rc;
     }
-    /* One value per entity: a single field of the root group. */
-    if (c->outer->f[fi].parent != GDEFSTOR_NONE ||
-        (c->outer->f[fi].flags & GDEFSTOR_FIELD_MULTIPLE) != 0) {
+    f = &c->outer->f[fi];
+    /* One value per entity: a single field of the root group, or with
+     * FIRST a multiple one's first item. */
+    if (f->parent != GDEFSTOR_NONE ||
+        ((f->flags & GDEFSTOR_FIELD_MULTIPLE) != 0) != first) {
+      return GDEFSTOR_ERR_INVALID;
+    }
+    if ((o->flags & GDEFSTOR_QUERY_EMPTY_IF_NONE) != 0 &&
+        f->type != GDEFSTOR_FIELD_TEXT && f->type != GDEFSTOR_FIELD_REFERENCE) {
       return GDEFSTOR_ERR_INVALID;
     }
     return GDEFSTOR_OK;
+  }
+  if (o->flags != 0) {
+    return GDEFSTOR_ERR_INVALID;
   }
   if (o->kind != GDEFSTOR_QUERY_META && o->kind != GDEFSTOR_QUERY_ENTITY) {
     return GDEFSTOR_ERR_INVALID;
@@ -466,6 +514,8 @@ void gdefstor_model_hits_release(const GDEFSTOR_Allocator * alloc,
 typedef struct SItem {
   uint32_t group;
   uint64_t item;
+  uint64_t parent;
+  double order;
   uint64_t from;
   GDEFSTOR_Value * vals;
   size_t nvals;
@@ -493,6 +543,9 @@ typedef struct Snap {
   uint64_t revision;
   int published;
   int deleted;
+  char * rwho;      /* the newest revision's who, when the query reads it */
+  size_t rwho_len;
+  uint64_t rwho_rev;
   SItem * items;
   size_t nitems;
   size_t capitems;
@@ -521,6 +574,10 @@ typedef struct Engine {
   void * scan_ctx;
   Inner * inner;      /* one per EXISTS */
   size_t exists_at;   /* the EXISTS being evaluated, depth first */
+  const GDEFSTOR_QueryNode ** exists; /* the EXISTS nodes, depth first */
+  size_t nexists;
+  const char * scan_lang; /* the language the type being scanned is read in */
+  size_t scan_lang_len;
   /* collecting */
   Snap cur;
   int have_cur;
@@ -546,6 +603,7 @@ static void snap_release(const GDEFSTOR_Allocator * alloc, Snap * s) {
   gcu_allocator_free(alloc, s->blinds);
   gcu_allocator_free(alloc, s->pid);
   gcu_allocator_free(alloc, s->creator);
+  gcu_allocator_free(alloc, s->rwho);
   memset(s, 0, sizeof *s);
 }
 
@@ -623,6 +681,13 @@ static GDEFSTOR_Result operand_set(Engine * e, const GDEFSTOR_QueryOperand * o,
         }
       }
     }
+    if (out->n == 0 && (o->flags & GDEFSTOR_QUERY_EMPTY_IF_NONE) != 0) {
+      /* No value reads as the single empty text. */
+      out->own.type = t->f[fi].type;
+      out->own.bytes = NULL;
+      out->own.len = 0;
+      return set_add(e, out, &out->own);
+    }
     return GDEFSTOR_OK;
   }
   case GDEFSTOR_QUERY_ENTITY:
@@ -655,6 +720,15 @@ static GDEFSTOR_Result operand_set(Engine * e, const GDEFSTOR_QueryOperand * o,
     case GDEFSTOR_META_REVISION:
       out->own.type = GDEFSTOR_FIELD_INTEGER;
       out->own.integer = (int64_t)s->revision;
+      break;
+    case GDEFSTOR_META_REVISION_WHO:
+      /* None for no revision and for the system's (an empty who). */
+      if (s->rwho_len == 0) {
+        return GDEFSTOR_OK;
+      }
+      out->own.type = GDEFSTOR_FIELD_REFERENCE;
+      out->own.bytes = (const uint8_t *)s->rwho;
+      out->own.len = s->rwho_len;
       break;
     default:
       return GDEFSTOR_ERR_INTERNAL;
@@ -869,6 +943,36 @@ static int hit_cmp(const void * ctx, size_t a, size_t b) {
   return x->row < y->row ? -1 : (x->row > y->row ? 1 : 0);
 }
 
+/* The value of a root multiple scalar field's first item: the lowest order
+ * key, then the lowest item id, among its items that have a value. Type 0
+ * when there is none. */
+static GDEFSTOR_Result first_value(Engine * e, const GDEFSTOR_QueryOperand * o,
+    const Snap * s, GDEFSTOR_Value * out) {
+  const GDEFSTOR_Type * t = e->plan->type;
+  const SItem * best = NULL;
+  size_t fi;
+  size_t i;
+  memset(out, 0, sizeof *out);
+  if (gdefstor_type_find(t, o->field, o->field_len, &fi) != GDEFSTOR_OK) {
+    return GDEFSTOR_ERR_INTERNAL;
+  }
+  for (i = 0; i < s->nitems; i++) {
+    const SItem * it = &s->items[i];
+    if (it->group != t->f[fi].group || it->nvals == 0 ||
+        it->vals[0].type == 0) {
+      continue;
+    }
+    if (best == NULL || it->order < best->order ||
+        (it->order == best->order && it->item < best->item)) {
+      best = it;
+    }
+  }
+  if (best == NULL) {
+    return GDEFSTOR_OK;
+  }
+  return gdefstor_model_value_copy(e->alloc, out, &best->vals[0]);
+}
+
 static GDEFSTOR_Result keep_hit(Engine * e, const Snap * s) {
   const GDEFSTOR_Query * q = e->plan->query;
   Hit * h;
@@ -893,13 +997,28 @@ static GDEFSTOR_Result keep_hit(Engine * e, const Snap * s) {
   h->pid_len = s->pid_len;
   e->nhits += 1;
   for (k = 0; k < q->sort_count; k++) {
+    const GDEFSTOR_QueryOperand * key = &q->sorts[k].key;
     Set v;
-    GDEFSTOR_Result rc =
-        operand_set(e, &q->sorts[k].key, e->plan->type, s, NULL, &v);
-    if (rc == GDEFSTOR_OK && v.n > 0) {
-      rc = gdefstor_model_value_copy(e->alloc, &h->keys[k], v.v[0]);
+    GDEFSTOR_Result rc;
+    if ((key->flags & GDEFSTOR_QUERY_FIRST) != 0) {
+      rc = first_value(e, key, s, &h->keys[k]);
+    } else {
+      rc = operand_set(e, key, e->plan->type, s, NULL, &v);
+      if (rc == GDEFSTOR_OK && v.n > 0) {
+        rc = gdefstor_model_value_copy(e->alloc, &h->keys[k], v.v[0]);
+      }
+      set_release(e, &v);
     }
-    set_release(e, &v);
+    if (rc == GDEFSTOR_OK && h->keys[k].type == 0 &&
+        (key->flags & GDEFSTOR_QUERY_EMPTY_IF_NONE) != 0) {
+      /* No value sorts as the empty text, tied with it. */
+      size_t fi;
+      if (gdefstor_type_find(e->plan->type, key->field, key->field_len, &fi) !=
+          GDEFSTOR_OK) {
+        return GDEFSTOR_ERR_INTERNAL;
+      }
+      h->keys[k].type = e->plan->type->f[fi].type;
+    }
     if (rc != GDEFSTOR_OK) {
       return rc;
     }
@@ -932,8 +1051,7 @@ static GDEFSTOR_Result decide(Engine * e, const Snap * s) {
 }
 
 static int in_language(const Engine * e, const char * lang, size_t len) {
-  const GDEFSTOR_Query * q = e->plan->query;
-  return len == q->language_len && memcmp(lang, q->language, len) == 0;
+  return len == e->scan_lang_len && memcmp(lang, e->scan_lang, len) == 0;
 }
 
 /* Keep only the entity's tree in the query's language: a query reads one
@@ -1041,6 +1159,8 @@ static GDEFSTOR_Result on_item(void * ctx, uint64_t row,
   memset(it, 0, sizeof *it);
   it->group = i->group;
   it->item = i->item;
+  it->parent = i->parent;
+  it->order = i->order;
   it->from = i->valid_from;
   if (!gdefstor_model_lang_ok(i->language, i->language_len)) {
     return GDEFSTOR_ERR_CORRUPT;
@@ -1098,6 +1218,81 @@ static GDEFSTOR_Result on_blind(void * ctx, uint64_t row,
   return GDEFSTOR_OK;
 }
 
+/* The newest revision's who, for META REVISION_WHO. */
+static GDEFSTOR_Result on_revision(void * ctx, uint64_t row,
+    const GDEFSTOR_ModelRevision * r) {
+  Engine * e = (Engine *)ctx;
+  Snap * s = &e->cur;
+  char * who;
+  if (!e->have_cur || row != s->row || (r->who == NULL && r->who_len != 0)) {
+    return GDEFSTOR_ERR_INTERNAL;
+  }
+  if (s->rwho != NULL && r->revision < s->rwho_rev) {
+    return GDEFSTOR_OK;
+  }
+  who = gdefstor_dup(e->alloc, r->who == NULL ? "" : r->who, r->who_len);
+  if (who == NULL) {
+    return GDEFSTOR_ERR_OOM;
+  }
+  gcu_allocator_free(e->alloc, s->rwho);
+  s->rwho = who;
+  s->rwho_len = r->who_len;
+  s->rwho_rev = r->revision;
+  return GDEFSTOR_OK;
+}
+
+/* Whether an operand, a node or a query reads META REVISION_WHO: only then
+ * are revisions read. */
+static int reads_who(const GDEFSTOR_QueryNode * n) {
+  size_t i;
+  if (n == NULL) {
+    return 0;
+  }
+  if ((n->left.kind == GDEFSTOR_QUERY_META &&
+          n->left.meta == GDEFSTOR_META_REVISION_WHO) ||
+      (n->right.kind == GDEFSTOR_QUERY_META &&
+          n->right.meta == GDEFSTOR_META_REVISION_WHO)) {
+    return 1;
+  }
+  for (i = 0; i < n->child_count; i++) {
+    if (reads_who(n->children[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int query_reads_who(const GDEFSTOR_Query * q) {
+  size_t i;
+  for (i = 0; i < q->sort_count; i++) {
+    if (q->sorts[i].key.kind == GDEFSTOR_QUERY_META &&
+        q->sorts[i].key.meta == GDEFSTOR_META_REVISION_WHO) {
+      return 1;
+    }
+  }
+  return reads_who(q->where);
+}
+
+/* The EXISTS nodes of a tree in a depth-first walk, the order the plan's
+ * types are in. */
+static size_t collect_exists(const GDEFSTOR_QueryNode * n,
+    const GDEFSTOR_QueryNode ** out, size_t cap, size_t at) {
+  size_t i;
+  if (n == NULL) {
+    return at;
+  }
+  if (n->op == GDEFSTOR_QUERY_EXISTS) {
+    if (at < cap) {
+      out[at] = n;
+    }
+    at += 1;
+  }
+  for (i = 0; i < n->child_count; i++) {
+    at = collect_exists(n->children[i], out, cap, at);
+  }
+  return at;
+}
+
 /* Whether a tree asks blind equality anywhere: only then are blind rows read. */
 static int has_blind_node(const GDEFSTOR_QueryNode * n) {
   size_t i;
@@ -1116,7 +1311,7 @@ static int has_blind_node(const GDEFSTOR_QueryNode * n) {
 }
 
 static GDEFSTOR_Result scan_type(Engine * e, const GDEFSTOR_Type * t,
-    Inner * into) {
+    Inner * into, const char * lang, size_t lang_len) {
   GDEFSTOR_ModelVisitor v;
   GDEFSTOR_Result rc;
   memset(&v, 0, sizeof v);
@@ -1126,6 +1321,11 @@ static GDEFSTOR_Result scan_type(Engine * e, const GDEFSTOR_Type * t,
   if (has_blind_node(e->plan->query->where)) {
     v.blind = on_blind;
   }
+  if (query_reads_who(e->plan->query)) {
+    v.revision = on_revision;
+  }
+  e->scan_lang = lang;
+  e->scan_lang_len = lang_len;
   e->into = into;
   e->have_cur = 0;
   rc = e->scan(e->scan_ctx, t->name, t->name_len, &v);
@@ -1163,12 +1363,34 @@ GDEFSTOR_Result gdefstor_model_scan(const GDEFSTOR_ModelPlan * plan,
       return GDEFSTOR_ERR_OOM;
     }
   }
-  /* Each type an EXISTS looks at is read once, whole. */
+  if (plan->exists_count > 0) {
+    e.exists = (const GDEFSTOR_QueryNode **)gdefstor_mem0(e.alloc,
+        plan->exists_count * sizeof *e.exists);
+    if (e.exists == NULL) {
+      gcu_allocator_free(e.alloc, e.inner);
+      return GDEFSTOR_ERR_OOM;
+    }
+    e.nexists = collect_exists(plan->query->where, e.exists,
+        plan->exists_count, 0);
+    if (e.nexists != plan->exists_count) {
+      rc = GDEFSTOR_ERR_INTERNAL;
+    }
+  }
+  /* Each type an EXISTS looks at is read once, whole, in the EXISTS's
+   * language (the query's unless it names its own). */
   for (i = 0; rc == GDEFSTOR_OK && i < plan->exists_count; i++) {
-    rc = scan_type(&e, plan->exists_types[i], &e.inner[i]);
+    const GDEFSTOR_QueryNode * x = e.exists[i];
+    if (x->exists_language != NULL) {
+      rc = scan_type(&e, plan->exists_types[i], &e.inner[i],
+          x->exists_language, x->exists_language_len);
+    } else {
+      rc = scan_type(&e, plan->exists_types[i], &e.inner[i],
+          plan->query->language, plan->query->language_len);
+    }
   }
   if (rc == GDEFSTOR_OK) {
-    rc = scan_type(&e, plan->type, NULL);
+    rc = scan_type(&e, plan->type, NULL, plan->query->language,
+        plan->query->language_len);
   }
   if (rc == GDEFSTOR_OK && !plan->count_only) {
     rc = sort_hits(&e, &order);
@@ -1221,5 +1443,6 @@ GDEFSTOR_Result gdefstor_model_scan(const GDEFSTOR_ModelPlan * plan,
     gcu_allocator_free(e.alloc, e.inner[i].v);
   }
   gcu_allocator_free(e.alloc, e.inner);
+  gcu_allocator_free(e.alloc, (void *)e.exists);
   return rc;
 }

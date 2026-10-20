@@ -298,8 +298,9 @@ typedef struct GDEFSTOR_ModelHits {
 
 /** gdefstor_model_scan(): visit every current entity of @p type (entity, then its
  * current items of every language, and, when the visitor's `blind` is set,
- * its blind rows), for the reference engine, which keeps those of the
- * query's language. */
+ * its blind rows, and, when the visitor's `revision` is set, its newest
+ * revision row, none for an entity with no revision), for the reference
+ * engine, which keeps those of the query's language. */
 typedef GDEFSTOR_Result (*GDEFSTOR_ModelScanFn)(void * ctx, const char * type,
     size_t type_len, const GDEFSTOR_ModelVisitor * visitor);
 

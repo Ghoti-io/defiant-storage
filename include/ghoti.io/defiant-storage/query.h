@@ -123,9 +123,29 @@
  * the public id; no value sorts before every value; text sorts by bytes. The
  * final tiebreak is the internal row, ascending even under a descending sort,
  * which is creation order. The total counts every match before the offset and
- * the limit. Flags other than ::GDEFSTOR_QUERY_OUTER, a select, `numeric` on a
+ * the limit. Flags other than the three below, a select, `numeric` on a
  * sort and `entity_numeric` are ::GDEFSTOR_ERR_INVALID, and so is a type that
  * was never declared.
+ *
+ * Three flags read an operand or a sort key the way a caller whose own values
+ * are texts reads them (core's conditions are), and are refused anywhere else:
+ *
+ * - ::GDEFSTOR_QUERY_EMPTY_IF_NONE on a FIELD operand of a TEXT or REFERENCE
+ *   field: when no current item of the query's language has a value, the
+ *   operand is the single empty text instead of the empty set, so `= ""`
+ *   holds on the entity and `!= ""` does not. On a sort key of such a field,
+ *   no value sorts as the empty text, tied with it.
+ * - ::GDEFSTOR_QUERY_AS_TEXT on an operand of type REFERENCE (a reference
+ *   field, META CREATOR or REVISION_WHO, ENTITY): it is of type TEXT, so it
+ *   compares by bytes with a text field or text constants.
+ * - ::GDEFSTOR_QUERY_FIRST on a sort key: the key is a MULTIPLE scalar field
+ *   of the root group, and an entity sorts by the value of its first item
+ *   (the lowest order key, then the lowest item id) that has one.
+ *
+ * An EXISTS may name the language its other type is read in
+ * (GDEFSTOR_QueryNode::exists_language): its FIELD operands then read that
+ * language's items, and its OUTER operands the query's. With none it is the
+ * query's language, as everywhere else.
  *
  * A personal field holds ciphertext, so the comparisons above refuse it; it is
  * matched only by ::GDEFSTOR_QUERY_BLIND, blind-index equality: the left
@@ -175,6 +195,12 @@ extern "C" {
 /** An operand's flag, inside an EXISTS: the operand is of the row the EXISTS
  * is being decided for (the outer row), not of the row it looks at. */
 #define GDEFSTOR_QUERY_OUTER 2
+/** An operand's flag, over entities: a REFERENCE operand is compared as TEXT
+ * ("Over entities"). */
+#define GDEFSTOR_QUERY_AS_TEXT 4
+/** A sort key's flag, over entities: a root MULTIPLE scalar field, sorted by
+ * its first item's value ("Over entities"). */
+#define GDEFSTOR_QUERY_FIRST 8
 
 /** One text. Borrowed for the call that takes it. */
 typedef struct GDEFSTOR_QueryText {
@@ -198,13 +224,16 @@ typedef enum GDEFSTOR_QueryMeta {
   GDEFSTOR_META_DELETED,       ///< Boolean: the newest state (soft delete).
   GDEFSTOR_META_CREATOR,       ///< Reference: who created it; none for the system.
   GDEFSTOR_META_CREATED,       ///< Date-time: when.
-  GDEFSTOR_META_REVISION       ///< Integer: the newest revision, 0 for none.
+  GDEFSTOR_META_REVISION,      ///< Integer: the newest revision, 0 for none.
+  /** Reference: who wrote the newest revision; none for an entity with no
+   * revision and for one the system wrote (an empty who). */
+  GDEFSTOR_META_REVISION_WHO
 } GDEFSTOR_QueryMeta;
 
 /** One side of a comparison, a sort key or a returned column. */
 typedef struct GDEFSTOR_QueryOperand {
   int kind;                   ///< A ::GDEFSTOR_QueryKind.
-  int flags;                  ///< ::GDEFSTOR_QUERY_EMPTY_IF_NONE or 0.
+  int flags;                  ///< ::GDEFSTOR_QUERY_EMPTY_IF_NONE and the others, or 0.
   const char * column;        ///< COLUMN: the column name.
   size_t column_len;          ///< Length of @ref column.
   const char * join_type;     ///< COLUMN: another projection type, or NULL.
@@ -254,6 +283,11 @@ typedef struct GDEFSTOR_QueryNode {
   size_t child_count;                       ///< How many children.
   const char * exists_type;                 ///< EXISTS: the projection type.
   size_t exists_type_len;                   ///< Length of @ref exists_type.
+  /** EXISTS over entities: the language the other type's FIELD operands read
+   * (a language tag), or NULL for the query's. OUTER operands always read
+   * the query's. The projection form does not read it. */
+  const char * exists_language;
+  size_t exists_language_len;               ///< Its length.
 } GDEFSTOR_QueryNode;
 
 /** One sort key. */

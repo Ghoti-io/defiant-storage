@@ -82,6 +82,7 @@ above; the operands are typed:
 | `META` `CREATOR` | who created it (none for the system) | reference |
 | `META` `CREATED` | when | date-time |
 | `META` `REVISION` | the newest revision, 0 for none | integer |
+| `META` `REVISION_WHO` | who wrote the newest revision (none for no revision or the system's) | reference |
 | `ENTITY` | its public id | reference |
 
 What it supports:
@@ -122,6 +123,26 @@ What it supports:
 - An offset, a limit (clamped to 1000; 0 is every match) and the total,
   which counts every match before the offset and the limit.
 
+For a caller whose own values are texts (core's conditions, story S6b),
+three flags and one member read the same data the way such a caller does.
+Each is refused anywhere else, and a query that names none of them means
+exactly what it meant before:
+
+- `GDEFSTOR_QUERY_EMPTY_IF_NONE` on a `FIELD` of a text or reference field:
+  with no value on any current item of the language, the operand is the
+  single empty text, so `= ""` holds and `!= ""` does not. On a sort key of
+  such a field, no value sorts as the empty text and ties with it.
+- `GDEFSTOR_QUERY_AS_TEXT` on a reference operand (a reference field,
+  `META` `CREATOR` or `REVISION_WHO`, `ENTITY`): its type is text, so it
+  compares by bytes with a text field or text constants.
+- `GDEFSTOR_QUERY_FIRST` on a sort key: a multiple scalar field of the root
+  group, sorted by the value of its first item (lowest order key, then lowest
+  item id) that has one; none sorts as no value.
+- `GDEFSTOR_QueryNode::exists_language` on an `EXISTS`: the other type's
+  `FIELD` operands read that language's items (a relation kept in one
+  language, tested from a list in another); its `OUTER` operands read the
+  query's. NULL is the query's language.
+
 What it refuses, with `GDEFSTOR_ERR_INVALID` unless a limit says otherwise:
 a query with no language, or a tag that is not one; a type never declared; a path that is not an active scalar field (a group, a
 retired field, a field that does not exist); a personal field anywhere but
@@ -129,9 +150,10 @@ in `BLIND` (its value is ciphertext: never compared, ranged or sorted), and a
 `BLIND` on anything else or with a MAC of another length; sides of different
 types; an ordered comparison on text, references or booleans; `in` without a
 constant list; `COLUMN` and `CONST` (the projection form's operands) outside
-`BLIND`; flags
-other than `OUTER`; `OUTER` outside an `EXISTS`; an `EXISTS` inside another;
-a sort on a nested or multiple field, or with `numeric`; select columns;
+`BLIND`; flags other than `OUTER` and the three above, or one of those
+where it does not apply; `OUTER` outside an `EXISTS`; an `EXISTS` inside
+another, or one naming a language tag that is not one; a sort on a nested
+field, on a multiple field without `FIRST`, or with `numeric`; select columns;
 `entity_numeric`. The caps above are `GDEFSTOR_ERR_LIMIT`.
 
 A backend answers through `GDEFSTOR_ModelBackend::query`, handed the checked
