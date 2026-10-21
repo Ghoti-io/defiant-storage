@@ -3526,6 +3526,183 @@ void gdefstor_draft_free(GDEFSTOR_Draft * draft) {
   gcu_allocator_free(alloc, draft);
 }
 
+/* ---- the drafts of a tenant ---------------------------------------------- */
+
+typedef struct DraftListEntry {
+  char * pid;
+  size_t pid_len;
+  char * type;
+  size_t type_len;
+} DraftListEntry;
+
+struct GDEFSTOR_DraftList {
+  const GDEFSTOR_Allocator * alloc;
+  DraftListEntry * v;
+  size_t n;
+  size_t cap;
+  size_t * order; /* v by public id */
+};
+
+static GDEFSTOR_Result list_skip_entity(void * ctx,
+    const GDEFSTOR_ModelEntity * e) {
+  (void)ctx;
+  (void)e;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result list_skip_state(void * ctx, uint64_t row,
+    const GDEFSTOR_ModelState * s) {
+  (void)ctx;
+  (void)row;
+  (void)s;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result list_skip_revision(void * ctx, uint64_t row,
+    const GDEFSTOR_ModelRevision * r) {
+  (void)ctx;
+  (void)row;
+  (void)r;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result list_skip_item(void * ctx, uint64_t row,
+    const GDEFSTOR_ModelItem * i) {
+  (void)ctx;
+  (void)row;
+  (void)i;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result list_skip_type(void * ctx, const char * name,
+    size_t name_len, const uint8_t * text, size_t text_len) {
+  (void)ctx;
+  (void)name;
+  (void)name_len;
+  (void)text;
+  (void)text_len;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result list_draft(void * ctx, const GDEFSTOR_ModelDraft * d) {
+  GDEFSTOR_DraftList * l = (GDEFSTOR_DraftList *)ctx;
+  DraftListEntry * e;
+  if (d == NULL || d->public_id == NULL || d->public_id_len == 0 ||
+      d->type == NULL) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  if (l->n == l->cap) {
+    size_t ncap = l->cap == 0 ? 8 : l->cap * 2;
+    DraftListEntry * grown;
+    if (ncap > SIZE_MAX / sizeof *grown) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    grown = (DraftListEntry *)gcu_allocator_realloc(l->alloc, l->v,
+        ncap * sizeof *grown);
+    if (grown == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    l->v = grown;
+    l->cap = ncap;
+  }
+  e = &l->v[l->n];
+  memset(e, 0, sizeof *e);
+  e->pid = gdefstor_dup(l->alloc, d->public_id, d->public_id_len);
+  e->type = gdefstor_dup(l->alloc, d->type, d->type_len);
+  if (e->pid == NULL || e->type == NULL) {
+    gcu_allocator_free(l->alloc, e->pid);
+    gcu_allocator_free(l->alloc, e->type);
+    return GDEFSTOR_ERR_OOM;
+  }
+  e->pid_len = d->public_id_len;
+  e->type_len = d->type_len;
+  l->n += 1;
+  return GDEFSTOR_OK;
+}
+
+static int draft_list_cmp(const void * ctx, size_t a, size_t b) {
+  const DraftListEntry * v = (const DraftListEntry *)ctx;
+  size_t n = v[a].pid_len < v[b].pid_len ? v[a].pid_len : v[b].pid_len;
+  int c = memcmp(v[a].pid, v[b].pid, n);
+  if (c != 0) {
+    return c;
+  }
+  return v[a].pid_len < v[b].pid_len ? -1 : (v[a].pid_len > v[b].pid_len);
+}
+
+GDEFSTOR_Result gdefstor_draft_list(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, GDEFSTOR_DraftList ** out_list) {
+  GDEFSTOR_DraftList * l;
+  GDEFSTOR_ModelVisitor v;
+  GDEFSTOR_Result rc = read_args(store, tenant, tenant_len);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  if (out_list == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  l = (GDEFSTOR_DraftList *)gdefstor_mem0(store->alloc, sizeof *l);
+  if (l == NULL) {
+    return GDEFSTOR_ERR_OOM;
+  }
+  l->alloc = store->alloc;
+  /* The truth's dump, of which only the drafts are kept: there is no other
+   * way to a draft that reserves an id with no entity. */
+  memset(&v, 0, sizeof v);
+  v.ctx = l;
+  v.type = list_skip_type;
+  v.entity = list_skip_entity;
+  v.state = list_skip_state;
+  v.revision = list_skip_revision;
+  v.item = list_skip_item;
+  v.draft = list_draft;
+  rc = store->model.dump(store->model.ctx, tenant, tenant_len,
+      GDEFSTOR_MODEL_TRUTH, &v);
+  if (rc == GDEFSTOR_OK) {
+    rc = gdefstor_model_sort(l->alloc, l->n, draft_list_cmp, l->v, &l->order);
+  }
+  if (rc != GDEFSTOR_OK) {
+    gdefstor_draft_list_free(l);
+    return rc;
+  }
+  *out_list = l;
+  return GDEFSTOR_OK;
+}
+
+size_t gdefstor_draft_list_count(const GDEFSTOR_DraftList * list) {
+  return list == NULL ? 0 : list->n;
+}
+
+GDEFSTOR_Result gdefstor_draft_list_item(const GDEFSTOR_DraftList * list,
+    size_t index, const char ** out_public_id, size_t * out_public_id_len,
+    const char ** out_type, size_t * out_type_len) {
+  const DraftListEntry * e;
+  if (list == NULL || index >= list->n || out_public_id == NULL ||
+      out_public_id_len == NULL || out_type == NULL || out_type_len == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  e = &list->v[list->order == NULL ? index : list->order[index]];
+  *out_public_id = e->pid;
+  *out_public_id_len = e->pid_len;
+  *out_type = e->type;
+  *out_type_len = e->type_len;
+  return GDEFSTOR_OK;
+}
+
+void gdefstor_draft_list_free(GDEFSTOR_DraftList * list) {
+  size_t i;
+  if (list == NULL) {
+    return;
+  }
+  for (i = 0; i < list->n; i++) {
+    gcu_allocator_free(list->alloc, list->v[i].pid);
+    gcu_allocator_free(list->alloc, list->v[i].type);
+  }
+  gcu_allocator_free(list->alloc, list->v);
+  gcu_allocator_free(list->alloc, list->order);
+  gcu_allocator_free(list->alloc, list);
+}
+
 GDEFSTOR_Result gdefstor_draft_delete(GDEFSTOR_Write * write,
     const char * public_id, size_t public_id_len) {
   GDEFSTOR_Store * store;

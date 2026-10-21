@@ -50,6 +50,7 @@
 #define GDEFSTOR_DiffKind GHOTIIO_DEFSTOR(GDEFSTOR_DiffKind)
 #define GDEFSTOR_Draft GHOTIIO_DEFSTOR(GDEFSTOR_Draft)
 #define GDEFSTOR_DraftInfo GHOTIIO_DEFSTOR(GDEFSTOR_DraftInfo)
+#define GDEFSTOR_DraftList GHOTIIO_DEFSTOR(GDEFSTOR_DraftList)
 #define GDEFSTOR_Entity GHOTIIO_DEFSTOR(GDEFSTOR_Entity)
 #define GDEFSTOR_EntityInfo GHOTIIO_DEFSTOR(GDEFSTOR_EntityInfo)
 #define GDEFSTOR_FieldInfo GHOTIIO_DEFSTOR(GDEFSTOR_FieldInfo)
@@ -78,6 +79,8 @@
 #define GDEFSTOR_ModelRecord GHOTIIO_DEFSTOR(GDEFSTOR_ModelRecord)
 #define GDEFSTOR_ModelOutbox GHOTIIO_DEFSTOR(GDEFSTOR_ModelOutbox)
 #define GDEFSTOR_RecordList GHOTIIO_DEFSTOR(GDEFSTOR_RecordList)
+#define GDEFSTOR_SnapshotAbout GHOTIIO_DEFSTOR(GDEFSTOR_SnapshotAbout)
+#define GDEFSTOR_SnapshotModule GHOTIIO_DEFSTOR(GDEFSTOR_SnapshotModule)
 #define GDEFSTOR_OutboxClaim GHOTIIO_DEFSTOR(GDEFSTOR_OutboxClaim)
 #define GDEFSTOR_OutboxEntry GHOTIIO_DEFSTOR(GDEFSTOR_OutboxEntry)
 #define GDEFSTOR_ModelClose GHOTIIO_DEFSTOR(GDEFSTOR_ModelClose)
@@ -122,6 +125,18 @@
 #define gdefstor_snapshot_ledger GHOTIIO_DEFSTOR(gdefstor_snapshot_ledger)
 #define gdefstor_snapshot_export_at GHOTIIO_DEFSTOR(gdefstor_snapshot_export_at)
 #define gdefstor_snapshot_taken GHOTIIO_DEFSTOR(gdefstor_snapshot_taken)
+#define gdefstor_snapshot_export_tenant                                        \
+  GHOTIIO_DEFSTOR(gdefstor_snapshot_export_tenant)
+#define gdefstor_snapshot_about GHOTIIO_DEFSTOR(gdefstor_snapshot_about)
+#define gdefstor_snapshot_about_found                                          \
+  GHOTIIO_DEFSTOR(gdefstor_snapshot_about_found)
+#define gdefstor_snapshot_about_edition                                        \
+  GHOTIIO_DEFSTOR(gdefstor_snapshot_about_edition)
+#define gdefstor_snapshot_about_module_count                                   \
+  GHOTIIO_DEFSTOR(gdefstor_snapshot_about_module_count)
+#define gdefstor_snapshot_about_module                                         \
+  GHOTIIO_DEFSTOR(gdefstor_snapshot_about_module)
+#define gdefstor_snapshot_about_free GHOTIIO_DEFSTOR(gdefstor_snapshot_about_free)
 #define gdefstor_store_destroy GHOTIIO_DEFSTOR(gdefstor_store_destroy)
 #define gdefstor_write_abort GHOTIIO_DEFSTOR(gdefstor_write_abort)
 #define gdefstor_write_begin GHOTIIO_DEFSTOR(gdefstor_write_begin)
@@ -134,6 +149,10 @@
 #define gdefstor_draft_free GHOTIIO_DEFSTOR(gdefstor_draft_free)
 #define gdefstor_draft_get GHOTIIO_DEFSTOR(gdefstor_draft_get)
 #define gdefstor_draft_info GHOTIIO_DEFSTOR(gdefstor_draft_info)
+#define gdefstor_draft_list GHOTIIO_DEFSTOR(gdefstor_draft_list)
+#define gdefstor_draft_list_count GHOTIIO_DEFSTOR(gdefstor_draft_list_count)
+#define gdefstor_draft_list_item GHOTIIO_DEFSTOR(gdefstor_draft_list_item)
+#define gdefstor_draft_list_free GHOTIIO_DEFSTOR(gdefstor_draft_list_free)
 #define gdefstor_draft_put GHOTIIO_DEFSTOR(gdefstor_draft_put)
 #define gdefstor_entity_count GHOTIIO_DEFSTOR(gdefstor_entity_count)
 #define gdefstor_entity_create GHOTIIO_DEFSTOR(gdefstor_entity_create)

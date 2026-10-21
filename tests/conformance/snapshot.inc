@@ -712,6 +712,188 @@ TEST_F(ModelSnapshot, AnEmptyTenantHasNoEntityPart) {
   EXPECT_EQ("", snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH));
 }
 
+/* The data set of a backup pair says what the tenant needs to come back up
+ * (AD-23): its edition and its enabled modules with their stored-data schema
+ * versions, read back without an import; an import takes it; the same input
+ * gives the same bytes; an export refuses what it would not read back; and a
+ * plain export says nothing of either. */
+TEST_F(ModelSnapshot, ADataSetSaysTheEditionAndTheModulesItNeeds) {
+  ASSERT_EQ(GDEFSTOR_OK, snapshot_fixture::Populate(store, kTenant, false));
+  const GDEFSTOR_SnapshotModule mods[2] = {{"blog", 4, 3}, {"blog-x", 6, 1}};
+  const char * ed = "defiant-edition/2";
+  auto exported = [&](const char * e, const GDEFSTOR_SnapshotModule * m,
+                      size_t n, GDEFSTOR_Result * rc) {
+    uint8_t * zip = nullptr;
+    size_t len = 0;
+    *rc = gdefstor_snapshot_export_tenant(store, kTenant, 2, nullptr, 77, e,
+        e == nullptr ? 0 : std::strlen(e), m, n, &zip, &len);
+    std::string out(reinterpret_cast<const char *>(zip), zip == nullptr ? 0 : len);
+    gdefstor_bytes_free(nullptr, zip);
+    return out;
+  };
+  GDEFSTOR_Result rc;
+  std::string zip = exported(ed, mods, 2, &rc);
+  ASSERT_EQ(GDEFSTOR_OK, rc);
+  EXPECT_EQ(zip, exported(ed, mods, 2, &rc));
+  auto members = ZipMembers(zip);
+  ASSERT_FALSE(members.empty());
+  EXPECT_EQ("manifest", members[0].first);
+  EXPECT_NE(std::string::npos,
+      members[0].second.find("\"edition\":\"defiant-edition/2\",\"modules\":["
+                             "{\"name\":\"blog\",\"schema\":3},{\"name\":"
+                             "\"blog-x\",\"schema\":1}]"))
+      << members[0].second;
+  GDEFSTOR_SnapshotAbout * about = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_snapshot_about(store,
+      reinterpret_cast<const uint8_t *>(zip.data()), zip.size(), nullptr,
+      &about));
+  EXPECT_EQ(1, gdefstor_snapshot_about_found(about));
+  const char * e = nullptr;
+  size_t elen = 0;
+  gdefstor_snapshot_about_edition(about, &e, &elen);
+  EXPECT_EQ(std::string(ed), std::string(e, elen));
+  ASSERT_EQ(2u, gdefstor_snapshot_about_module_count(about));
+  GDEFSTOR_SnapshotModule m;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_snapshot_about_module(about, 1, &m));
+  EXPECT_EQ("blog-x", std::string(m.name, m.name_len));
+  EXPECT_EQ(1u, m.schema);
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_snapshot_about_module(about, 0, &m));
+  EXPECT_EQ("blog", std::string(m.name, m.name_len));
+  EXPECT_EQ(3u, m.schema);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_snapshot_about_module(about, 2, &m));
+  gdefstor_snapshot_about_free(about);
+  int found = 0;
+  int64_t taken = 0;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_snapshot_taken(store,
+      reinterpret_cast<const uint8_t *>(zip.data()), zip.size(), nullptr,
+      &found, &taken));
+  EXPECT_EQ(77, taken);
+  std::string why;
+  EXPECT_EQ(GDEFSTOR_OK, snapshot_fixture::Import(copy, kTenant, zip, &why))
+      << why;
+  /* No edition is null, and no module an empty list. */
+  std::string bare = exported(nullptr, nullptr, 0, &rc);
+  ASSERT_EQ(GDEFSTOR_OK, rc);
+  EXPECT_NE(std::string::npos,
+      ZipMembers(bare)[0].second.find("\"edition\":null,\"modules\":[]"));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_snapshot_about(store,
+      reinterpret_cast<const uint8_t *>(bare.data()), bare.size(), nullptr,
+      &about));
+  EXPECT_EQ(1, gdefstor_snapshot_about_found(about));
+  gdefstor_snapshot_about_edition(about, &e, &elen);
+  EXPECT_EQ(0u, elen);
+  EXPECT_EQ(0u, gdefstor_snapshot_about_module_count(about));
+  gdefstor_snapshot_about_free(about);
+  /* What an export refuses. */
+  const GDEFSTOR_SnapshotModule unsorted[2] = {{"b", 1, 1}, {"a", 1, 1}};
+  const GDEFSTOR_SnapshotModule twice[2] = {{"a", 1, 1}, {"a", 1, 2}};
+  const GDEFSTOR_SnapshotModule zero[1] = {{"a", 1, 0}};
+  const GDEFSTOR_SnapshotModule upper[1] = {{"A", 1, 1}};
+  for (const char * bad : {"defiant-edition/0", "defiant-edition/01",
+           "defiant-edition/", "edition/1", "defiant-edition/4294967296"}) {
+    exported(bad, nullptr, 0, &rc);
+    EXPECT_EQ(GDEFSTOR_ERR_INVALID, rc) << bad;
+  }
+  for (const GDEFSTOR_SnapshotModule * bad : {unsorted, twice}) {
+    exported(nullptr, bad, 2, &rc);
+    EXPECT_EQ(GDEFSTOR_ERR_INVALID, rc);
+  }
+  for (const GDEFSTOR_SnapshotModule * bad : {zero, upper}) {
+    exported(nullptr, bad, 1, &rc);
+    EXPECT_EQ(GDEFSTOR_ERR_INVALID, rc);
+  }
+  /* A plain data set says neither. */
+  std::string plain = snapshot_fixture::Export(store, kTenant);
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_snapshot_about(store,
+      reinterpret_cast<const uint8_t *>(plain.data()), plain.size(), nullptr,
+      &about));
+  EXPECT_EQ(0, gdefstor_snapshot_about_found(about));
+  EXPECT_EQ(0u, gdefstor_snapshot_about_module_count(about));
+  gdefstor_snapshot_about_free(about);
+}
+
+/* A manifest's edition and modules are judged with the rest of the archive,
+ * before anything is written: one without the other, an edition that is not
+ * defiant-edition/<n>, a module out of order, twice, at schema 0, with a
+ * leading zero, with a member the format does not hold or with a name that
+ * is not a machine name, is refused, and so is reading it back. */
+TEST_F(ModelSnapshot, AManifestsEditionAndModulesAreJudgedBeforeAnythingIsWritten) {
+  auto manifest = [](const std::string & about) {
+    return ZipOf({{"manifest",
+        "{\"format\":\"defiant-snapshot/1\"," + about + "\"model\":[]}"}});
+  };
+  std::string why;
+  EXPECT_EQ(GDEFSTOR_OK, snapshot_fixture::Import(copy, kTenant,
+      manifest("\"edition\":\"defiant-edition/1\",\"modules\":[{\"name\":"
+               "\"a\",\"schema\":1},{\"name\":\"b\",\"schema\":7}],"),
+      &why))
+      << why;
+  for (const char * bad :
+      {"\"edition\":null,", "\"modules\":[],",
+          "\"edition\":\"defiant-edition/0\",\"modules\":[],",
+          "\"edition\":7,\"modules\":[],",
+          "\"edition\":null,\"modules\":{},",
+          "\"edition\":null,\"modules\":[{\"name\":\"b\",\"schema\":1},"
+          "{\"name\":\"a\",\"schema\":1}],",
+          "\"edition\":null,\"modules\":[{\"name\":\"a\",\"schema\":1},"
+          "{\"name\":\"a\",\"schema\":2}],",
+          "\"edition\":null,\"modules\":[{\"name\":\"a\",\"schema\":0}],",
+          "\"edition\":null,\"modules\":[{\"name\":\"a\",\"schema\":1.5}],",
+          "\"edition\":null,\"modules\":[{\"name\":\"a\",\"schema\":\"1\"}],",
+          "\"edition\":null,\"modules\":[{\"name\":\"a\",\"schema\":1,"
+          "\"x\":1}],",
+          "\"edition\":null,\"modules\":[{\"name\":\"A\",\"schema\":1}],",
+          "\"edition\":null,\"modules\":[{\"name\":\"../a\",\"schema\":1}],"}) {
+    std::string zip = manifest(bad);
+    EXPECT_EQ(GDEFSTOR_ERR_CORRUPT,
+        snapshot_fixture::Import(copy, kTenant, zip, &why))
+        << bad;
+    EXPECT_FALSE(why.empty()) << bad;
+    GDEFSTOR_SnapshotAbout * about = nullptr;
+    EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, gdefstor_snapshot_about(copy,
+        reinterpret_cast<const uint8_t *>(zip.data()), zip.size(), nullptr,
+        &about))
+        << bad;
+    EXPECT_EQ(nullptr, about);
+  }
+  EXPECT_EQ("", snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH));
+}
+
+/* Every draft of a tenant is listed, by public id, the draft of an entity
+ * and the draft that reserves an id with no entity alike, each with its
+ * type; an empty tenant lists none; and a round trip lists the same. */
+TEST_F(ModelSnapshot, EveryDraftOfATenantIsListed) {
+  auto listed = [](GDEFSTOR_Store * s) {
+    GDEFSTOR_DraftList * l = nullptr;
+    std::string out;
+    EXPECT_EQ(GDEFSTOR_OK, gdefstor_draft_list(s, kTenant, 2, &l));
+    for (size_t i = 0; i < gdefstor_draft_list_count(l); i++) {
+      const char * pid = nullptr;
+      size_t pid_len = 0;
+      const char * type = nullptr;
+      size_t type_len = 0;
+      EXPECT_EQ(GDEFSTOR_OK, gdefstor_draft_list_item(l, i, &pid, &pid_len,
+          &type, &type_len));
+      out += std::string(pid, pid_len) + " " + std::string(type, type_len) +
+             "\n";
+    }
+    const char * p = nullptr;
+    size_t n = 0;
+    EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_draft_list_item(l,
+        gdefstor_draft_list_count(l), &p, &n, &p, &n));
+    gdefstor_draft_list_free(l);
+    return out;
+  };
+  EXPECT_EQ("", listed(copy));
+  RoundTrip();
+  EXPECT_EQ("o1 shop.order\no9 shop.order\n", listed(store));
+  EXPECT_EQ(listed(store), listed(copy));
+  GDEFSTOR_DraftList * l = nullptr;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_draft_list(store, kTenant, 2,
+      nullptr));
+  EXPECT_EQ(nullptr, l);
+}
+
 /* Every allocation an export or an import makes may fail: each failure is
  * reported (::GDEFSTOR_ERR_OOM), an export that failed returns nothing, and
  * an import that failed writes nothing - the next attempt would be refused

@@ -32,7 +32,10 @@
  * `defiant-revision/1`. Derived data (current tables, the blind table,
  * indexes) is never in it, and neither is a key: a personal value travels as
  * it is stored, ciphertext and subject. So a snapshot of one backend imports
- * into any other.
+ * into any other. The data set of a backup pair
+ * (gdefstor_snapshot_export_tenant()) also says when it was taken and what
+ * the tenant needs to come back up: its edition and its enabled modules with
+ * the schema version of each one's stored data.
  *
  * A member named `ledger` is a copy of an erasure ledger. It is not imported
  * into the tenant. Import refuses any other member the manifest does not
@@ -116,6 +119,107 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_export_at(
     const GDEFSTOR_Limits * limits, int64_t taken_ms, uint8_t ** out_bytes,
     size_t * out_len);
 
+/** The edition identifier's name (AD-18, AD-34): an edition is written
+ * `defiant-edition/<n>`, n a positive integer without leading zeros. */
+#define GDEFSTOR_EDITION_NAME "defiant-edition"
+
+/** The longest module name a data set holds, in bytes. */
+#define GDEFSTOR_SNAPSHOT_MODULE_NAME_MAX 64
+
+/** The most modules a data set names. */
+#define GDEFSTOR_SNAPSHOT_MODULES_MAX 1024
+
+/**
+ * @brief One module a data set names (AD-23): a module the tenant has
+ * enabled, and the version of the stored-data schema its data is in (AD-15).
+ *
+ * The name is a module's machine name: a lowercase letter, then lowercase
+ * letters, digits and hyphens, at most ::GDEFSTOR_SNAPSHOT_MODULE_NAME_MAX
+ * bytes. @ref schema is 1 or more.
+ */
+typedef struct GDEFSTOR_SnapshotModule {
+  const char * name; ///< The module's machine name.
+  size_t name_len;   ///< Its length.
+  uint32_t schema;   ///< Its stored-data schema version, 1 or more.
+} GDEFSTOR_SnapshotModule;
+
+/**
+ * @brief Export one tenant as the data set of a backup pair: when it was
+ * taken, and what the tenant needs to come back up (AD-23).
+ *
+ * As gdefstor_snapshot_export_at(), and the manifest also says the tenant's
+ * edition (`"edition"`, `defiant-edition/<n>`, or null for a tenant that pins
+ * none) and its enabled modules with the schema version of each one's stored
+ * data (`"modules"`, by name). Storage does not read the tenant's enablement
+ * itself: the caller (core) names the modules. Nothing is written to the
+ * store.
+ *
+ * @param edition `defiant-edition/<n>`, or NULL with @p edition_len 0 for
+ *   none.
+ * @param modules The modules in strictly ascending byte order of name, at
+ *   most ::GDEFSTOR_SNAPSHOT_MODULES_MAX; NULL when @p module_count is 0.
+ * @return ::GDEFSTOR_OK or an error; ::GDEFSTOR_ERR_INVALID for a negative
+ *   @p taken_ms, an edition that is not `defiant-edition/<n>`, a module name
+ *   that is not a machine name, a schema of 0, or modules out of order or
+ *   named twice.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_export_tenant(
+    GDEFSTOR_Store * store, const char * tenant, size_t tenant_len,
+    const GDEFSTOR_Limits * limits, int64_t taken_ms, const char * edition,
+    size_t edition_len, const GDEFSTOR_SnapshotModule * modules,
+    size_t module_count, uint8_t ** out_bytes, size_t * out_len);
+
+/** What a data set's manifest says the tenant needs. Opaque. */
+typedef struct GDEFSTOR_SnapshotAbout GDEFSTOR_SnapshotAbout;
+
+/**
+ * @brief Read what a snapshot's manifest says the tenant needs to come back
+ * up (gdefstor_snapshot_export_tenant()). Nothing is imported.
+ *
+ * A manifest that holds neither `"edition"` nor `"modules"` (one that
+ * gdefstor_snapshot_export() or gdefstor_snapshot_export_at() made) reads as
+ * not found. Free @p out_about with gdefstor_snapshot_about_free().
+ *
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_CORRUPT for a zip without a readable
+ *   manifest, one that holds one of the two and not the other, or either not
+ *   as gdefstor_snapshot_export_tenant() writes it (an edition that is not
+ *   `defiant-edition/<n>`, a module that is not `{"name":…,"schema":…}` with a
+ *   machine name and a schema of 1 or more, modules out of order or named
+ *   twice, or more than ::GDEFSTOR_SNAPSHOT_MODULES_MAX), or the archive's
+ *   error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_about(GDEFSTOR_Store * store,
+    const uint8_t * bytes, size_t len, const GDEFSTOR_Limits * limits,
+    GDEFSTOR_SnapshotAbout ** out_about);
+
+/** @return 1 when the manifest says the edition and the modules, else 0. */
+GDEFSTOR_API int gdefstor_snapshot_about_found(
+    const GDEFSTOR_SnapshotAbout * about);
+
+/**
+ * @brief The edition the manifest names: `defiant-edition/<n>`, or @p out_len
+ * 0 for none. Borrowed until @p about is freed.
+ */
+GDEFSTOR_API void gdefstor_snapshot_about_edition(
+    const GDEFSTOR_SnapshotAbout * about, const char ** out_edition,
+    size_t * out_len);
+
+/** @return How many modules the manifest names. */
+GDEFSTOR_API size_t gdefstor_snapshot_about_module_count(
+    const GDEFSTOR_SnapshotAbout * about);
+
+/**
+ * @brief Module @p index, in ascending byte order of name. The name is
+ * borrowed until @p about is freed.
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID past the end.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_about_module(
+    const GDEFSTOR_SnapshotAbout * about, size_t index,
+    GDEFSTOR_SnapshotModule * out);
+
+/** @brief Release what gdefstor_snapshot_about() read. NULL is ignored. */
+GDEFSTOR_API void gdefstor_snapshot_about_free(GDEFSTOR_SnapshotAbout * about);
+
 /**
  * @brief Read when a snapshot was taken, as gdefstor_snapshot_export_at()
  * recorded it. Nothing is imported.
@@ -144,7 +248,10 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_ledger(GDEFSTOR_Store * store,
  * @brief Import a snapshot into a tenant that holds nothing.
  *
  * Reads `defiant-snapshot/1`; any other version, of the snapshot or of a
- * member (an entity's `defiant-revision/1`), is ::GDEFSTOR_ERR_UNSUPPORTED. A
+ * member (an entity's `defiant-revision/1`), is ::GDEFSTOR_ERR_UNSUPPORTED.
+ * The edition and modules a data set's manifest names are checked as
+ * gdefstor_snapshot_about() checks them and not acted on: deciding whether
+ * this installation can hold them is the caller's (core's restore). A
  * tenant that already holds any entity truth (a declaration, an entity, a
  * draft, a blind row, a record, a counter or an outbox row) is
  * ::GDEFSTOR_ERR_INVALID and is left alone. A bad member is

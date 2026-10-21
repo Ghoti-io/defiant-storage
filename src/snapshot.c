@@ -165,9 +165,186 @@ static GARC_Result add_file(GARC_Writer * writer, const char * name,
   return gr;
 }
 
+/* ---- what a data set says the tenant needs (AD-23) ------------------------ */
+
+static const char EDITION_PREFIX[] = GDEFSTOR_EDITION_NAME "/";
+
+/* A positive decimal integer without leading zeros that fits in 32 bits. */
+static int u32_text(const char * p, size_t n, uint32_t * out) {
+  uint64_t v = 0;
+  size_t i;
+  if (n == 0 || n > 10 || p[0] == '0') {
+    return 0;
+  }
+  for (i = 0; i < n; i++) {
+    if (p[i] < '0' || p[i] > '9') {
+      return 0;
+    }
+    v = v * 10u + (uint64_t)(p[i] - '0');
+  }
+  if (v > UINT32_MAX) {
+    return 0;
+  }
+  if (out != NULL) {
+    *out = (uint32_t)v;
+  }
+  return 1;
+}
+
+/* `defiant-edition/<n>`. */
+static int edition_ok(const char * p, size_t n) {
+  size_t k = strlen(EDITION_PREFIX);
+  return p != NULL && n > k && memcmp(p, EDITION_PREFIX, k) == 0 &&
+         u32_text(p + k, n - k, NULL);
+}
+
+/* A module's machine name: a lowercase letter, then lowercase letters,
+ * digits and hyphens. */
+static int module_name_ok(const char * p, size_t n) {
+  size_t i;
+  if (p == NULL || n == 0 || n > GDEFSTOR_SNAPSHOT_MODULE_NAME_MAX ||
+      p[0] < 'a' || p[0] > 'z') {
+    return 0;
+  }
+  for (i = 1; i < n; i++) {
+    char c = p[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int bytes_cmp(const char * a, size_t an, const char * b, size_t bn) {
+  size_t n = an < bn ? an : bn;
+  int c = n == 0 ? 0 : memcmp(a, b, n);
+  if (c != 0) {
+    return c;
+  }
+  return an < bn ? -1 : (an > bn ? 1 : 0);
+}
+
+/* The edition and modules a caller gives an export, as the manifest will
+ * hold them. */
+static int about_args_ok(const char * edition, size_t edition_len,
+    const GDEFSTOR_SnapshotModule * modules, size_t count) {
+  size_t i;
+  if ((edition == NULL && edition_len != 0) ||
+      (edition_len != 0 && !edition_ok(edition, edition_len)) ||
+      (modules == NULL && count != 0) ||
+      count > GDEFSTOR_SNAPSHOT_MODULES_MAX) {
+    return 0;
+  }
+  for (i = 0; i < count; i++) {
+    if (!module_name_ok(modules[i].name, modules[i].name_len) ||
+        modules[i].schema == 0 ||
+        (i > 0 && bytes_cmp(modules[i - 1].name, modules[i - 1].name_len,
+                      modules[i].name, modules[i].name_len) >= 0)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+typedef struct AboutModule {
+  char name[GDEFSTOR_SNAPSHOT_MODULE_NAME_MAX + 1];
+  size_t len;
+  uint32_t schema;
+} AboutModule;
+
+struct GDEFSTOR_SnapshotAbout {
+  const GDEFSTOR_Allocator * alloc;
+  int found;
+  char edition[48];
+  size_t edition_len;
+  AboutModule * mods;
+  size_t n;
+};
+
+/* The manifest's `"edition"` and `"modules"`: both or neither, each as an
+ * export writes it. With @p out NULL, only checked. */
+static GDEFSTOR_Result read_about(const GDEFSTOR_Allocator * alloc,
+    const GTEXT_JSON_Value * root, GDEFSTOR_SnapshotAbout * out,
+    int * out_found) {
+  const GTEXT_JSON_Value * edition = gtext_json_object_get(root, "edition", 7);
+  const GTEXT_JSON_Value * modules = gtext_json_object_get(root, "modules", 7);
+  size_t n;
+  size_t i;
+  *out_found = 0;
+  if (edition == NULL && modules == NULL) {
+    return GDEFSTOR_OK;
+  }
+  if (edition == NULL || modules == NULL ||
+      gtext_json_typeof(modules) != GTEXT_JSON_ARRAY) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  if (gtext_json_typeof(edition) != GTEXT_JSON_NULL) {
+    const char * p = NULL;
+    size_t len = 0;
+    if (gtext_json_get_string(edition, &p, &len) != GTEXT_JSON_OK ||
+        !edition_ok(p, len) || (out != NULL && len >= sizeof out->edition)) {
+      return GDEFSTOR_ERR_CORRUPT;
+    }
+    if (out != NULL) {
+      memcpy(out->edition, p, len);
+      out->edition[len] = '\0';
+      out->edition_len = len;
+    }
+  }
+  n = gtext_json_array_size(modules);
+  if (n > GDEFSTOR_SNAPSHOT_MODULES_MAX) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  if (out != NULL && n > 0) {
+    out->mods = (AboutModule *)gdefstor_mem0(alloc, n * sizeof *out->mods);
+    if (out->mods == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+  }
+  {
+    const char * prev = NULL;
+    size_t prev_len = 0;
+    for (i = 0; i < n; i++) {
+      const GTEXT_JSON_Value * m = gtext_json_array_get(modules, i);
+      const char * name = NULL;
+      size_t name_len = 0;
+      const char * lex = NULL;
+      size_t lex_len = 0;
+      uint32_t schema = 0;
+      if (gtext_json_typeof(m) != GTEXT_JSON_OBJECT ||
+          gtext_json_object_size(m) != 2 ||
+          gtext_json_get_string(gtext_json_object_get(m, "name", 4), &name,
+              &name_len) != GTEXT_JSON_OK ||
+          !module_name_ok(name, name_len) ||
+          gtext_json_get_number_lexeme(gtext_json_object_get(m, "schema", 6),
+              &lex, &lex_len) != GTEXT_JSON_OK ||
+          !u32_text(lex, lex_len, &schema) ||
+          (prev != NULL && bytes_cmp(prev, prev_len, name, name_len) >= 0)) {
+        return GDEFSTOR_ERR_CORRUPT;
+      }
+      prev = name;
+      prev_len = name_len;
+      if (out != NULL) {
+        memcpy(out->mods[i].name, name, name_len);
+        out->mods[i].name[name_len] = '\0';
+        out->mods[i].len = name_len;
+        out->mods[i].schema = schema;
+        out->n = i + 1;
+      }
+    }
+  }
+  *out_found = 1;
+  if (out != NULL) {
+    out->found = 1;
+  }
+  return GDEFSTOR_OK;
+}
+
 static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
     size_t tenant_len, const GDEFSTOR_Limits * limits, const uint8_t * ledger,
     size_t ledger_len, int with_ledger, int with_taken, int64_t taken_ms,
+    int with_about, const char * edition, size_t edition_len,
+    const GDEFSTOR_SnapshotModule * modules, size_t module_count,
     uint8_t ** out_bytes, size_t * out_len) {
   GDEFSTOR_Limits cap;
   GDEFSTOR_SnapMember * model = NULL;
@@ -186,6 +363,8 @@ static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
   GARC_Result gr = GARC_OK;
   if (store == NULL || out_bytes == NULL || out_len == NULL ||
       (with_ledger && ledger == NULL && ledger_len != 0) ||
+      (with_about &&
+          !about_args_ok(edition, edition_len, modules, module_count)) ||
       !gdefstor_span_ok(tenant, tenant_len, store->limits.max_tenant_bytes)) {
     return GDEFSTOR_ERR_INVALID;
   }
@@ -225,6 +404,46 @@ static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
              ? gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
                    store->alloc, at, (size_t)kn)
              : GDEFSTOR_ERR_INTERNAL;
+  }
+  if (rc == GDEFSTOR_OK && with_about) {
+    /* What the tenant needs to come back up (AD-23): its edition and its
+     * enabled modules with their stored-data schema versions. An import
+     * checks them and leaves acting on them to its caller. */
+    rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
+        store->alloc, "\"edition\":", strlen("\"edition\":"));
+    if (rc == GDEFSTOR_OK) {
+      rc = edition_len == 0
+               ? gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
+                     store->alloc, "null", 4)
+               : gdefstor_json_escape_append(&manifest, &manifest_len,
+                     &manifest_cap, store->alloc, edition, edition_len);
+    }
+    if (rc == GDEFSTOR_OK) {
+      rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
+          store->alloc, ",\"modules\":[", strlen(",\"modules\":["));
+    }
+    for (i = 0; rc == GDEFSTOR_OK && i < module_count; i++) {
+      char num[24];
+      int kn = snprintf(num, sizeof num, ",\"schema\":%lu}",
+          (unsigned long)modules[i].schema);
+      rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
+          store->alloc, i > 0 ? ",{\"name\":" : "{\"name\":",
+          i > 0 ? 9 : 8);
+      if (rc == GDEFSTOR_OK) {
+        rc = gdefstor_json_escape_append(&manifest, &manifest_len,
+            &manifest_cap, store->alloc, modules[i].name, modules[i].name_len);
+      }
+      if (rc == GDEFSTOR_OK) {
+        rc = kn > 0 && (size_t)kn < sizeof num
+                 ? gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
+                       store->alloc, num, (size_t)kn)
+                 : GDEFSTOR_ERR_INTERNAL;
+      }
+    }
+    if (rc == GDEFSTOR_OK) {
+      rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
+          store->alloc, "],", 2);
+    }
   }
   if (rc == GDEFSTOR_OK) {
     rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
@@ -308,8 +527,8 @@ static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
 GDEFSTOR_Result gdefstor_snapshot_export(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const GDEFSTOR_Limits * limits,
     uint8_t ** out_bytes, size_t * out_len) {
-  return export_zip(store, tenant, tenant_len, limits, NULL, 0, 0, 0, 0,
-      out_bytes, out_len);
+  return export_zip(store, tenant, tenant_len, limits, NULL, 0, 0, 0, 0, 0,
+      NULL, 0, NULL, 0, out_bytes, out_len);
 }
 
 GDEFSTOR_Result gdefstor_snapshot_export_at(GDEFSTOR_Store * store,
@@ -319,7 +538,19 @@ GDEFSTOR_Result gdefstor_snapshot_export_at(GDEFSTOR_Store * store,
     return GDEFSTOR_ERR_INVALID;
   }
   return export_zip(store, tenant, tenant_len, limits, NULL, 0, 0, 1, taken_ms,
-      out_bytes, out_len);
+      0, NULL, 0, NULL, 0, out_bytes, out_len);
+}
+
+GDEFSTOR_Result gdefstor_snapshot_export_tenant(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, const GDEFSTOR_Limits * limits,
+    int64_t taken_ms, const char * edition, size_t edition_len,
+    const GDEFSTOR_SnapshotModule * modules, size_t module_count,
+    uint8_t ** out_bytes, size_t * out_len) {
+  if (taken_ms < 0) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  return export_zip(store, tenant, tenant_len, limits, NULL, 0, 0, 1, taken_ms,
+      1, edition, edition_len, modules, module_count, out_bytes, out_len);
 }
 
 GDEFSTOR_Result gdefstor_snapshot_export_ledger(GDEFSTOR_Store * store,
@@ -327,7 +558,7 @@ GDEFSTOR_Result gdefstor_snapshot_export_ledger(GDEFSTOR_Store * store,
     const uint8_t * ledger, size_t ledger_len, uint8_t ** out_bytes,
     size_t * out_len) {
   return export_zip(store, tenant, tenant_len, limits, ledger, ledger_len, 1, 0,
-      0, out_bytes, out_len);
+      0, 0, NULL, 0, NULL, 0, out_bytes, out_len);
 }
 
 static GDEFSTOR_Result read_members(GDEFSTOR_Store * store,
@@ -565,6 +796,7 @@ static GDEFSTOR_Result import_zip(GDEFSTOR_Store * store,
   GDEFSTOR_Write * write = NULL;
   GDEFSTOR_Result rc;
   int empty = 1;
+  int about_found = 0;
   if (store == NULL || (bytes == NULL && len != 0) ||
       !gdefstor_span_ok(tenant, tenant_len, store->limits.max_tenant_bytes)) {
     return GDEFSTOR_ERR_INVALID;
@@ -612,13 +844,26 @@ static GDEFSTOR_Result import_zip(GDEFSTOR_Store * store,
     goto done;
   }
   /* The manifest holds its format, the entity part's member names and,
-   * from gdefstor_snapshot_export_at(), when it was taken: nothing else. */
+   * from gdefstor_snapshot_export_at(), when it was taken, and from
+   * gdefstor_snapshot_export_tenant() the tenant's edition and modules as
+   * well: nothing else. */
   model = gtext_json_object_get(root, "model", 5);
-  keys = 2 + (gtext_json_object_get(root, "taken_ms", 8) != NULL ? 1 : 0);
+  rc = read_about(store->alloc, root, NULL, &about_found);
+  if (rc != GDEFSTOR_OK) {
+    why_set(why, "the manifest's edition or modules are not what "
+                 "defiant-snapshot/1 holds there (an edition "
+                 "defiant-edition/<n> or null, and modules by name, each "
+                 "with a schema version of 1 or more, both or neither), so "
+                 "nothing was written");
+    goto done;
+  }
+  keys = 2 + (gtext_json_object_get(root, "taken_ms", 8) != NULL ? 1 : 0) +
+         (about_found ? 2 : 0);
   if (model == NULL || gtext_json_typeof(model) != GTEXT_JSON_ARRAY ||
       gtext_json_object_size(root) != keys) {
     why_set(why, "the manifest is not what defiant-snapshot/1 holds (its "
-                 "format, \"model\" and \"taken_ms\"), so nothing was written");
+                 "format, \"model\", \"taken_ms\", \"edition\" and "
+                 "\"modules\"), so nothing was written");
     rc = GDEFSTOR_ERR_CORRUPT;
     goto done;
   }
@@ -856,4 +1101,108 @@ GDEFSTOR_Result gdefstor_snapshot_taken(GDEFSTOR_Store * store,
   gtext_json_free(root);
   free_mems(store->alloc, mems, count);
   return rc;
+}
+
+GDEFSTOR_Result gdefstor_snapshot_about(GDEFSTOR_Store * store,
+    const uint8_t * bytes, size_t len, const GDEFSTOR_Limits * limits,
+    GDEFSTOR_SnapshotAbout ** out_about) {
+  GDEFSTOR_Limits cap;
+  SnapMem * mems = NULL;
+  size_t count = 0;
+  SnapMem * manifest;
+  GTEXT_JSON_Parse_Options opt;
+  GTEXT_JSON_Error err;
+  GTEXT_JSON_Value * root;
+  GDEFSTOR_SnapshotAbout * about;
+  int found = 0;
+  GDEFSTOR_Result rc;
+  if (store == NULL || out_about == NULL || (bytes == NULL && len != 0)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (limits == NULL) {
+    cap = store->limits;
+  } else {
+    cap = *limits;
+  }
+  rc = read_members(store, &cap, bytes, len, &mems, &count);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  manifest = find_mem(mems, count, MANIFEST_NAME, strlen(MANIFEST_NAME));
+  if (manifest == NULL) {
+    free_mems(store->alloc, mems, count);
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  memset(&err, 0, sizeof err);
+  opt = gtext_json_parse_options_default();
+  opt.max_depth = cap.max_json_depth == 0 ? 1 : cap.max_json_depth;
+  opt.max_string_bytes = cap.max_member_bytes;
+  opt.max_total_bytes = cap.max_member_bytes;
+  opt.dupkeys = GTEXT_JSON_DUPKEY_ERROR;
+  opt.allocator = (const GTEXT_Allocator *)store->alloc;
+  root = gtext_json_parse((const char *)manifest->bytes, manifest->len, &opt,
+      &err);
+  if (root == NULL) {
+    rc = from_json(err.code);
+    gtext_json_error_free(&err);
+    free_mems(store->alloc, mems, count);
+    return rc;
+  }
+  gtext_json_error_free(&err);
+  about = (GDEFSTOR_SnapshotAbout *)gdefstor_mem0(store->alloc, sizeof *about);
+  if (about == NULL) {
+    rc = GDEFSTOR_ERR_OOM;
+  } else {
+    about->alloc = store->alloc;
+    rc = gtext_json_typeof(root) == GTEXT_JSON_OBJECT
+             ? read_about(store->alloc, root, about, &found)
+             : GDEFSTOR_ERR_CORRUPT;
+  }
+  gtext_json_free(root);
+  free_mems(store->alloc, mems, count);
+  if (rc != GDEFSTOR_OK) {
+    gdefstor_snapshot_about_free(about);
+    return rc;
+  }
+  *out_about = about;
+  return GDEFSTOR_OK;
+}
+
+int gdefstor_snapshot_about_found(const GDEFSTOR_SnapshotAbout * about) {
+  return about != NULL && about->found;
+}
+
+void gdefstor_snapshot_about_edition(const GDEFSTOR_SnapshotAbout * about,
+    const char ** out_edition, size_t * out_len) {
+  if (out_edition != NULL) {
+    *out_edition = about == NULL ? "" : about->edition;
+  }
+  if (out_len != NULL) {
+    *out_len = about == NULL ? 0 : about->edition_len;
+  }
+}
+
+size_t gdefstor_snapshot_about_module_count(
+    const GDEFSTOR_SnapshotAbout * about) {
+  return about == NULL ? 0 : about->n;
+}
+
+GDEFSTOR_Result gdefstor_snapshot_about_module(
+    const GDEFSTOR_SnapshotAbout * about, size_t index,
+    GDEFSTOR_SnapshotModule * out) {
+  if (about == NULL || out == NULL || index >= about->n) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  out->name = about->mods[index].name;
+  out->name_len = about->mods[index].len;
+  out->schema = about->mods[index].schema;
+  return GDEFSTOR_OK;
+}
+
+void gdefstor_snapshot_about_free(GDEFSTOR_SnapshotAbout * about) {
+  if (about == NULL) {
+    return;
+  }
+  gcu_allocator_free(about->alloc, about->mods);
+  gcu_allocator_free(about->alloc, about);
 }

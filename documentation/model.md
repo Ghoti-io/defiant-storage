@@ -228,7 +228,10 @@ no entity reserves the id; applying it creates the entity, with the
 revision's who and when as creator and creation time, and writes revision 1,
 after checking everything, so a draft that does not validate creates nothing.
 Deleting a draft touches nothing else. Scheduled publish is a caller applying
-a draft at a time.
+a draft at a time. `gdefstor_draft_list()` names every draft of a tenant, by
+public id, reserving or not; it reads the backend's dump of the truth, so it
+costs what the tenant holds and is for exports ("everything about this
+person"), not requests.
 
 ## Queries
 
@@ -621,9 +624,11 @@ either ledger names is dropped, an equal row is kept, and a secret or key the
 tenant holds with other bytes refuses the whole import. Importing a set twice
 changes nothing. A key set holds keys: it is the key half of a backup pair,
 never inside a snapshot. The data half is a snapshot taken with
-`gdefstor_snapshot_export_at()`, whose manifest records `"taken_ms"`
-(`gdefstor_snapshot_taken()` reads it); the restore that pairs the two, and
-refuses a key set older than its data set, is core's.
+`gdefstor_snapshot_export_tenant()`, whose manifest records `"taken_ms"`
+(`gdefstor_snapshot_taken()` reads it) and the tenant's edition and enabled
+modules with their stored-data schema versions (`gdefstor_snapshot_about()`
+reads them); the restore that pairs the two, refuses a key set older than its
+data set and a module schema newer than the destination's, is core's.
 
 A backend may leave these members NULL, all of them; every call that needs
 them is `GDEFSTOR_ERR_UNSUPPORTED` on it. The struct has one size,

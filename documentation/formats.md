@@ -20,13 +20,27 @@ an earlier shape. The member named `manifest` is:
 
 ```json
 {"format":"defiant-snapshot/1","taken_ms":1234,
+ "edition":"defiant-edition/1","modules":[{"name":"blog","schema":1}],
  "model":["model/73686f702e6f72646572/type.json","model/73686f702e6f72646572/entities.json",
           "model/73686f702e6f72646572/6f31.json","model/drafts.json","model/records.json",
           "model/counters.json","model/outbox.json"]}
 ```
 
-`taken_ms` is there when `gdefstor_snapshot_export_at` made it, and nothing
-but `format`, `taken_ms` and `model` is. `model` lists the **entity part**,
+`taken_ms` is there when `gdefstor_snapshot_export_at` or
+`gdefstor_snapshot_export_tenant` made it. `edition` and `modules` are there,
+together, when `gdefstor_snapshot_export_tenant` made it (the data set of a
+backup pair, AD-23): what the tenant needs to come back up. `edition` is the
+tenant's edition, `defiant-edition/<n>` (n a positive integer without leading
+zeros), or `null` for a tenant that pins none; `modules` is every module the
+tenant has enabled, by name in byte order, each once, each with `schema`, the
+version (1 or more) of the stored-data schema its data is in (AD-15). A
+module name is a lowercase letter, then lowercase letters, digits and
+hyphens, at most 64 bytes; at most 1024 modules. Storage carries them and does
+not act on them: `gdefstor_snapshot_about` reads them back, an import checks
+them as that does (one without the other, or either not as written here, is
+`GDEFSTOR_ERR_CORRUPT`), and deciding whether a destination can hold them is
+core's restore. Nothing but `format`, `taken_ms`, `edition`, `modules` and
+`model` is in a manifest. `model` lists the **entity part**,
 the truth of the entity port (model.h), in the order the members are written;
 it is empty for a tenant that holds none. Every member of the archive is the
 manifest, a member `model` names, or `ledger`; anything else is

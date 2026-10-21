@@ -808,6 +808,42 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_tree(const GDEFSTOR_Draft * draft,
 /** @brief Release a draft. NULL is ignored. */
 GDEFSTOR_API void gdefstor_draft_free(GDEFSTOR_Draft * draft);
 
+/** The drafts of a tenant, gdefstor_draft_list(). Opaque. */
+typedef struct GDEFSTOR_DraftList GDEFSTOR_DraftList;
+
+/**
+ * @brief Every draft of a tenant as of the last commit: the drafts of
+ * entities and the drafts that reserve an id with no entity yet, by public
+ * id in byte order.
+ *
+ * What "everything about this person" needs besides the subject lookup
+ * (gdefstor_subject_lookup() reads the revision tables, and a draft is not
+ * in them). It reads the backend's dump of the truth, so its cost is the
+ * tenant's size, not the drafts': it is for exports, not for a request.
+ * Read each with gdefstor_draft_get(). Free @p out_list with
+ * gdefstor_draft_list_free().
+ *
+ * @return ::GDEFSTOR_OK (no draft is success), ::GDEFSTOR_ERR_INVALID,
+ *   ::GDEFSTOR_ERR_OOM, or a backend's error.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_list(GDEFSTOR_Store * store,
+    const char * tenant, size_t tenant_len, GDEFSTOR_DraftList ** out_list);
+
+/** @return How many drafts the list holds. */
+GDEFSTOR_API size_t gdefstor_draft_list_count(const GDEFSTOR_DraftList * list);
+
+/**
+ * @brief Draft @p index: its public id and its type, borrowed until @p list
+ * is freed.
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID past the end.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_list_item(
+    const GDEFSTOR_DraftList * list, size_t index, const char ** out_public_id,
+    size_t * out_public_id_len, const char ** out_type, size_t * out_type_len);
+
+/** @brief Release a draft list. NULL is ignored. */
+GDEFSTOR_API void gdefstor_draft_list_free(GDEFSTOR_DraftList * list);
+
 /**
  * @brief Delete a draft. Revisions, states and the entity are not touched.
  * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID when there is none.
