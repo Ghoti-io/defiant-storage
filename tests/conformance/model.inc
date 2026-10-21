@@ -3878,7 +3878,26 @@ class ModelWriters : public ModelTest {
   }
 };
 
+/* Where cutil has no fibers (GCU_FIBER_SUPPORTED is 0: every target but
+ * x86-64 and arm64 ELF, and Windows), no writer is ever on one, so a writer
+ * cannot park: the two tests of parking skip there, once the platform is seen
+ * to refuse a fiber, and AWriterThatIsNotAFiberIsToldTheTenantIsBusy is what
+ * holds. suite/tools/xarch's first run (story S10) met it on i686, s390x,
+ * PowerPC and SPARC64. */
+#if GCU_FIBER_SUPPORTED
+#define GDEFSTOR_TEST_NEEDS_FIBERS() (void)0
+#else
+#define GDEFSTOR_TEST_NEEDS_FIBERS()                                          \
+  do {                                                                         \
+    GCU_Fiber * none = nullptr;                                                \
+    ASSERT_EQ(GCU_FIBER_ERR_UNSUPPORTED, gcu_fiber_create(&none, ParkEntry,    \
+        nullptr, GCU_FIBER_DEFAULT_STACK_SIZE, nullptr));                      \
+    GTEST_SKIP() << "cutil has no fibers on this target, so no writer parks"; \
+  } while (0)
+#endif
+
 TEST_F(ModelWriters, ASecondWriterOnAFiberParksUntilTheFirstCommits) {
+  GDEFSTOR_TEST_NEEDS_FIBERS();
   GDEFSTOR_Write * w = nullptr;
   ASSERT_EQ(GDEFSTOR_OK, Hold(&w));
   Park park;
@@ -3897,6 +3916,7 @@ TEST_F(ModelWriters, ASecondWriterOnAFiberParksUntilTheFirstCommits) {
 }
 
 TEST_F(ModelWriters, AnAbortWakesTheParkedWriterToNothing) {
+  GDEFSTOR_TEST_NEEDS_FIBERS();
   GDEFSTOR_Write * w = nullptr;
   ASSERT_EQ(GDEFSTOR_OK, Hold(&w));
   Park park;
