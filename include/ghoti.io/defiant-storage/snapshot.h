@@ -62,6 +62,13 @@ extern "C" {
 /** The snapshot format's version, and the only one a reader accepts. */
 #define GDEFSTOR_SNAPSHOT_VERSION 1
 
+/** The format of one entity's revisions and item versions, a member of a
+ * snapshot (AD-34). */
+#define GDEFSTOR_REVISION_NAME "defiant-revision"
+
+/** Its version, and the only one a reader accepts. */
+#define GDEFSTOR_REVISION_VERSION 1
+
 /**
  * @brief Export one tenant's truth to a zip.
  *

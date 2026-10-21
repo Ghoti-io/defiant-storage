@@ -31,11 +31,7 @@
 #include <ghoti.io/defiant-storage/allocator.h>
 #include <ghoti.io/defiant-storage/core.h>
 #include <ghoti.io/defiant-storage/store.h>
-#include <ghoti.io/defiant-storage/revision.h>
-#include <ghoti.io/defiant-storage/blob.h>
-#include <ghoti.io/defiant-storage/projection.h>
 #include <ghoti.io/defiant-storage/query.h>
-#include <ghoti.io/defiant-storage/outbox.h>
 #include <ghoti.io/defiant-storage/snapshot.h>
 #include <ghoti.io/defiant-storage/value.h>
 #include <ghoti.io/defiant-storage/model.h>

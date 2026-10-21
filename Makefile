@@ -437,7 +437,7 @@ TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cfla
 # coverage target does, because --coverage links the gcov runtime, whose
 # mangle_path check-symbols is right to reject in a shipping library and
 # wrong to reject in an instrumented one. Spelled as text's TEST_GATES is.
-TEST_GATES ?= check-symbols check-aliasing check-seams check-defects check-query check-model
+TEST_GATES ?= check-symbols check-aliasing check-seams check-model
 
 # Valgrind flags (exclude "still reachable" as it's not a leak)
 # --suppressions: see tests/valgrind.supp. It holds allocations that are
@@ -656,7 +656,7 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 ####################################################################
 
 # General commands
-.PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-aliasing check-seams check-defects check-query check-model
+.PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-aliasing check-seams check-model
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -850,12 +850,6 @@ check-aliasing: ## Fail if the strict-aliasing warning is not actually armed
 		printf '\033[0;31mcheck-aliasing: CFLAGS resolves to -Wstrict-aliasing=%s, and only level 1 reports the planted store - 0, 2 and 3 are all silent on it. The level is wrong; the flags are not missing. Note that 3 is also what -Wall implies, so it means either an explicit override later on the command line or ALIASING flags that stopped being passed, and this cannot tell which.\033[0m\n' "$$level" >&2; \
 	fi; \
 	exit 1
-check-defects: ## Fail unless each planted defect turns the conformance gate red
-	@tools/check-defects.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC) TEXT_PC=$(TEXT_PC) ARCHIVE_PC=$(ARCHIVE_PC)
-
-check-query: ## Fail unless each defect planted in the query form turns a named test red
-	@tools/check-query.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC) TEXT_PC=$(TEXT_PC) ARCHIVE_PC=$(ARCHIVE_PC)
-
 check-model: ## Fail unless each defect planted in the entity port turns a named test red
 	@tools/check-model.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC) TEXT_PC=$(TEXT_PC) ARCHIVE_PC=$(ARCHIVE_PC)
 
@@ -1267,11 +1261,10 @@ fuzz-run-$2: $$(FUZZ_APP_DIR)/$1
 		-max_total_time=$$(FUZZ_TIME) -print_final_stats=1
 endef
 
-$(eval $(call fuzz-rule,fuzz_revision,revision))
 $(eval $(call fuzz-rule,fuzz_snapshot,snapshot))
 
 fuzz: ## Build and run every fuzzer for $(FUZZ_TIME) seconds each
-fuzz: fuzz-run-revision fuzz-run-snapshot
+fuzz: fuzz-run-snapshot
 
 fuzz-clean: ## Remove the fuzz build (keeps the corpus)
 	-@rm -rf $(FUZZ_DIR)
@@ -1332,6 +1325,8 @@ endif
 	# Installing the pkg-config files.
 	@mkdir -p $(PKGCONFIG_INSTALL_PATH)
 	@mkdir -p $(CONFORMANCE_DIR)
+	@# A suite this tree no longer has (suite.inc, query.inc) is not left behind.
+	@rm -f $(CONFORMANCE_DIR)/*.inc
 	@cp tests/conformance/*.inc $(CONFORMANCE_DIR)/
 	@cat pkgconfig/$(SUITE)-$(PROJECT).pc | sed 's/(SUITE)/$(SUITE)/g; s/(PROJECT)/$(PROJECT)/g; s/(BRANCH)/$(BRANCH)/g; s/(VERSION)/$(VERSION)/g; s|(PC_LIB_DIR)|$(PC_LIB_DIR)|g; s|(PC_INCLUDE_DIR)|$(PC_INCLUDE_DIR)|g; s|(REQUIRES)|$(PC_REQUIRES)|g; s|(CONFORMANCE_DIR)|$(CONFORMANCE_DIR)|g' > $(PKGCONFIG_INSTALL_PATH)/$(SUITE)-$(PROJECT)$(BRANCH).pc
 ifeq ($(OS_NAME), Linux)

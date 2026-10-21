@@ -166,7 +166,6 @@
 
 #include <ghoti.io/defiant-storage/macros.h>
 #include <ghoti.io/defiant-storage/store.h>
-#include <ghoti.io/defiant-storage/projection.h>
 #include <ghoti.io/defiant-storage/value.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -318,37 +317,6 @@ typedef struct GDEFSTOR_Query {
 /** The rows of a query. Opaque. */
 typedef struct GDEFSTOR_QueryResult GDEFSTOR_QueryResult;
 
-/**
- * @brief Run a query over the committed rows of one projection type.
- *
- * @param store The store.
- * @param tenant Tenant bytes.
- * @param tenant_len Its length.
- * @param type The projection type.
- * @param type_len Its length.
- * @param query The query.
- * @param out_result Receives the result on success.
- * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID, ::GDEFSTOR_ERR_LIMIT,
- *   ::GDEFSTOR_ERR_CORRUPT, ::GDEFSTOR_ERR_OOM, or a backend's error. An
- *   unknown tenant or type is success with no rows.
- */
-GDEFSTOR_API GDEFSTOR_Result gdefstor_projection_query(GDEFSTOR_Store * store,
-    const char * tenant, size_t tenant_len, const char * type, size_t type_len,
-    const GDEFSTOR_Query * query, GDEFSTOR_QueryResult ** out_result);
-
-/**
- * @brief Count the committed rows of one projection type that match.
- *
- * The same predicate and the same refusals as gdefstor_projection_query(); the
- * sort, offset, limit and select are not looked at.
- *
- * @param where The predicate, or NULL for every row.
- * @param out_count Receives the number of matches.
- */
-GDEFSTOR_API GDEFSTOR_Result gdefstor_projection_count(GDEFSTOR_Store * store,
-    const char * tenant, size_t tenant_len, const char * type, size_t type_len,
-    const GDEFSTOR_QueryNode * where, uint64_t * out_count);
-
 /** @return How many rows this page holds. */
 GDEFSTOR_API size_t gdefstor_query_result_rows(const GDEFSTOR_QueryResult * r);
 
@@ -364,17 +332,6 @@ GDEFSTOR_API uint64_t gdefstor_query_result_total(
 GDEFSTOR_API GDEFSTOR_Result gdefstor_query_result_entity(
     const GDEFSTOR_QueryResult * r, size_t row, const char ** out_entity,
     size_t * out_len);
-
-/**
- * @brief One returned column of a row: the first text of the select operand.
- *
- * @param select Index into GDEFSTOR_Query::select.
- * @param out_present Set to 0 when the operand had no text.
- * @return ::GDEFSTOR_OK or ::GDEFSTOR_ERR_INVALID for an index out of range.
- */
-GDEFSTOR_API GDEFSTOR_Result gdefstor_query_result_value(
-    const GDEFSTOR_QueryResult * r, size_t row, size_t select,
-    int * out_present, const uint8_t ** out_bytes, size_t * out_len);
 
 /** @brief Release a result. NULL is ignored. */
 GDEFSTOR_API void gdefstor_query_result_free(GDEFSTOR_QueryResult * r);
@@ -403,127 +360,6 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_count(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * type, size_t type_len,
     const char * language, size_t language_len,
     const GDEFSTOR_QueryNode * where, uint64_t * out_count);
-
-/* ---- for the authors of a backend --------------------------------------- */
-
-/**
- * What a backend that answers queries itself is handed: the tenant, the key
- * prefix of every row of the type, and a query the port has already checked.
- * A backend that does not set GDEFSTOR_Backend::query is answered by the
- * port's own scan, which reads every row of the type through `list` and `get`.
- */
-typedef struct GDEFSTOR_QueryPlan {
-  const char * type;          ///< The projection type.
-  size_t type_len;            ///< Its length.
-  const char * prefix;        ///< Key prefix shared by every row of the type.
-  size_t prefix_len;          ///< Its length.
-  const GDEFSTOR_Query * query; ///< Checked: shape, limits, select.
-  uint64_t limit;             ///< The page size after clamping, UINT64_MAX for all.
-  int count_only;             ///< Only @ref GDEFSTOR_QueryRows::total is wanted.
-} GDEFSTOR_QueryPlan;
-
-/**
- * What a backend writes back: the page, in order, and the total. Arrays and
- * their elements come from the store's allocator; the port frees them. The
- * entity is the decoded argument, and the row is the encoded projection (the
- * port decodes the columns to return from it).
- */
-typedef struct GDEFSTOR_QueryRows {
-  uint64_t total;       ///< Matches before the offset and the limit.
-  size_t count;         ///< Rows in the page.
-  char ** entities;     ///< Entity arguments, `count` of them.
-  size_t * entity_lens; ///< Their lengths.
-  uint8_t ** rows;      ///< Encoded rows, `count` of them.
-  size_t * row_lens;    ///< Their lengths.
-} GDEFSTOR_QueryRows;
-
-/**
- * @brief The key prefix of every row of a projection type, colon included.
- *
- * @param alloc The store's allocator, or NULL.
- * @param out_prefix Receives a fresh string; free it with the allocator.
- */
-GDEFSTOR_API GDEFSTOR_Result gdefstor_projection_key_prefix(
-    const GDEFSTOR_Allocator * alloc, const char * type, size_t type_len,
-    char ** out_prefix, size_t * out_len);
-
-/** @brief The key of one projection row. Free with the allocator. */
-GDEFSTOR_API GDEFSTOR_Result gdefstor_projection_key(
-    const GDEFSTOR_Allocator * alloc, const char * type, size_t type_len,
-    const char * entity, size_t entity_len, char ** out_key, size_t * out_len);
-
-/**
- * @brief The entity argument inside a key that starts with the @p prefix_len
- * bytes of gdefstor_projection_key_prefix().
- *
- * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_CORRUPT for a key that is not hex.
- */
-GDEFSTOR_API GDEFSTOR_Result gdefstor_projection_key_entity(
-    const GDEFSTOR_Allocator * alloc, const char * key, size_t key_len,
-    size_t prefix_len, char ** out_entity, size_t * out_len);
-
-/** One encoded row, borrowed. `bytes` NULL is a row that is not there. */
-typedef struct GDEFSTOR_QueryRowRef {
-  const uint8_t * bytes; ///< The encoded projection, or NULL when absent.
-  size_t len;            ///< Its length.
-} GDEFSTOR_QueryRowRef;
-
-/**
- * The rows a node can look at: the queried row, the row of the left
- * operand's `join_type` and that of the right's, all with this entity.
- */
-typedef struct GDEFSTOR_QueryEnv {
-  GDEFSTOR_QueryRowRef main;       ///< The queried row (inside an EXISTS, the other type's).
-  GDEFSTOR_QueryRowRef left_join;  ///< The left operand's joined row, of its own row's entity.
-  GDEFSTOR_QueryRowRef right_join; ///< The right operand's joined row, likewise.
-  const uint8_t * entity;          ///< The entity argument.
-  size_t entity_len;               ///< Its length.
-  GDEFSTOR_QueryRowRef outer;      ///< Inside an EXISTS: the row it is decided for.
-  const uint8_t * outer_entity;    ///< Inside an EXISTS: that row's entity argument.
-  size_t outer_entity_len;         ///< Its length.
-} GDEFSTOR_QueryEnv;
-
-/**
- * @brief Whether a comparison node holds on a row.
- *
- * The reference meaning of EQ, NE, IN, LT, LE, GT and GE. The tree walk above
- * it is the backend's. The constants are taken from the node.
- */
-GDEFSTOR_API GDEFSTOR_Result gdefstor_query_leaf(
-    const GDEFSTOR_Allocator * alloc, const GDEFSTOR_QueryNode * node,
-    const GDEFSTOR_QueryEnv * env, int * out_holds);
-
-/** A sort key, computed. */
-typedef struct GDEFSTOR_QueryKey {
-  int present;        ///< 0 is "none", which sorts first.
-  int is_int;         ///< The key is @ref value.
-  int64_t value;      ///< A numeric key that parsed.
-  uint8_t * bytes;    ///< A text key, owned.
-  size_t len;         ///< Its length.
-} GDEFSTOR_QueryKey;
-
-/** @brief Compute the key of one sort for a row. Free with gdefstor_query_key_free(). */
-GDEFSTOR_API GDEFSTOR_Result gdefstor_query_key_make(
-    const GDEFSTOR_Allocator * alloc, const GDEFSTOR_QuerySort * sort,
-    const GDEFSTOR_QueryEnv * env, GDEFSTOR_QueryKey * out);
-
-/** @brief Compare two keys of one sort, ascending: negative, 0 or positive. */
-GDEFSTOR_API int gdefstor_query_key_compare(const GDEFSTOR_QuerySort * sort,
-    const GDEFSTOR_QueryKey * a, const GDEFSTOR_QueryKey * b);
-
-/** @brief Release a key's bytes. */
-GDEFSTOR_API void gdefstor_query_key_free(const GDEFSTOR_Allocator * alloc,
-    GDEFSTOR_QueryKey * key);
-
-/**
- * @brief The first text of a select operand on a row.
- *
- * @param out_bytes A fresh copy; free with the allocator. NULL when absent.
- */
-GDEFSTOR_API GDEFSTOR_Result gdefstor_query_first_text(
-    const GDEFSTOR_Allocator * alloc, const GDEFSTOR_QueryOperand * operand,
-    const GDEFSTOR_QueryEnv * env, int * out_present, uint8_t ** out_bytes,
-    size_t * out_len);
 
 #ifdef __cplusplus
 }

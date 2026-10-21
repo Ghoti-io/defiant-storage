@@ -25,20 +25,16 @@
  *
  * This is the port the entity layer speaks (AD-13, AD-14): entities of
  * declared types, each with one linear revision history of a typed, nested
- * field tree. It sits beside the key/bytes API of store.h, projection.h and
- * revision.h, which keeps working unchanged until the contract story. The
- * model, its limits and the reasons for each rule are in
- * documentation/model.md; what follows is the contract per call.
+ * field tree, and records, counters and an outbox beside them. It is the
+ * port's one storage model. The model, its limits and the reasons for each
+ * rule are in documentation/model.md; what follows is the contract per call.
  *
- * A store has this port when it was opened with gdefstor_store_create_model()
- * (the memory backend does). On any other store every call here is
- * ::GDEFSTOR_ERR_UNSUPPORTED.
+ * A store is opened with gdefstor_store_open() over a backend
+ * (model_backend.h).
  *
  * Writes take a GDEFSTOR_Write: the tenant's writer queue and one backend
- * transaction. A write holds either key/bytes rows or entity operations, not
- * both; a mix is ::GDEFSTOR_ERR_INVALID. Records, counters and the outbox
- * (below) are entity operations: they commit in the entity transaction. A
- * call that fails before it reached the
+ * transaction. Records, counters and the outbox (below) commit in that
+ * transaction with the entities. A call that fails before it reached the
  * backend leaves the write as it was; one that fails after (an I/O error, a
  * full allocator) marks the write broken, and its commit aborts and returns
  * that error. Reads take the store and the tenant and see the last commit.
@@ -113,31 +109,18 @@ extern "C" {
 struct GDEFSTOR_ModelBackend;
 
 /**
- * @brief Open a store over a key/bytes backend and an entity backend.
+ * @brief Open a store over an entity backend.
  *
- * As gdefstor_store_create(), and the entity port of this header is served by
- * @p model (model_backend.h). Both are copied; each `ctx` is borrowed until
- * gdefstor_store_destroy(), which destroys both.
+ * @p model is copied, its `ctx` borrowed until gdefstor_store_destroy(),
+ * which destroys it.
  *
- * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (a required function missing,
- *   or a @ref GDEFSTOR_ModelBackend::size that is not this header's), or
- *   ::GDEFSTOR_ERR_OOM.
- */
-GDEFSTOR_API GDEFSTOR_Result gdefstor_store_create_model(
-    const GDEFSTOR_Backend * backend, const struct GDEFSTOR_ModelBackend * model,
-    const GDEFSTOR_Allocator * allocator, const GDEFSTOR_Limits * limits,
-    GDEFSTOR_Store ** out_store);
-
-/**
- * @brief Open a store over an entity backend alone.
- *
- * As gdefstor_store_create_model() with a key/bytes backend that holds
- * nothing: a read of a key/bytes row finds none, and the commit of a write
- * that holds one is ::GDEFSTOR_ERR_UNSUPPORTED. @p model is copied, its `ctx`
- * borrowed until
- * gdefstor_store_destroy(), which destroys it.
- *
- * @return As gdefstor_store_create_model().
+ * @param model Required: every required member set, and @ref
+ *   GDEFSTOR_ModelBackend::size this header's (model_backend.h).
+ * @param allocator NULL uses the default.
+ * @param limits NULL uses gdefstor_limits_default().
+ * @param out_store Receives the store on success. Not written on failure.
+ * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (a required member missing,
+ *   an optional family half set, or another size), or ::GDEFSTOR_ERR_OOM.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_store_open(
     const struct GDEFSTOR_ModelBackend * model,
@@ -296,8 +279,7 @@ typedef enum GDEFSTOR_IndexState {
  *
  * @param out_state Receives a ::GDEFSTOR_IndexState. Written only on success.
  * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (a type never declared, a path
- *   it does not have, a NULL argument), ::GDEFSTOR_ERR_UNSUPPORTED (a store
- *   without the entity port), or a backend's error.
+ *   it does not have, a NULL argument), or a backend's error.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_type_index_state(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * type, size_t type_len,
@@ -885,8 +867,8 @@ typedef struct GDEFSTOR_BlindHit {
  * @return ::GDEFSTOR_OK (no hit is success), ::GDEFSTOR_ERR_INVALID (a type
  *   never declared, a path that is not a personal scalar field, a MAC that is
  *   not ::GDEFSTOR_BLIND_MAC_BYTES bytes, a NULL argument),
- *   ::GDEFSTOR_ERR_UNSUPPORTED (a store without the entity port or whose
- *   backend has no blind table), ::GDEFSTOR_ERR_OOM, or a backend's error.
+ *   ::GDEFSTOR_ERR_UNSUPPORTED (a backend that has no blind table),
+ *   ::GDEFSTOR_ERR_OOM, or a backend's error.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_blind_history(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * type, size_t type_len,
@@ -1007,8 +989,6 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_blind_put(GDEFSTOR_Write * write,
  * Three families that live in the entity write beside entities, so that one
  * GDEFSTOR_Write commits an entity save, a record, a counter and an outbox row
  * together or none of them (model.md, "Records, counters and the outbox").
- * They are the entity side of a write: a write that holds key/bytes rows
- * refuses them, as it refuses every entity operation.
  *
  * Names: a record's namespace, a counter's name and an outbox stream are 1 to
  * ::GDEFSTOR_SYSTEM_MAX_NAME_BYTES bytes of `[A-Za-z0-9_.:-]`; a record's key is

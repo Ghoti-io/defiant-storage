@@ -1189,51 +1189,12 @@ extern "C" GDEFSTOR_Result ModelOpen(GDEFSTOR_Store ** out,
     const GDEFSTOR_Allocator * alloc);
 extern "C" void ModelClose(GDEFSTOR_Store * store);
 
-/* The key/bytes half: the port's tests already cover it with their own
- * scratch backend; this store needs one only because the port opens over
- * both. A bag that holds nothing is enough. */
-extern "C" {
-static void kb_destroy(void * ctx) {
-  (void)ctx;
-}
-static GDEFSTOR_Result kb_put(void * ctx, const char * t, size_t tl,
-    const char * k, size_t kl, const uint8_t * b, size_t n) {
-  (void)ctx; (void)t; (void)tl; (void)k; (void)kl; (void)b; (void)n;
-  return GDEFSTOR_ERR_IO;
-}
-static GDEFSTOR_Result kb_get(void * ctx, const char * t, size_t tl,
-    const char * k, size_t kl, uint8_t ** out, size_t * n) {
-  (void)ctx; (void)t; (void)tl; (void)k; (void)kl; (void)out; (void)n;
-  return GDEFSTOR_ERR_INVALID;
-}
-static GDEFSTOR_Result kb_remove(void * ctx, const char * t, size_t tl,
-    const char * k, size_t kl) {
-  (void)ctx; (void)t; (void)tl; (void)k; (void)kl;
-  return GDEFSTOR_ERR_INVALID;
-}
-static GDEFSTOR_Result kb_list(void * ctx, const char * t, size_t tl,
-    const char * p, size_t pl, char *** keys, size_t ** lens, size_t * n) {
-  (void)ctx; (void)t; (void)tl; (void)p; (void)pl;
-  *keys = nullptr;
-  *lens = nullptr;
-  *n = 0;
-  return GDEFSTOR_OK;
-}
-}
-
-/* The two backends of a scratch store, owning a new Scratch. */
-static void ScratchBackends(const GDEFSTOR_Allocator * alloc,
-    GDEFSTOR_Backend * out_kb, GDEFSTOR_ModelBackend * out_mb) {
-  GDEFSTOR_Backend & kb = *out_kb;
+/* The backend of a scratch store, owning a new Scratch. */
+static void ScratchBackend(const GDEFSTOR_Allocator * alloc,
+    GDEFSTOR_ModelBackend * out_mb) {
   GDEFSTOR_ModelBackend & mb = *out_mb;
   Scratch * s = new Scratch();
   s->alloc = alloc == nullptr ? gdefstor_allocator_default() : alloc;
-  std::memset(&kb, 0, sizeof kb);
-  kb.destroy = kb_destroy;
-  kb.put = kb_put;
-  kb.get = kb_get;
-  kb.remove = kb_remove;
-  kb.list = kb_list;
   std::memset(&mb, 0, sizeof mb);
   mb.size = sizeof mb;
   mb.ctx = s;
@@ -1280,9 +1241,8 @@ static void ScratchBackends(const GDEFSTOR_Allocator * alloc,
 
 GDEFSTOR_Result ModelOpen(GDEFSTOR_Store ** out,
     const GDEFSTOR_Allocator * alloc) {
-  GDEFSTOR_Backend kb;
   GDEFSTOR_ModelBackend mb;
-  ScratchBackends(alloc, &kb, &mb);
+  ScratchBackend(alloc, &mb);
   GDEFSTOR_Result rc = gdefstor_store_open(&mb, alloc, nullptr, out);
   if (rc != GDEFSTOR_OK) {
     mb.destroy(mb.ctx);
@@ -1296,40 +1256,17 @@ void ModelClose(GDEFSTOR_Store * store) {
 
 #include "model.inc"
 
-/* A store opened over the entity backend alone holds no key/bytes row: a
- * read finds none and a write that stages one is refused, while the entity
- * port in the same store works. */
-TEST(ModelPort, AStoreOverTheEntityBackendAloneHoldsNoKeyBytesRow) {
-  GDEFSTOR_Store * store = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, ModelOpen(&store, nullptr));
-  GDEFSTOR_Write * w = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, "t1", 2, nullptr, &w));
-  const uint8_t body[] = {'x'};
-  EXPECT_EQ(GDEFSTOR_OK, gdefstor_blob_put(w, "ab", 2, body, sizeof body));
-  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_write_commit(w));
-  uint8_t * got = nullptr;
-  size_t got_len = 0;
-  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_blob_get(store, "t1", 2, "ab", 2,
-      &got, &got_len));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, "t1", 2, nullptr, &w));
-  EXPECT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "a", 1, "b", 1,
-      body, sizeof body));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(w));
-  ModelClose(store);
-}
-
 /* A backend of the size before records, counters and the outbox: those calls
  * are refused as unsupported and nothing else changes; and a backend with
  * some of the members and not all is refused when the store is opened. */
 TEST(ModelPort, ABackendWithoutTheSystemFamiliesServesTheRest) {
-  GDEFSTOR_Backend kb;
   GDEFSTOR_ModelBackend mb;
-  ScratchBackends(nullptr, &kb, &mb);
+  ScratchBackend(nullptr, &mb);
   GDEFSTOR_ModelBackend v3 = mb;
   v3.destroy = [](void *) {}; /* the last store below destroys the Scratch */
   v3.size = GDEFSTOR_MODEL_BACKEND_SIZE_V3;
   GDEFSTOR_Store * old = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_create_model(&kb, &v3, nullptr,
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_open(&v3, nullptr,
       nullptr, &old));
   GDEFSTOR_Write * w = nullptr;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(old, "t1", 2, nullptr, &w));
@@ -1353,9 +1290,9 @@ TEST(ModelPort, ABackendWithoutTheSystemFamiliesServesTheRest) {
   gdefstor_store_destroy(old);
   GDEFSTOR_ModelBackend part = mb;
   part.outbox_parked = nullptr;
-  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_store_create_model(&kb, &part,
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_store_open(&part,
       nullptr, nullptr, &old));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_create_model(&kb, &mb, nullptr,
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_open(&mb, nullptr,
       nullptr, &old));
   gdefstor_store_destroy(old); /* destroys the backends, once */
 }
@@ -1364,14 +1301,13 @@ TEST(ModelPort, ABackendWithoutTheSystemFamiliesServesTheRest) {
  * refuses the put as unsupported; a put without a blind table is refused when
  * the store is opened. */
 TEST(ModelPort, ABackendWithoutBlindPutRefusesOnlyThePut) {
-  GDEFSTOR_Backend kb;
   GDEFSTOR_ModelBackend mb;
-  ScratchBackends(nullptr, &kb, &mb);
+  ScratchBackend(nullptr, &mb);
   GDEFSTOR_ModelBackend v6 = mb;
   v6.destroy = [](void *) {}; /* the last store below destroys the Scratch */
   v6.size = GDEFSTOR_MODEL_BACKEND_SIZE_V6;
   GDEFSTOR_Store * old = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_create_model(&kb, &v6, nullptr,
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_open(&v6, nullptr,
       nullptr, &old));
   GDEFSTOR_Write * w = nullptr;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(old, "t1", 2, nullptr, &w));
@@ -1391,9 +1327,9 @@ TEST(ModelPort, ABackendWithoutBlindPutRefusesOnlyThePut) {
   lone.blind_history = nullptr;
   lone.subject_lookup = nullptr;
   lone.blind_delete = nullptr;
-  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_store_create_model(&kb, &lone,
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_store_open(&lone,
       nullptr, nullptr, &old));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_create_model(&kb, &mb, nullptr,
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_open(&mb, nullptr,
       nullptr, &old));
   gdefstor_store_destroy(old); /* destroys the backends, once */
 }

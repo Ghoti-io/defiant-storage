@@ -21,17 +21,13 @@
 /**
  * @file
  *
- * Allocator helpers, storage keys and the planted-defect switches.
+ * Allocator helpers and the text buffers the formats are written with.
  */
 
 #include "internal.h"
 
 #include <ghoti.io/cutil/allocator.h>
 #include <string.h>
-
-int gdefstor_plant_see_uncommitted = 0; /* plant:isolation */
-int gdefstor_plant_keep_outbox = 0; /* plant:outbox-abort */
-int gdefstor_plant_enforce_limit = 1; /* plant:limit */
 
 const GDEFSTOR_Allocator * gdefstor_alloc(const GDEFSTOR_Allocator * in) {
   if (in != NULL) {
@@ -74,64 +70,6 @@ void gdefstor_limits_resolve(const GDEFSTOR_Limits * in,
 
 int gdefstor_span_ok(const char * p, size_t n, size_t cap) {
   return p != NULL && n > 0 && n <= cap;
-}
-
-static char gdefstor_hex_digit(unsigned v) {
-  return (char)(v < 10 ? '0' + v : 'a' + (v - 10));
-}
-
-GDEFSTOR_Result gdefstor_key_hex(const GDEFSTOR_Allocator * alloc,
-    const char * prefix, const char * a, size_t a_len, const char * b,
-    size_t b_len, int with_b, char ** out, size_t * out_len) {
-  size_t prefix_len;
-  size_t need;
-  size_t i;
-  char * key;
-
-  if (prefix == NULL || a == NULL || out == NULL || out_len == NULL) {
-    return GDEFSTOR_ERR_INVALID;
-  }
-  prefix_len = strlen(prefix);
-  if (a_len > SIZE_MAX / 2 || prefix_len > SIZE_MAX - a_len * 2) {
-    return GDEFSTOR_ERR_LIMIT;
-  }
-  need = prefix_len + a_len * 2;
-  if (with_b) {
-    if (b == NULL) {
-      return GDEFSTOR_ERR_INVALID;
-    }
-    if (b_len > SIZE_MAX / 2 || need > SIZE_MAX - 1 ||
-        b_len * 2 > SIZE_MAX - 1 - need) {
-      return GDEFSTOR_ERR_LIMIT;
-    }
-    need += 1 + b_len * 2;
-  }
-  if (need > SIZE_MAX - 1) {
-    return GDEFSTOR_ERR_LIMIT;
-  }
-  key = (char *)gdefstor_mem(alloc, need + 1);
-  if (key == NULL) {
-    return GDEFSTOR_ERR_OOM;
-  }
-  memcpy(key, prefix, prefix_len);
-  for (i = 0; i < a_len; i++) {
-    unsigned char c = (unsigned char)a[i];
-    key[prefix_len + i * 2] = gdefstor_hex_digit(c >> 4);
-    key[prefix_len + i * 2 + 1] = gdefstor_hex_digit(c & 0x0fu);
-  }
-  if (with_b) {
-    size_t at = prefix_len + a_len * 2;
-    key[at] = ':';
-    for (i = 0; i < b_len; i++) {
-      unsigned char c = (unsigned char)b[i];
-      key[at + 1 + i * 2] = gdefstor_hex_digit(c >> 4);
-      key[at + 1 + i * 2 + 1] = gdefstor_hex_digit(c & 0x0fu);
-    }
-  }
-  key[need] = '\0';
-  *out = key;
-  *out_len = need;
-  return GDEFSTOR_OK;
 }
 
 GDEFSTOR_Result gdefstor_buf_append(char ** buf, size_t * len, size_t * cap,

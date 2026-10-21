@@ -42,18 +42,13 @@ static int same_span(const char * a, size_t an, const char * b, size_t bn) {
 /* ---- the store and the write --------------------------------------------- */
 
 GDEFSTOR_Result gdefstor_model_ready(const GDEFSTOR_Store * store) {
-  if (store == NULL) {
-    return GDEFSTOR_ERR_INVALID;
-  }
-  return store->has_model ? GDEFSTOR_OK : GDEFSTOR_ERR_UNSUPPORTED;
+  return store == NULL ? GDEFSTOR_ERR_INVALID : GDEFSTOR_OK;
 }
 
-GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
-    const GDEFSTOR_ModelBackend * model, const GDEFSTOR_Allocator * allocator,
-    const GDEFSTOR_Limits * limits, GDEFSTOR_Store ** out_store) {
-  GDEFSTOR_Store * store = NULL;
+GDEFSTOR_Result gdefstor_store_open(const GDEFSTOR_ModelBackend * model,
+    const GDEFSTOR_Allocator * allocator, const GDEFSTOR_Limits * limits,
+    GDEFSTOR_Store ** out_store) {
   GDEFSTOR_ModelBackend copy;
-  GDEFSTOR_Result rc;
   if (model == NULL || out_store == NULL ||
       (model->size != sizeof(GDEFSTOR_ModelBackend) &&
           model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V1 &&
@@ -115,98 +110,19 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
   if (copy.blind_put != NULL && copy.blind_history == NULL) {
     return GDEFSTOR_ERR_INVALID;
   }
-  rc = gdefstor_store_create(backend, allocator, limits, &store);
-  if (rc != GDEFSTOR_OK) {
-    return rc;
-  }
-  store->model = copy;
-  store->has_model = 1;
-  *out_store = store;
-  return GDEFSTOR_OK;
-}
-
-/* The key/bytes backend of a store opened over an entity backend alone: it
- * holds nothing, and refuses to keep anything. */
-static void none_destroy(void * ctx) {
-  (void)ctx;
-}
-
-static GDEFSTOR_Result none_put(void * ctx, const char * tenant,
-    size_t tenant_len, const char * key, size_t key_len, const uint8_t * bytes,
-    size_t len) {
-  (void)ctx;
-  (void)tenant;
-  (void)tenant_len;
-  (void)key;
-  (void)key_len;
-  (void)bytes;
-  (void)len;
-  return GDEFSTOR_ERR_UNSUPPORTED;
-}
-
-static GDEFSTOR_Result none_get(void * ctx, const char * tenant,
-    size_t tenant_len, const char * key, size_t key_len, uint8_t ** out_bytes,
-    size_t * out_len) {
-  (void)ctx;
-  (void)tenant;
-  (void)tenant_len;
-  (void)key;
-  (void)key_len;
-  *out_bytes = NULL;
-  *out_len = 0;
-  return GDEFSTOR_ERR_INVALID;
-}
-
-static GDEFSTOR_Result none_remove(void * ctx, const char * tenant,
-    size_t tenant_len, const char * key, size_t key_len) {
-  (void)ctx;
-  (void)tenant;
-  (void)tenant_len;
-  (void)key;
-  (void)key_len;
-  return GDEFSTOR_OK;
-}
-
-static GDEFSTOR_Result none_list(void * ctx, const char * tenant,
-    size_t tenant_len, const char * prefix, size_t prefix_len,
-    char *** out_keys, size_t ** out_key_lens, size_t * out_count) {
-  (void)ctx;
-  (void)tenant;
-  (void)tenant_len;
-  (void)prefix;
-  (void)prefix_len;
-  *out_keys = NULL;
-  *out_key_lens = NULL;
-  *out_count = 0;
-  return GDEFSTOR_OK;
-}
-
-GDEFSTOR_Result gdefstor_store_open(const GDEFSTOR_ModelBackend * model,
-    const GDEFSTOR_Allocator * allocator, const GDEFSTOR_Limits * limits,
-    GDEFSTOR_Store ** out_store) {
-  GDEFSTOR_Backend none;
-  memset(&none, 0, sizeof none);
-  none.destroy = none_destroy;
-  none.put = none_put;
-  none.get = none_get;
-  none.remove = none_remove;
-  none.list = none_list;
-  return gdefstor_store_create_model(&none, model, allocator, limits,
-      out_store);
+  return gdefstor_store_create_on(&copy, allocator, limits, out_store);
 }
 
 int gdefstor_model_has_blind(const GDEFSTOR_Store * store) {
-  return store != NULL && store->has_model &&
-         store->model.blind_history != NULL;
+  return store != NULL && store->model.blind_history != NULL;
 }
 
 int gdefstor_model_has_sys(const GDEFSTOR_Store * store) {
-  return store != NULL && store->has_model && store->model.record_put != NULL;
+  return store != NULL && store->model.record_put != NULL;
 }
 
 int gdefstor_model_has_restore(const GDEFSTOR_Store * store) {
-  return store != NULL && store->has_model &&
-         store->model.restore_revision != NULL;
+  return store != NULL && store->model.restore_revision != NULL;
 }
 
 int gdefstor_model_has_personal(const GDEFSTOR_Type * t) {
@@ -226,16 +142,8 @@ GDEFSTOR_Result gdefstor_model_txn(GDEFSTOR_Write * write, void ** out_txn) {
     return GDEFSTOR_ERR_INVALID;
   }
   store = write->store;
-  if (!store->has_model) {
-    return GDEFSTOR_ERR_UNSUPPORTED;
-  }
   if (write->model_broken != GDEFSTOR_OK) {
     return write->model_broken;
-  }
-  /* Key/bytes rows commit through the other backend; one write is one
-   * transaction, so it holds one kind or the other. */
-  if (write->head != NULL) {
-    return GDEFSTOR_ERR_INVALID;
   }
   if (write->model_txn == NULL) {
     void * txn = NULL;

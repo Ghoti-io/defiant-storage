@@ -55,6 +55,7 @@
 #include <ghoti.io/archive/sink.h>
 #include <ghoti.io/archive/stream.h>
 #include <ghoti.io/archive/writer.h>
+#include <ghoti.io/cutil/fiber.h>
 
 #include "snapshot_fixture.inc"
 
@@ -3836,20 +3837,103 @@ TEST_F(ModelWrite, AbortLeavesNothing) {
   EXPECT_EQ(2u, Head("po1"));
 }
 
-TEST_F(ModelWrite, KeyBytesRowsAndEntityOperationsDoNotMix) {
-  SetUpPo();
+/* ---- the writer queue ------------------------------------------------------ */
+
+/* Writes to one tenant are serializable (store.h): a second writer on a fiber
+ * parks until the first commits or aborts, and then sees what it committed;
+ * a caller that is not a fiber is told the tenant is busy; another tenant's
+ * writer never waits. */
+class ModelWriters : public ModelTest {
+ public:
+  struct Park {
+    GDEFSTOR_Store * store = nullptr;
+    GDEFSTOR_Result begin_rc = GDEFSTOR_RESULT_COUNT;
+    GDEFSTOR_Result get_rc = GDEFSTOR_RESULT_COUNT;
+    int found = -1;
+  };
+
+  static void ParkEntry(void * arg) {
+    Park * park = static_cast<Park *>(arg);
+    GDEFSTOR_Write * w = nullptr;
+    park->begin_rc = gdefstor_write_begin(park->store, kTenant, 2, nullptr, &w);
+    if (park->begin_rc != GDEFSTOR_OK) {
+      return;
+    }
+    uint8_t * bytes = nullptr;
+    size_t len = 0;
+    park->get_rc = gdefstor_record_get(park->store, kTenant, 2, "core.q", 6,
+        "k", 1, &park->found, &bytes, &len);
+    gdefstor_bytes_free(nullptr, bytes);
+    gdefstor_write_abort(w);
+  }
+
+  GDEFSTOR_Result Hold(GDEFSTOR_Write ** out) {
+    GDEFSTOR_Result rc = gdefstor_write_begin(store, kTenant, 2, nullptr, out);
+    if (rc == GDEFSTOR_OK) {
+      rc = gdefstor_record_put(*out, "core.q", 6, "k", 1,
+          reinterpret_cast<const uint8_t *>("v"), 1);
+    }
+    return rc;
+  }
+
+  int Found() {
+    uint8_t * bytes = nullptr;
+    size_t len = 0;
+    int found = -1;
+    EXPECT_EQ(GDEFSTOR_OK, gdefstor_record_get(store, kTenant, 2, "core.q", 6,
+        "k", 1, &found, &bytes, &len));
+    gdefstor_bytes_free(nullptr, bytes);
+    return found;
+  }
+};
+
+TEST_F(ModelWriters, ASecondWriterOnAFiberParksUntilTheFirstCommits) {
   GDEFSTOR_Write * w = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, kTenant, 2, nullptr, &w));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_set_state(w, "po1", 3, 1, 0, "", 0, 1,
-      nullptr));
-  const uint8_t blob[] = {1, 2};
-  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_blob_put(w, "ab", 2, blob, 2));
+  ASSERT_EQ(GDEFSTOR_OK, Hold(&w));
+  Park park;
+  park.store = store;
+  GCU_Fiber * fiber = nullptr;
+  ASSERT_EQ(GCU_FIBER_OK, gcu_fiber_create(&fiber, ParkEntry, &park,
+      GCU_FIBER_DEFAULT_STACK_SIZE, nullptr));
+  ASSERT_EQ(GCU_FIBER_OK, gcu_fiber_switch_to(fiber));
+  EXPECT_EQ(GDEFSTOR_RESULT_COUNT, park.begin_rc) << "the second writer ran";
+  EXPECT_EQ(0, Found());
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(w));
+  EXPECT_EQ(GDEFSTOR_OK, park.begin_rc);
+  EXPECT_EQ(GDEFSTOR_OK, park.get_rc);
+  EXPECT_EQ(1, park.found);
+  gcu_fiber_destroy(fiber);
+}
+
+TEST_F(ModelWriters, AnAbortWakesTheParkedWriterToNothing) {
+  GDEFSTOR_Write * w = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, Hold(&w));
+  Park park;
+  park.store = store;
+  GCU_Fiber * fiber = nullptr;
+  ASSERT_EQ(GCU_FIBER_OK, gcu_fiber_create(&fiber, ParkEntry, &park,
+      GCU_FIBER_DEFAULT_STACK_SIZE, nullptr));
+  ASSERT_EQ(GCU_FIBER_OK, gcu_fiber_switch_to(fiber));
+  EXPECT_EQ(GDEFSTOR_RESULT_COUNT, park.begin_rc);
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(w));
+  EXPECT_EQ(GDEFSTOR_OK, park.begin_rc);
+  EXPECT_EQ(GDEFSTOR_OK, park.get_rc);
+  EXPECT_EQ(0, park.found);
+  gcu_fiber_destroy(fiber);
+}
+
+TEST_F(ModelWriters, AWriterThatIsNotAFiberIsToldTheTenantIsBusy) {
+  GDEFSTOR_Write * w = nullptr;
+  GDEFSTOR_Write * second = nullptr;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, kTenant, 2, nullptr, &w));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_blob_put(w, "ab", 2, blob, 2));
-  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_entity_set_state(w, "po1", 3, 0, 0,
-      "", 0, 1, nullptr));
-  gdefstor_write_abort(w);
+  EXPECT_EQ(GDEFSTOR_ERR_BUSY,
+      gdefstor_write_begin(store, kTenant, 2, nullptr, &second));
+  GDEFSTOR_Write * other = nullptr;
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, "t2", 2, nullptr, &other));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(other));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(w));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, kTenant, 2, nullptr, &w));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(w));
 }
 
 /* ---- the purchase order end to end --------------------------------------- */

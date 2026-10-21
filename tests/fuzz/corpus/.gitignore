@@ -6,6 +6,5 @@
 *
 !.gitignore
 !*/
-!revision/hello.json
 !snapshot/empty.zip
 !*/*.seed

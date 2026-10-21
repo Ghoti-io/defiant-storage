@@ -1,9 +1,9 @@
 # The entity port
 
 **Status:** describes what is built: the entity port of `model.h`, its
-query form, its backend interface and the key store port. It sits beside the
-key/bytes API (`store.h`, `projection.h`, `revision.h`), which keeps working
-unchanged until that API is removed.
+query form, its backend interface and the key store port. It is the port's
+one storage model: the key/bytes API that stood beside it (projections,
+revision documents, blobs and the old outbox) was removed in story S9.
 
 The port speaks entities, revisions, fields and queries, never keys and
 encoded bytes, and no SQL. Each backend chooses its physical schema; the rows
@@ -316,8 +316,7 @@ Core writes more than entities in one transaction: system records (installed
 and enabled modules, machine-name maps), the config epoch (AD-31) and outbox
 rows (AD-33). These three families live in the entity write, so one
 `GDEFSTOR_Write` commits an entity save, a record put, a counter's next value
-and an outbox append together, or none of them. They are entity operations:
-a write that holds key/bytes rows refuses them, and the reverse.
+and an outbox append together, or none of them.
 
 Names are machine-name-like text that compares by bytes: a record's
 namespace, a counter's name and an outbox stream are 1 to 128 bytes of
@@ -516,10 +515,8 @@ creators, actors and subjects are held to `GDEFSTOR_Limits::max_public_id_bytes`
 Entity operations take a `GDEFSTOR_Write`: the tenant's writer queue and one
 backend transaction, opened by the first operation. Reads take the store and
 see the last commit, also while a write of the same tenant is open; inside a
-write, each operation sees the write's own earlier ones. A write holds either
-key/bytes rows (blobs, the outbox, projections, revision documents) or entity
-operations, not both: the two go to different backends and nothing commits
-across two. An operation refused before it reached the backend leaves the
+write, each operation sees the write's own earlier ones. An operation
+refused before it reached the backend leaves the
 write usable; one that failed after (an I/O error, a full allocator) marks it
 broken, and its commit aborts and returns that error. Records, counters and
 outbox appends are entity operations; the outbox's claim, delivery and

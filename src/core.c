@@ -66,8 +66,6 @@ void gdefstor_limits_default(GDEFSTOR_Limits * limits) {
   if (limits == NULL) {
     return;
   }
-  limits->max_document_bytes = 1024u * 1024u;
-  limits->max_blob_bytes = 16u * 1024u * 1024u;
   limits->max_member_bytes = 16u * 1024u * 1024u;
   limits->max_members = 100000u;
   limits->max_snapshot_bytes = 64u * 1024u * 1024u;
@@ -75,18 +73,7 @@ void gdefstor_limits_default(GDEFSTOR_Limits * limits) {
   limits->max_public_id_bytes = 256u;
   limits->max_tenant_bytes = 256u;
   limits->max_type_bytes = 256u;
-  limits->max_body_bytes = 4096u;
-  limits->max_hash_bytes = 128u;
   limits->max_json_depth = 32u;
-  limits->max_columns = 64u;
-  limits->max_column_name_bytes = 128u;
-  limits->max_column_value_bytes = 1024u * 1024u;
-  limits->max_outbox_payload_bytes = 1024u * 1024u;
-  limits->max_stream_bytes = 256u;
-  limits->max_revisions = 100000u;
-  limits->max_blobs = 100000u;
-  limits->max_projections = 100000u;
-  limits->max_outbox_rows = 100000u;
 }
 
 void gdefstor_bytes_free(const GDEFSTOR_Allocator * allocator, void * bytes) {

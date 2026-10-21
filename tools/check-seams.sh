@@ -5,8 +5,8 @@
 # Fail if one subsystem of defiant-storage includes another's private header.
 #
 # src/internal.h is shared by every translation unit of the library by design
-# (blob, outbox, projection, revision, snapshot, store and util are one
-# subsystem each, over one set of helpers). It is private to the library: the
+# (snapshot, store and util are one subsystem each, over one set of
+# helpers). It is private to the library: the
 # public headers, the examples, the tests and the fuzzers must not include it,
 # and neither may a header or source of another library.
 #
@@ -30,7 +30,7 @@ ROOT="${1:?usage: check-seams.sh <root>}"
 
 owners_of() {
   case "$1" in
-    internal.h) printf '%s\n' 'blob.c outbox.c projection.c query.c revision.c snapshot.c store.c util.c core.c' ;;
+    internal.h) printf '%s\n' 'snapshot.c store.c util.c core.c' ;;
     model_internal.h) printf '%s\n' 'blind.c keystore.c model.c model_query.c model_snapshot.c query.c system.c tree.c type.c value.c' ;;
     *) printf '\n' ;;
   esac
@@ -109,7 +109,7 @@ trap 'rm -rf "$plant"' EXIT
 mkdir -p "$plant/src" "$plant/include/ghoti.io/defiant-storage" "$plant/tests" "$plant/examples"
 printf '%s\n' '/* private */' > "$plant/src/internal.h"
 printf '%s\n' '#include "internal.h"' > "$plant/src/store.c"
-printf '%s\n' '#include "internal.h"' > "$plant/src/blob.c"
+printf '%s\n' '#include "internal.h"' > "$plant/src/snapshot.c"
 printf '%s\n' '#include <ghoti.io/defiant-storage/core.h>' > "$plant/tests/test_x.cpp"
 printf '%s\n' '#include <ghoti.io/defiant-storage/store.h>' > "$plant/examples/demo.c"
 

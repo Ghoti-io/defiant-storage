@@ -20,7 +20,7 @@
 
 /**
  * @file core.h
- * @brief Result codes, limits and the caller-supplied clock.
+ * @brief Result codes and limits.
  * @stability free
  *
  * Formats are specified in documentation/formats.md.
@@ -78,27 +78,14 @@ GDEFSTOR_API const char * gdefstor_result_string(GDEFSTOR_Result result);
  * defaults passes NULL or calls gdefstor_limits_default().
  */
 typedef struct GDEFSTOR_Limits {
-  size_t max_document_bytes;      ///< One revision document.
-  size_t max_blob_bytes;          ///< One blob body.
   size_t max_member_bytes;        ///< One snapshot member's declared size.
   size_t max_members;             ///< Snapshot members, manifest included.
   size_t max_snapshot_bytes;      ///< Sum of snapshot member sizes.
   uint32_t max_zip_ratio;         ///< Uncompressed / compressed, integer.
   size_t max_public_id_bytes;     ///< A caller-supplied public id.
   size_t max_tenant_bytes;        ///< The tenant argument.
-  size_t max_type_bytes;          ///< An entity type or projection type.
-  size_t max_body_bytes;          ///< The revision `body` location string.
-  size_t max_hash_bytes;          ///< A caller-supplied blob hash.
-  size_t max_json_depth;          ///< JSON nesting, revision and outbox.
-  size_t max_columns;             ///< Columns in one projection row.
-  size_t max_column_name_bytes;   ///< One column name.
-  size_t max_column_value_bytes;  ///< One column value.
-  size_t max_outbox_payload_bytes;///< One outbox payload.
-  size_t max_stream_bytes;        ///< One outbox stream name.
-  size_t max_revisions;           ///< Revisions stored for one tenant.
-  size_t max_blobs;               ///< Blobs stored for one tenant.
-  size_t max_projections;         ///< Projection rows for one tenant.
-  size_t max_outbox_rows;         ///< Outbox rows for one tenant.
+  size_t max_type_bytes;          ///< An entity type's machine name.
+  size_t max_json_depth;          ///< JSON nesting of a snapshot's members.
 } GDEFSTOR_Limits;
 
 /**
@@ -109,18 +96,7 @@ typedef struct GDEFSTOR_Limits {
 GDEFSTOR_API void gdefstor_limits_default(GDEFSTOR_Limits * limits);
 
 /**
- * @brief The clock the caller passes. The port does not read one.
- *
- * `now_ms` returns milliseconds of whatever clock the caller means. The
- * port only subtracts those values to expire an outbox lease.
- */
-typedef struct GDEFSTOR_Clock {
-  int64_t (*now_ms)(void * ctx); ///< Required.
-  void * ctx;                    ///< Passed to now_ms. May be NULL.
-} GDEFSTOR_Clock;
-
-/**
- * @brief Release bytes returned by a get.
+ * @brief Release bytes the port returned (a record, a dump, a snapshot).
  *
  * @param allocator The allocator the store was created with, or NULL for
  *   the default. It must be the one that allocated @p bytes.

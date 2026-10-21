@@ -1242,9 +1242,6 @@ GDEFSTOR_Result gdefstor_snap_model_export(GDEFSTOR_Store * store,
   GDEFSTOR_Result rc;
   *out = NULL;
   *out_count = 0;
-  if (!store->has_model) {
-    return GDEFSTOR_OK;
-  }
   m = model_new(store->alloc);
   if (m == NULL) {
     return GDEFSTOR_ERR_OOM;
@@ -2435,9 +2432,6 @@ GDEFSTOR_Result gdefstor_snap_model_empty(GDEFSTOR_Store * store,
   GDEFSTOR_ModelVisitor v;
   GDEFSTOR_Result rc;
   *out_empty = 1;
-  if (!store->has_model) {
-    return GDEFSTOR_OK;
-  }
   memset(&p, 0, sizeof p);
   memset(&v, 0, sizeof v);
   v.ctx = &p;

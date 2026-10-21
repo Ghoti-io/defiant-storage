@@ -281,4 +281,15 @@ plant as-text-ignored src/model_query.c testModel \
   '  }
   return GDEFSTOR_OK;'
 
+# The writer queue admitting a second writer of a tenant while the first is
+# open (store.h): writes to one tenant stop being serializable.
+plant second-writer-admitted src/store.c testModel \
+  'ModelWriters.ASecondWriterOnAFiberParksUntilTheFirstCommits' \
+  '    if (!gate->held) {
+      break;
+    }' \
+  '    if (1) {
+      break;
+    }'
+
 plant_finish

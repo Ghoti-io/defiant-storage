@@ -1,47 +1,13 @@
 # Formats
 
-Writers emit the current version. A reader accepts that version and refuses
-a higher one with `GDEFSTOR_ERR_UNSUPPORTED`. An unknown format name is the
-same error. A document that is this format but wrong is `GDEFSTOR_ERR_CORRUPT`.
-Nothing over a limit is truncated: the call returns `GDEFSTOR_ERR_LIMIT`.
-
-## defiant-revision/1
-
-One JSON object, written canonically by `gdefstor_revision_write`:
-
-```json
-{"format":"defiant-revision/1","seq":1,"row":1,"entity":"<public-id>","type":"core.post","lang":{"en":{"title":["Hello"]}},"body":""}
-```
-
-`seq` and `row` are positive integers the caller supplies. `row` is the
-storage key, written in decimal. `entity` is the public id and is not the
-key. A document with no `row`, or with `row` of 0, is `GDEFSTOR_ERR_CORRUPT`
-and is not stored. The revision's identity is that sequence together with
-`row`. Appending the same identity again leaves the first document and
-returns `GDEFSTOR_ERR_INVALID`.
-
-`lang` is the language axis. Each language is an object of fields, and each
-field value is an array of strings. This story does not write a
-`{"blob":...}` member; a large value of that shape is still accepted by the
-port when a caller supplies one.
-
-An empty `body` means the body is inline in `lang`. A non-empty `body` is
-the location an archive module already chose; the port stores the string
-and does not open it.
-
-A large field value is an object whose only member is `blob`, holding the
-caller-supplied hash: `{"blob":"<hash>"}`. The port does not hash the bytes.
-
-## defiant-outbox/1
-
-```json
-{"format":"defiant-outbox/1","id":"<public-id>","stream":"<name>","seq":1,"payload":{}}
-```
-
-`seq` is assigned at commit, one higher than the highest committed sequence
-in that stream. The payload is one JSON value the caller supplied. A log
-line is that document plus a newline, written by `gdefstor_outbox_run` after
-the commit, never inside it.
+Every format here is at version 1 (AD-34: until the suite's first release a
+format is replaced in place and stays at 1). Writers write version 1, and a
+reader accepts version 1 and refuses every other with
+`GDEFSTOR_ERR_UNSUPPORTED`. An unknown format name is the same error. A
+document that is this format but wrong is `GDEFSTOR_ERR_CORRUPT`. Nothing over
+a limit is truncated: the call returns `GDEFSTOR_ERR_LIMIT`. The documents an
+entity's declaration, tree and draft are stored as (`defiant-type/1`,
+`defiant-tree/1`, `defiant-draft/1`) are in model.md.
 
 ## defiant-snapshot/1
 
@@ -154,11 +120,9 @@ values (AD-23).
 
 ## Limits
 
-`gdefstor_limits_default` sets document 1 MiB, blob and member 16 MiB,
-100000 members, snapshot total 64 MiB, zip ratio 100, public id / tenant /
-type 256, body location 4096, hash 128, JSON depth 32, 64 columns, column
-name 128, column value and outbox payload 1 MiB, stream 256, and 100000
-rows of each kind. NULL means these defaults. Zero is a real cap.
+`gdefstor_limits_default` sets member 16 MiB, 100000 members, snapshot total
+64 MiB, zip ratio 100, public id / tenant / type 256 and JSON depth 32. NULL
+means these defaults. Zero is a real cap.
 
 The zip ratio is uncompressed size divided by compressed size, integer.
 Equal to the cap is allowed. A stored member whose compressed size is 0 and
@@ -166,13 +130,8 @@ whose declared size is not is over the cap.
 
 ## Planted defects
 
-`src/util.c` holds three switches `tools/check-defects.sh` flips:
-
-- `gdefstor_plant_see_uncommitted` makes a read return an uncommitted write.
-  `ReadSnapshot.OpenWriteIsInvisible` goes red.
-- `gdefstor_plant_keep_outbox` publishes the outbox row on abort.
-  `Abort.NothingVisible` goes red.
-- `gdefstor_plant_enforce_limit` cleared skips the document-size cap.
-  `Limits.DocumentStopsAtBound` goes red.
-
-The unpatched tree passes.
+`tools/check-model.sh` plants each defect by an exact edit of a scratch copy
+of the source and requires a named test to fail; the snapshot's include a
+member written without its format (`snapshot-member-without-format`) and a
+reader that takes another version (`revision-reader-takes-another-version`,
+`snapshot-reader-takes-another-version`). The unpatched tree passes.

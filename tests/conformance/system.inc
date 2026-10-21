@@ -747,24 +747,6 @@ TEST_F(ModelSystem, RebuildLeavesRecordsCountersAndTheOutboxAlone) {
       Claim("core.bus", 10, 1000, 5));
 }
 
-TEST_F(ModelSystem, KeyBytesRowsAndTheseFamiliesDoNotMix) {
-  const uint8_t blob[] = {1, 2};
-  GDEFSTOR_Write * w = nullptr;
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, kTenant, 2, nullptr, &w));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_blob_put(w, "ab", 2, blob, 2));
-  uint64_t v = 0;
-  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_record_put(w, "core.x", 6, "k", 1,
-      blob, 2));
-  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_counter_next(w, "c", 1, &v));
-  EXPECT_EQ(GDEFSTOR_ERR_INVALID, Append(w, "core.bus", "k1"));
-  gdefstor_write_abort(w);
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, kTenant, 2, nullptr, &w));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "core.x", 6, "k", 1, blob, 2));
-  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_blob_put(w, "ab", 2, blob, 2));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(w));
-  EXPECT_EQ(std::string("\x01\x02", 2), Get("core.x", "k"));
-}
-
 /* ---- a seeded sweep against a model -------------------------------------- */
 
 /* The meaning of model.h's records, counters and outbox, written from the

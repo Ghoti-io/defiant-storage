@@ -259,12 +259,11 @@ GDEFSTOR_Result gdefstor_model_sort(const GDEFSTOR_Allocator * alloc, size_t n,
 GDEFSTOR_Result gdefstor_query_result_adopt(const GDEFSTOR_Allocator * alloc,
     GDEFSTOR_ModelHits * hits, GDEFSTOR_QueryResult ** out);
 
-/* ERR_UNSUPPORTED unless the store has the entity port. */
+/* ERR_INVALID for a NULL store. */
 GDEFSTOR_Result gdefstor_model_ready(const GDEFSTOR_Store * store);
 
 /* The write's entity transaction, opened on first use. ERR_INVALID for a
- * write that is not alive or has key/bytes rows staged; the broken error for
- * a write already broken. */
+ * write that is not alive; the broken error for a write already broken. */
 GDEFSTOR_Result gdefstor_model_txn(GDEFSTOR_Write * write, void ** out_txn);
 
 /* Mark the write broken by @p rc (an error after the backend was written). */
