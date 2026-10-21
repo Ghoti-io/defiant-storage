@@ -20,27 +20,28 @@
 
 /**
  * @file snapshot.h
- * @brief A tenant snapshot: a zip whose manifest is `defiant-snapshot`.
+ * @brief A tenant snapshot: a zip whose manifest is `defiant-snapshot/1`.
  * @stability free
  *
- * A snapshot (AD-23) is a logical export of one tenant, readable without the
- * framework, in two parts while both kinds of storage exist:
+ * A snapshot (AD-23) is a logical export of one tenant's truth, readable
+ * without the framework: what the entity port holds, read through the port -
+ * type declarations, entities with their state history, revisions with who,
+ * when and why, every item version in every language, drafts, records,
+ * counters and outbox rows - as JSON members under `model/`
+ * (documentation/formats.md). Each entity's member says its own format,
+ * `defiant-revision/1`. Derived data (current tables, the blind table,
+ * indexes) is never in it, and neither is a key: a personal value travels as
+ * it is stored, ciphertext and subject. So a snapshot of one backend imports
+ * into any other.
  *
- * - **the key/bytes rows** (store.h): members named by their storage keys
- *   (`r:`, `b:`, `p:`, `o:`), as in `defiant-snapshot/1`;
- * - **the entity part** (model.h), on a store with the entity port: the
- *   truth it holds, read through the port - type declarations, entities with
- *   their state history, revisions with who, when and why, every item
- *   version in every language, drafts, records, counters and outbox rows -
- *   as JSON members under `model/` (documentation/formats.md). Derived data
- *   (current tables, the blind table, indexes) is never in it, and neither is
- *   a key: a personal value travels as it is stored, ciphertext and subject.
- *   So a snapshot of one backend imports into any other.
+ * A member named `ledger` is a copy of an erasure ledger. It is not imported
+ * into the tenant. Import refuses any other member the manifest does not
+ * list with ::GDEFSTOR_ERR_CORRUPT and leaves the tenant unchanged. The same
+ * truth always exports to the same bytes.
  *
- * A member named `ledger` is a copy of an erasure ledger. It is not a storage
- * key and is not imported into the tenant. Import refuses any other member
- * the manifest does not list with ::GDEFSTOR_ERR_CORRUPT and leaves the
- * tenant unchanged. The same truth always exports to the same bytes.
+ * Every format here is at version 1, and a reader refuses every other
+ * version (AD-34: until the suite's first release a format is replaced in
+ * place and stays at 1).
  */
 
 #ifndef GHOTI_IO_GDEFSTOR_SNAPSHOT_H
@@ -58,15 +59,13 @@ extern "C" {
 /** Current snapshot format name. */
 #define GDEFSTOR_SNAPSHOT_NAME "defiant-snapshot"
 
-/** Current snapshot format version: 2 added the entity part. A reader
- * accepts every version up to this one (AD-34). */
-#define GDEFSTOR_SNAPSHOT_VERSION 2
+/** The snapshot format's version, and the only one a reader accepts. */
+#define GDEFSTOR_SNAPSHOT_VERSION 1
 
 /**
- * @brief Export one tenant's committed rows to a zip.
+ * @brief Export one tenant's truth to a zip.
  *
- * The key/bytes rows and, on a store with the entity port, the entity part,
- * each as of its last commit. Nothing is written to the store.
+ * The entity part, as of the last commit. Nothing is written to the store.
  *
  * @param store The store.
  * @param tenant Tenant bytes.
@@ -83,7 +82,8 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_export(GDEFSTOR_Store * store,
 /**
  * @brief Export one tenant and attach @p ledger as the `ledger` member.
  *
- * The ledger is not a storage key. An empty copy is @p ledger_len 0.
+ * The ledger is not part of the tenant's truth. An empty copy is
+ * @p ledger_len 0.
  * @p ledger may be NULL only then.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_export_ledger(
@@ -134,16 +134,16 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_ledger(GDEFSTOR_Store * store,
     uint8_t ** out_bytes, size_t * out_len);
 
 /**
- * @brief Import a snapshot into a tenant that has no rows.
+ * @brief Import a snapshot into a tenant that holds nothing.
  *
- * Reads `defiant-snapshot/1` and `/2`; a newer version is
- * ::GDEFSTOR_ERR_UNSUPPORTED. A tenant that already holds a key/bytes row or
- * any entity truth (a declaration, an entity, a draft, a blind row, a
- * record, a counter or an outbox row) is ::GDEFSTOR_ERR_INVALID and is left
- * alone. A bad member is ::GDEFSTOR_ERR_CORRUPT and nothing from the archive
- * is kept. An entity part on a store that cannot hold one (no entity port,
- * or a backend without the restore members of model_backend.h) is
- * ::GDEFSTOR_ERR_UNSUPPORTED.
+ * Reads `defiant-snapshot/1`; any other version, of the snapshot or of a
+ * member (an entity's `defiant-revision/1`), is ::GDEFSTOR_ERR_UNSUPPORTED. A
+ * tenant that already holds any entity truth (a declaration, an entity, a
+ * draft, a blind row, a record, a counter or an outbox row) is
+ * ::GDEFSTOR_ERR_INVALID and is left alone. A bad member is
+ * ::GDEFSTOR_ERR_CORRUPT and nothing from the archive is kept. An entity part
+ * on a store whose backend cannot hold one (without the restore members of
+ * model_backend.h) is ::GDEFSTOR_ERR_UNSUPPORTED.
  *
  * The entity part comes back exactly: item ids, revision numbers and their
  * commit sequences, `valid_from` and `valid_to`, order keys, creators, times
@@ -153,10 +153,8 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_ledger(GDEFSTOR_Store * store,
  * are not in a snapshot: the caller rebuilds them from decryptable values
  * (AD-23). Entity rows are numbered afresh, in the order they had.
  *
- * Everything is checked before anything is written. The entity part commits
- * in one write; when the snapshot also holds key/bytes rows, they commit in a
- * second write after it (a write holds one kind or the other, model.h), and a
- * failure there leaves the entity part imported.
+ * Everything is checked before anything is written, and the whole commits in
+ * one write.
  *
  * @param store The store.
  * @param tenant Tenant the rows are imported into. Not read from the zip.
@@ -175,9 +173,9 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_import(GDEFSTOR_Store * store,
  *
  * On any result but ::GDEFSTOR_OK, @p out_reason receives a sentence in
  * plain words, NUL-terminated (@p out_reason_len leaves the NUL out): the
- * tenant is not empty, the snapshot is a newer format than this build reads
- * (naming both versions), the store cannot hold an entity part, or which
- * member is not what the format holds there. Free it with
+ * tenant is not empty, the snapshot or a member is at another version than
+ * this build reads (naming the versions), the store cannot hold an entity
+ * part, or which member is not what the format holds there. Free it with
  * gdefstor_bytes_free() and the store's allocator. On ::GDEFSTOR_OK it is
  * NULL, and so it is when memory ran out for the sentence itself. A NULL
  * @p out_reason or @p out_reason_len is ::GDEFSTOR_ERR_INVALID.

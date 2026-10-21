@@ -213,8 +213,29 @@ plant snapshot-drops-a-language src/model_snapshot.c testModel \
 # An import into a tenant that already holds entity truth accepted.
 plant snapshot-import-into-non-empty src/snapshot.c testModel \
   'ModelSnapshot.ImportIntoANonEmptyTenantIsRefusedInWords' \
-  '    if (rc == GDEFSTOR_OK && !empty) {' \
-  '    if (0) {'
+  '  if (rc == GDEFSTOR_OK && !empty) {' \
+  '  if (0) {'
+
+# A snapshot member without its format (story S9): an entity's member is
+# written without "format":"defiant-revision/1".
+plant snapshot-member-without-format src/model_snapshot.c testModel \
+  'ModelSnapshot.EveryEntityMemberSaysItsFormat' \
+  '    j_lit(&j, "{\"format\":\"" REVISION_FORMAT "\",\"type\":");' \
+  '    j_lit(&j, "{\"type\":");'
+
+# A reader accepting another version (story S9), twice: an entity's member
+# read whatever defiant-revision version it says, and a manifest whatever
+# defiant-snapshot version.
+plant revision-reader-takes-another-version src/model_snapshot.c testModel \
+  'ModelSnapshot.ASnapshotOrMemberAtAnotherVersionIsRefusedInWords' \
+  '  if (!same(p, n, REVISION_FORMAT, strlen(REVISION_FORMAT))) {' \
+  '  if (!(n > strlen(REVISION_PREFIX) &&
+          memcmp(p, REVISION_PREFIX, strlen(REVISION_PREFIX)) == 0)) {'
+
+plant snapshot-reader-takes-another-version src/snapshot.c testModel \
+  'ModelSnapshot.ASnapshotOrMemberAtAnotherVersionIsRefusedInWords' \
+  '  if (len == name_len + 2 && text[name_len + 1] == '"'"'1'"'"') {' \
+  '  if (len >= name_len + 2) {'
 
 # A counter reset on import: a caller's counter comes back at 0.
 plant snapshot-import-resets-a-counter src/model_snapshot.c testModel \

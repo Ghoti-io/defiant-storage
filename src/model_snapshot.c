@@ -21,7 +21,7 @@
 /**
  * @file
  *
- * The entity part of `defiant-snapshot/2` (documentation/formats.md): a
+ * The entity part of `defiant-snapshot/1` (documentation/formats.md): a
  * logical export of the truth the entity port holds, read through the
  * backend's `dump`, and its import, written through the backend's restore
  * members. What is derived (current tables, the blind table, indexes) is
@@ -43,6 +43,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* The format of a per-entity member (AD-34), and its name with the slash. */
+#define REVISION_PREFIX GDEFSTOR_REVISION_NAME "/"
+#define REVISION_FORMAT GDEFSTOR_REVISION_NAME "/1"
 
 /* ---- the truth, held in memory -------------------------------------------- */
 
@@ -1066,7 +1070,8 @@ static GDEFSTOR_Result spell_type(Out * o, const GDEFSTOR_SnapModel * m,
     size_t k;
     memset(&j, 0, sizeof j);
     j.alloc = o->alloc;
-    j_lit(&j, "{\"type\":");
+    /* The member says its own format (AD-34): defiant-revision/1. */
+    j_lit(&j, "{\"format\":\"" REVISION_FORMAT "\",\"type\":");
     j_str(&j, t->name, t->name_len);
     j_lit(&j, ",\"id\":");
     j_str(&j, e->pid, e->pid_len);
@@ -1761,7 +1766,20 @@ static GDEFSTOR_Result read_entity(GDEFSTOR_SnapModel * m,
   SEnt * e;
   size_t i;
   GDEFSTOR_Result rc;
-  if (!is_obj(root, 4) || revs == NULL || items == NULL ||
+  /* Its own format first: version 1 and no other (AD-34). A member without
+   * one is not what an export writes; one of another version is a format
+   * this build does not read. */
+  if (root == NULL || gtext_json_typeof(root) != GTEXT_JSON_OBJECT ||
+      !get_str(root, "format", &p, &n)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  if (!same(p, n, REVISION_FORMAT, strlen(REVISION_FORMAT))) {
+    return n > strlen(REVISION_PREFIX) &&
+                   memcmp(p, REVISION_PREFIX, strlen(REVISION_PREFIX)) == 0
+               ? GDEFSTOR_ERR_UNSUPPORTED
+               : GDEFSTOR_ERR_CORRUPT;
+  }
+  if (!is_obj(root, 5) || revs == NULL || items == NULL ||
       ti == GDEFSTOR_NONE || !get_str(root, "type", &p, &n) ||
       !same(p, n, type, type_len) || !get_str(root, "id", &p, &n) ||
       !same(p, n, pid, pid_len)) {

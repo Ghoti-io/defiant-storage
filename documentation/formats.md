@@ -43,27 +43,31 @@ in that stream. The payload is one JSON value the caller supplied. A log
 line is that document plus a newline, written by `gdefstor_outbox_run` after
 the commit, never inside it.
 
-## defiant-snapshot/2
+## defiant-snapshot/1
 
-The current snapshot (AD-23, AD-34): a zip that is a logical export of one
-tenant, readable without the framework. Writers write version 2; a reader
-reads 1 and 2 and refuses a newer version with `GDEFSTOR_ERR_UNSUPPORTED`
-(`gdefstor_snapshot_import_explain` says which, in words). The member named
-`manifest` is:
+The snapshot (AD-23, AD-34): a zip that is a logical export of one tenant's
+truth, readable without the framework. Writers write version 1, and a reader
+reads version 1 and refuses every other with `GDEFSTOR_ERR_UNSUPPORTED`
+(`gdefstor_snapshot_import_explain` says which, in words): until the suite's
+first release a format is replaced in place and stays at 1, so no reader keeps
+an earlier shape. The member named `manifest` is:
 
 ```json
-{"format":"defiant-snapshot/2","taken_ms":1234,"entries":[{"key":"r:...","kind":"revision"}],
+{"format":"defiant-snapshot/1","taken_ms":1234,
  "model":["model/73686f702e6f72646572/type.json","model/73686f702e6f72646572/entities.json",
           "model/73686f702e6f72646572/6f31.json","model/drafts.json","model/records.json",
           "model/counters.json","model/outbox.json"]}
 ```
 
-`taken_ms` is there when `gdefstor_snapshot_export_at` made it. `entries`
-lists the key/bytes rows, exactly as in version 1 below. `model` lists the
-**entity part**, the truth of the entity port (model.h), in the order the
-members are written; it is empty for a tenant that holds none. Every member
-of the archive is the manifest, a member one of the two lists names, or
-`ledger`; anything else is `GDEFSTOR_ERR_CORRUPT`.
+`taken_ms` is there when `gdefstor_snapshot_export_at` made it, and nothing
+but `format`, `taken_ms` and `model` is. `model` lists the **entity part**,
+the truth of the entity port (model.h), in the order the members are written;
+it is empty for a tenant that holds none. Every member of the archive is the
+manifest, a member `model` names, or `ledger`; anything else is
+`GDEFSTOR_ERR_CORRUPT`. Names are never joined to a filesystem path: a name
+with an empty segment, a segment `.` or `..`, or a backslash is
+`GDEFSTOR_ERR_CORRUPT`, and the tenant is left unchanged. The tenant is an
+argument of import, not a member of the zip.
 
 The entity part is read through the backend's `dump` of the truth, so it is
 the same whichever backend held it, and it holds no derived data: no current
@@ -91,10 +95,12 @@ entity never saved), `last_item` the highest item id it has given out, and
 `states` its state history, oldest first.
 
 **`model/<hex of type>/<hex of public id>.json`**, one per entity, after its
-type's entities:
+type's entities, a **`defiant-revision/1`** document: one entity's revisions
+and item versions. It says its format first; a member without it is
+`GDEFSTOR_ERR_CORRUPT`, and one at another version `GDEFSTOR_ERR_UNSUPPORTED`.
 
 ```json
-{"type":"shop.order","id":"o1",
+{"format":"defiant-revision/1","type":"shop.order","id":"o1",
  "revisions":[{"revision":1,"commit":1,"who":"u1","when_ms":1000,"why":"first","languages":"en"}],
  "items":[{"lang":"en","group":0,"item":1,"parent":0,"order":"0000000000000000","from":1,"to":2,
            "values":{"number":"A-1","total":"19.99","paid":false,"note":{"@c":"01fe","@s":"subj1"}}},
@@ -145,24 +151,6 @@ the drafts, the records, the counters at their values and the outbox rows
 with their leases, failures and parked flags, through the backend's restore
 members (model_backend.h). Blind rows are core's to rebuild from decryptable
 values (AD-23).
-
-## defiant-snapshot/1
-
-Still read; no longer written. A zip. The member named `manifest` is:
-
-```json
-{"format":"defiant-snapshot/1","entries":[{"key":"r:...","kind":"revision"}]}
-```
-
-`kind` is `revision`, `blob`, `projection` or `outbox`. Every other member
-name is a storage key (`r:`, `b:`, `p:` or `o:` plus hex of the caller-supplied
-ids). A revision member's name is `r:` plus the hex of the decimal
-`row` text, not the document's `entity`. Import refuses a member whose
-key does not match that row and sequence. Names are never joined to a
-filesystem path. A name with an empty
-segment, a segment `.` or `..`, or a backslash is `GDEFSTOR_ERR_CORRUPT`,
-and the tenant is left unchanged. A slash only separates those segments.
-The tenant is an argument of import, not a member of the zip.
 
 ## Limits
 

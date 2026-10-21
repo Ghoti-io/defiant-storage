@@ -21,12 +21,11 @@
 /**
  * @file
  *
- * defiant-snapshot/2: a zip. The manifest member is named "manifest". The
- * members it lists under "entries" are named by storage keys (the key/bytes
- * rows), those under "model" hold the entity port's truth
+ * defiant-snapshot/1: a zip. The manifest member is named "manifest". The
+ * members it lists under "model" hold the entity port's truth
  * (model_snapshot.c), and a member named "ledger" is a copy of an erasure
- * ledger. No name is ever joined to a path. A reader accepts
- * defiant-snapshot/1 as well, which has no "model".
+ * ledger. No name is ever joined to a path. A reader reads version 1 and
+ * refuses every other (AD-34: formats stay at 1 until the first release).
  */
 
 #include "internal.h"
@@ -47,7 +46,7 @@ static const char MANIFEST_NAME[] = "manifest";
 static const char LEDGER_NAME[] = "ledger";
 
 /* SnapMem::kind of a member the manifest lists under "model". */
-#define KIND_MODEL 100
+#define KIND_MODEL 1
 
 typedef struct SnapMem {
   char * name;
@@ -55,12 +54,6 @@ typedef struct SnapMem {
   uint8_t * bytes;
   size_t len;
   int kind;
-  char * id;
-  size_t id_len;
-  char * stream;
-  size_t stream_len;
-  uint64_t seq;
-  int have_seq;
 } SnapMem;
 
 static void free_mems(const GDEFSTOR_Allocator * alloc, SnapMem * mems,
@@ -72,20 +65,8 @@ static void free_mems(const GDEFSTOR_Allocator * alloc, SnapMem * mems,
   for (i = 0; i < count; i++) {
     gcu_allocator_free(alloc, mems[i].name);
     gcu_allocator_free(alloc, mems[i].bytes);
-    gcu_allocator_free(alloc, mems[i].id);
-    gcu_allocator_free(alloc, mems[i].stream);
   }
   gcu_allocator_free(alloc, mems);
-}
-
-static void free_keys(const GDEFSTOR_Allocator * alloc, char ** keys,
-    size_t * lens, size_t count) {
-  size_t i;
-  for (i = 0; i < count; i++) {
-    gcu_allocator_free(alloc, keys[i]);
-  }
-  gcu_allocator_free(alloc, keys);
-  gcu_allocator_free(alloc, lens);
 }
 
 static GDEFSTOR_Result from_arc(GARC_Result gr) {
@@ -145,103 +126,6 @@ static int ratio_over(uint64_t uncomp, uint64_t comp, uint32_t max_ratio) {
   return uncomp > (uint64_t)max_ratio * comp;
 }
 
-static int prefix_kind(const char * key, size_t key_len) {
-  if (key_len >= 2 && key[0] == 'r' && key[1] == ':') {
-    return GDEFSTOR_KIND_REV;
-  }
-  if (key_len >= 2 && key[0] == 'b' && key[1] == ':') {
-    return GDEFSTOR_KIND_BLOB;
-  }
-  if (key_len >= 2 && key[0] == 'p' && key[1] == ':') {
-    return GDEFSTOR_KIND_PROJ;
-  }
-  if (key_len >= 2 && key[0] == 'o' && key[1] == ':') {
-    return GDEFSTOR_KIND_OUT;
-  }
-  return 0;
-}
-
-static const char * kind_name(int kind) {
-  if (kind == GDEFSTOR_KIND_REV) {
-    return "revision";
-  }
-  if (kind == GDEFSTOR_KIND_BLOB) {
-    return "blob";
-  }
-  if (kind == GDEFSTOR_KIND_PROJ) {
-    return "projection";
-  }
-  if (kind == GDEFSTOR_KIND_OUT) {
-    return "outbox";
-  }
-  return NULL;
-}
-
-static int kind_from_name(const char * text, size_t len) {
-  if (len == 8 && memcmp(text, "revision", 8) == 0) {
-    return GDEFSTOR_KIND_REV;
-  }
-  if (len == 4 && memcmp(text, "blob", 4) == 0) {
-    return GDEFSTOR_KIND_BLOB;
-  }
-  if (len == 10 && memcmp(text, "projection", 10) == 0) {
-    return GDEFSTOR_KIND_PROJ;
-  }
-  if (len == 6 && memcmp(text, "outbox", 6) == 0) {
-    return GDEFSTOR_KIND_OUT;
-  }
-  return 0;
-}
-
-static GDEFSTOR_Result validate_projection(const uint8_t * bytes, size_t len,
-    const GDEFSTOR_Limits * limits) {
-  size_t at = 0;
-  uint32_t count;
-  uint32_t i;
-  if (len < 4) {
-    return GDEFSTOR_ERR_CORRUPT;
-  }
-  count = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
-          ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
-  at = 4;
-  if (count > limits->max_columns) {
-    return GDEFSTOR_ERR_LIMIT;
-  }
-  for (i = 0; i < count; i++) {
-    uint32_t name_len;
-    uint32_t value_len;
-    if (at > len || len - at < 4) {
-      return GDEFSTOR_ERR_CORRUPT;
-    }
-    name_len = (uint32_t)bytes[at] | ((uint32_t)bytes[at + 1] << 8) |
-               ((uint32_t)bytes[at + 2] << 16) | ((uint32_t)bytes[at + 3] << 24);
-    at += 4;
-    if (name_len == 0 || name_len > limits->max_column_name_bytes || at > len ||
-        len - at < name_len) {
-      return name_len > limits->max_column_name_bytes ? GDEFSTOR_ERR_LIMIT
-                                                      : GDEFSTOR_ERR_CORRUPT;
-    }
-    at += name_len;
-    if (at > len || len - at < 4) {
-      return GDEFSTOR_ERR_CORRUPT;
-    }
-    value_len = (uint32_t)bytes[at] | ((uint32_t)bytes[at + 1] << 8) |
-                ((uint32_t)bytes[at + 2] << 16) |
-                ((uint32_t)bytes[at + 3] << 24);
-    at += 4;
-    if (value_len > limits->max_column_value_bytes || at > len ||
-        len - at < value_len) {
-      return value_len > limits->max_column_value_bytes ? GDEFSTOR_ERR_LIMIT
-                                                        : GDEFSTOR_ERR_CORRUPT;
-    }
-    at += value_len;
-  }
-  if (at != len) {
-    return GDEFSTOR_ERR_CORRUPT;
-  }
-  return GDEFSTOR_OK;
-}
-
 static GDEFSTOR_Result from_json(GTEXT_JSON_Status code) {
   if (code == GTEXT_JSON_OK) {
     return GDEFSTOR_OK;
@@ -286,10 +170,6 @@ static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
     size_t ledger_len, int with_ledger, int with_taken, int64_t taken_ms,
     uint8_t ** out_bytes, size_t * out_len) {
   GDEFSTOR_Limits cap;
-  char ** keys = NULL;
-  size_t * lens = NULL;
-  size_t count = 0;
-  SnapMem * mems = NULL;
   GDEFSTOR_SnapMember * model = NULL;
   size_t nmodel = 0;
   size_t i;
@@ -315,7 +195,7 @@ static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
     cap = *limits;
   }
   /* The entity part: the truth the entity port holds, as of the last
-   * commit; none on a store without the port. */
+   * commit. */
   rc = gdefstor_snap_model_export(store, tenant, tenant_len, &cap, &model,
       &nmodel);
   if (rc != GDEFSTOR_OK) {
@@ -328,54 +208,14 @@ static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
     }
     total += model[i].len;
   }
-  rc = store->backend.list(store->backend.ctx, tenant, tenant_len, "", 0, &keys,
-      &lens, &count);
-  if (rc != GDEFSTOR_OK) {
-    free_model(store->alloc, model, nmodel);
-    return rc;
-  }
-  if (count + 1 < count || count + 1 + nmodel < nmodel ||
-      count + 1 + nmodel + (with_ledger ? (size_t)1 : (size_t)0) >
-          cap.max_members) {
-    free_keys(store->alloc, keys, lens, count);
+  if (nmodel + 1 < nmodel ||
+      nmodel + 1 + (with_ledger ? (size_t)1 : (size_t)0) > cap.max_members) {
     free_model(store->alloc, model, nmodel);
     return GDEFSTOR_ERR_LIMIT;
   }
-  mems = (SnapMem *)gdefstor_mem0(store->alloc,
-      count == 0 ? sizeof *mems : count * sizeof *mems);
-  if (mems == NULL) {
-    free_keys(store->alloc, keys, lens, count);
-    free_model(store->alloc, model, nmodel);
-    return GDEFSTOR_ERR_OOM;
-  }
-  for (i = 0; rc == GDEFSTOR_OK && i < count; i++) {
-    int kind = prefix_kind(keys[i], lens[i]);
-    if (kind == 0) {
-      rc = GDEFSTOR_ERR_CORRUPT;
-      break;
-    }
-    rc = store->backend.get(store->backend.ctx, tenant, tenant_len, keys[i],
-        lens[i], &mems[i].bytes, &mems[i].len);
-    if (rc != GDEFSTOR_OK) {
-      break;
-    }
-    if (mems[i].len > cap.max_member_bytes || total > SIZE_MAX - mems[i].len) {
-      rc = GDEFSTOR_ERR_LIMIT;
-      break;
-    }
-    mems[i].kind = kind;
-    mems[i].name = keys[i];
-    mems[i].name_len = lens[i];
-    keys[i] = NULL;
-    total += mems[i].len;
-  }
-  free_keys(store->alloc, keys, lens, count);
-  keys = NULL;
-  if (rc == GDEFSTOR_OK) {
-    rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
-        store->alloc, "{\"format\":\"defiant-snapshot/2\",",
-        strlen("{\"format\":\"defiant-snapshot/2\","));
-  }
+  rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
+      store->alloc, "{\"format\":\"" GDEFSTOR_SNAPSHOT_NAME "/1\",",
+      strlen("{\"format\":\"" GDEFSTOR_SNAPSHOT_NAME "/1\","));
   if (rc == GDEFSTOR_OK && with_taken) {
     /* When the set was taken, so a restore can pair it with a key set at
      * least as new (keystore.h). An import does not read it. */
@@ -388,38 +228,7 @@ static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
   }
   if (rc == GDEFSTOR_OK) {
     rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
-        store->alloc, "\"entries\":[", strlen("\"entries\":["));
-  }
-  for (i = 0; rc == GDEFSTOR_OK && i < count; i++) {
-    const char * kn = kind_name(mems[i].kind);
-    if (i > 0) {
-      rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
-          store->alloc, ",", 1);
-    }
-    if (rc == GDEFSTOR_OK) {
-      rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
-          store->alloc, "{\"key\":", strlen("{\"key\":"));
-    }
-    if (rc == GDEFSTOR_OK) {
-      rc = gdefstor_json_escape_append(&manifest, &manifest_len, &manifest_cap,
-          store->alloc, mems[i].name, mems[i].name_len);
-    }
-    if (rc == GDEFSTOR_OK) {
-      rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
-          store->alloc, ",\"kind\":", strlen(",\"kind\":"));
-    }
-    if (rc == GDEFSTOR_OK) {
-      rc = gdefstor_json_escape_append(&manifest, &manifest_len, &manifest_cap,
-          store->alloc, kn, strlen(kn));
-    }
-    if (rc == GDEFSTOR_OK) {
-      rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
-          store->alloc, "}", 1);
-    }
-  }
-  if (rc == GDEFSTOR_OK) {
-    rc = gdefstor_buf_append(&manifest, &manifest_len, &manifest_cap,
-        store->alloc, "],\"model\":[", strlen("],\"model\":["));
+        store->alloc, "\"model\":[", strlen("\"model\":["));
   }
   for (i = 0; rc == GDEFSTOR_OK && i < nmodel; i++) {
     if (i > 0) {
@@ -457,10 +266,6 @@ static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
       gr = add_file(writer, MANIFEST_NAME, strlen(MANIFEST_NAME), manifest,
           manifest_len);
     }
-    for (i = 0; gr == GARC_OK && i < count; i++) {
-      gr = add_file(writer, mems[i].name, mems[i].name_len, mems[i].bytes,
-          mems[i].len);
-    }
     for (i = 0; gr == GARC_OK && i < nmodel; i++) {
       gr = add_file(writer, model[i].name, model[i].name_len, model[i].bytes,
           model[i].len);
@@ -496,7 +301,6 @@ static GDEFSTOR_Result export_zip(GDEFSTOR_Store * store, const char * tenant,
     garc_sink_destroy(sink);
   }
   gcu_allocator_free(store->alloc, manifest);
-  free_mems(store->alloc, mems, count);
   free_model(store->alloc, model, nmodel);
   return rc;
 }
@@ -711,6 +515,35 @@ static void why_default(Why * w, GDEFSTOR_Result rc) {
   }
 }
 
+/* The manifest's format: GDEFSTOR_SNAPSHOT_NAME and version 1, and no
+ * other (AD-34). */
+static GDEFSTOR_Result check_format(const char * text, size_t len, Why * why) {
+  size_t name_len = strlen(GDEFSTOR_SNAPSHOT_NAME);
+  size_t i;
+  char said[200];
+  if (len <= name_len + 1 || memcmp(text, GDEFSTOR_SNAPSHOT_NAME, name_len) != 0 ||
+      text[name_len] != '/') {
+    why_set(why, "the manifest does not name the defiant-snapshot format, so "
+                 "this is not a snapshot this build reads");
+    return GDEFSTOR_ERR_UNSUPPORTED;
+  }
+  for (i = name_len + 1; i < len; i++) {
+    if (text[i] < '0' || text[i] > '9') {
+      return GDEFSTOR_ERR_CORRUPT;
+    }
+  }
+  if (len == name_len + 2 && text[name_len + 1] == '1') {
+    return GDEFSTOR_OK;
+  }
+  snprintf(said, sizeof said,
+      "the snapshot is defiant-snapshot/%.*s, and this build reads "
+      "defiant-snapshot/1 and no other version, so nothing was written",
+      (int)(len - name_len - 1 > 24 ? 24 : len - name_len - 1),
+      text + name_len + 1);
+  why_set(why, said);
+  return GDEFSTOR_ERR_UNSUPPORTED;
+}
+
 static GDEFSTOR_Result import_zip(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const uint8_t * bytes, size_t len,
     const GDEFSTOR_Limits * limits, Why * why) {
@@ -721,25 +554,17 @@ static GDEFSTOR_Result import_zip(GDEFSTOR_Store * store,
   GTEXT_JSON_Parse_Options opt;
   GTEXT_JSON_Error err;
   GTEXT_JSON_Value * root = NULL;
-  const GTEXT_JSON_Value * entries;
   const GTEXT_JSON_Value * model;
-  const GTEXT_JSON_Value * format;
   const char * format_text = NULL;
   size_t format_len = 0;
-  size_t entries_n;
   size_t model_n = 0;
+  size_t keys;
   size_t i;
-  size_t listed = 0;
-  size_t nkv = 0;
-  char ** keys = NULL;
-  size_t * lens = NULL;
-  size_t have = 0;
   size_t extra = 0;
   GDEFSTOR_SnapModel * sm = NULL;
   GDEFSTOR_Write * write = NULL;
   GDEFSTOR_Result rc;
-  unsigned version = 0;
-  size_t slash;
+  int empty = 1;
   if (store == NULL || (bytes == NULL && len != 0) ||
       !gdefstor_span_ok(tenant, tenant_len, store->limits.max_tenant_bytes)) {
     return GDEFSTOR_ERR_INVALID;
@@ -776,190 +601,35 @@ static GDEFSTOR_Result import_zip(GDEFSTOR_Store * store,
     return rc;
   }
   gtext_json_error_free(&err);
-  if (gtext_json_typeof(root) != GTEXT_JSON_OBJECT) {
+  if (gtext_json_typeof(root) != GTEXT_JSON_OBJECT ||
+      gtext_json_get_string(gtext_json_object_get(root, "format", 6),
+          &format_text, &format_len) != GTEXT_JSON_OK) {
     rc = GDEFSTOR_ERR_CORRUPT;
     goto done;
   }
-  format = gtext_json_object_get(root, "format", 6);
-  if (gtext_json_get_string(format, &format_text, &format_len) !=
-      GTEXT_JSON_OK) {
-    rc = GDEFSTOR_ERR_CORRUPT;
+  rc = check_format(format_text, format_len, why);
+  if (rc != GDEFSTOR_OK) {
     goto done;
   }
-  slash = format_len;
-  for (i = 0; i < format_len; i++) {
-    if (format_text[i] == '/') {
-      slash = i;
-    }
-  }
-  if (slash == format_len ||
-      slash != strlen(GDEFSTOR_SNAPSHOT_NAME) ||
-      memcmp(format_text, GDEFSTOR_SNAPSHOT_NAME, slash) != 0) {
-    why_set(why, "the manifest does not name the defiant-snapshot format, so "
-                 "this is not a snapshot this build reads");
-    rc = GDEFSTOR_ERR_UNSUPPORTED;
-    goto done;
-  }
-  for (i = slash + 1; i < format_len; i++) {
-    if (format_text[i] < '0' || format_text[i] > '9') {
-      rc = GDEFSTOR_ERR_CORRUPT;
-      goto done;
-    }
-    if (version > 1000000u) {
-      break;
-    }
-    version = version * 10u + (unsigned)(format_text[i] - '0');
-  }
-  if (version == 0 || version > GDEFSTOR_SNAPSHOT_VERSION) {
-    char text[200];
-    if (version == 0) {
-      rc = GDEFSTOR_ERR_UNSUPPORTED;
-      why_set(why, "the manifest names defiant-snapshot version 0, which "
-                   "was never written");
-      goto done;
-    }
-    snprintf(text, sizeof text,
-        "the snapshot is defiant-snapshot/%s%u, newer than this build, which "
-        "reads defiant-snapshot/1 to defiant-snapshot/%d; nothing was written",
-        version > 1000000u ? ">" : "", version > 1000000u ? 1000000u : version,
-        GDEFSTOR_SNAPSHOT_VERSION);
-    why_set(why, text);
-    rc = GDEFSTOR_ERR_UNSUPPORTED;
-    goto done;
-  }
-  entries = gtext_json_object_get(root, "entries", 7);
-  if (entries == NULL || gtext_json_typeof(entries) != GTEXT_JSON_ARRAY) {
-    rc = GDEFSTOR_ERR_CORRUPT;
-    goto done;
-  }
-  /* The entity part: version 2 lists its members under "model". */
+  /* The manifest holds its format, the entity part's member names and,
+   * from gdefstor_snapshot_export_at(), when it was taken: nothing else. */
   model = gtext_json_object_get(root, "model", 5);
-  if (model != NULL &&
-      (version < 2 || gtext_json_typeof(model) != GTEXT_JSON_ARRAY)) {
+  keys = 2 + (gtext_json_object_get(root, "taken_ms", 8) != NULL ? 1 : 0);
+  if (model == NULL || gtext_json_typeof(model) != GTEXT_JSON_ARRAY ||
+      gtext_json_object_size(root) != keys) {
+    why_set(why, "the manifest is not what defiant-snapshot/1 holds (its "
+                 "format, \"model\" and \"taken_ms\"), so nothing was written");
     rc = GDEFSTOR_ERR_CORRUPT;
     goto done;
   }
-  model_n = model == NULL ? 0 : gtext_json_array_size(model);
-  entries_n = gtext_json_array_size(entries);
+  model_n = gtext_json_array_size(model);
   extra = find_mem(mems, count, LEDGER_NAME, strlen(LEDGER_NAME)) == NULL ? 0
                                                                          : 1;
-  if (entries_n + model_n + 1 + extra != count) {
+  if (model_n + 1 + extra != count) {
     why_set(why, "the archive holds members its manifest does not list, or "
                  "lists members it does not hold, so nothing was written");
     rc = GDEFSTOR_ERR_CORRUPT;
     goto done;
-  }
-  for (i = 0; i < entries_n; i++) {
-    const GTEXT_JSON_Value * entry = gtext_json_array_get(entries, i);
-    const char * key = NULL;
-    size_t key_len = 0;
-    const char * kind_text = NULL;
-    size_t kind_len = 0;
-    int kind;
-    SnapMem * mem;
-    if (gtext_json_typeof(entry) != GTEXT_JSON_OBJECT ||
-        gtext_json_get_string(gtext_json_object_get(entry, "key", 3), &key,
-            &key_len) != GTEXT_JSON_OK ||
-        gtext_json_get_string(gtext_json_object_get(entry, "kind", 4), &kind_text,
-            &kind_len) != GTEXT_JSON_OK) {
-      rc = GDEFSTOR_ERR_CORRUPT;
-      goto done;
-    }
-    kind = kind_from_name(kind_text, kind_len);
-    mem = find_mem(mems, count, key, key_len);
-    if (kind == 0 || mem == NULL || mem == manifest ||
-        prefix_kind(key, key_len) != kind) {
-      rc = GDEFSTOR_ERR_CORRUPT;
-      goto done;
-    }
-    if (mem->kind != 0) {
-      rc = GDEFSTOR_ERR_CORRUPT;
-      goto done;
-    }
-    mem->kind = kind;
-    if (kind == GDEFSTOR_KIND_REV) {
-      GDEFSTOR_Revision * rev = NULL;
-      rc = gdefstor_revision_parse(mem->bytes, mem->len, &cap, store->alloc,
-          &rev);
-      if (rc == GDEFSTOR_OK) {
-        char seq[32];
-        char row_text[32];
-        char * expect = NULL;
-        size_t expect_len = 0;
-        int n = snprintf(seq, sizeof seq, "%llu",
-            (unsigned long long)gdefstor_revision_seq(rev));
-        int nr = snprintf(row_text, sizeof row_text, "%llu",
-            (unsigned long long)gdefstor_revision_row(rev));
-        if (n <= 0 || nr <= 0 || gdefstor_revision_row(rev) == 0) {
-          rc = GDEFSTOR_ERR_CORRUPT;
-        } else {
-          rc = gdefstor_key_hex(store->alloc, "r:", row_text, (size_t)nr, seq,
-              (size_t)n, 1, &expect, &expect_len);
-        }
-        if (rc == GDEFSTOR_OK &&
-            (expect_len != key_len || memcmp(expect, key, key_len) != 0)) {
-          rc = GDEFSTOR_ERR_CORRUPT;
-        }
-        gcu_allocator_free(store->alloc, expect);
-        gdefstor_revision_free(rev);
-      }
-    } else if (kind == GDEFSTOR_KIND_BLOB) {
-      if (mem->len > cap.max_blob_bytes) {
-        rc = GDEFSTOR_ERR_LIMIT;
-      }
-    } else if (kind == GDEFSTOR_KIND_PROJ) {
-      rc = validate_projection(mem->bytes, mem->len, &cap);
-    } else {
-      GDEFSTOR_Outbox_Row * row = NULL;
-      char * expect = NULL;
-      size_t expect_len = 0;
-      rc = gdefstor_decode_outbox(store->alloc, &cap, mem->bytes, mem->len,
-          &row);
-      if (rc == GDEFSTOR_OK) {
-        rc = gdefstor_key_hex(store->alloc, "o:", row->id, row->id_len, NULL, 0,
-            0, &expect, &expect_len);
-      }
-      if (rc == GDEFSTOR_OK &&
-          (expect_len != key_len || memcmp(expect, key, key_len) != 0)) {
-        rc = GDEFSTOR_ERR_CORRUPT;
-      }
-      if (rc == GDEFSTOR_OK) {
-        size_t j;
-        for (j = 0; j < count; j++) {
-          if (&mems[j] == mem || !mems[j].have_seq) {
-            continue;
-          }
-          if (mems[j].seq == row->seq &&
-              mems[j].stream_len == row->stream_len &&
-              memcmp(mems[j].stream, row->stream, row->stream_len) == 0) {
-            rc = GDEFSTOR_ERR_CORRUPT;
-            break;
-          }
-        }
-      }
-      if (rc == GDEFSTOR_OK) {
-        mem->id = gdefstor_dup(store->alloc, row->id, row->id_len);
-        mem->stream = gdefstor_dup(store->alloc, row->stream, row->stream_len);
-        mem->id_len = row->id_len;
-        mem->stream_len = row->stream_len;
-        mem->seq = row->seq;
-        mem->have_seq = 1;
-        if (mem->id == NULL || mem->stream == NULL) {
-          rc = GDEFSTOR_ERR_OOM;
-        }
-      }
-      gcu_allocator_free(store->alloc, expect);
-      gdefstor_outbox_row_free(row);
-    }
-    if (rc != GDEFSTOR_OK) {
-      if (rc == GDEFSTOR_ERR_CORRUPT) {
-        why_member(why, mem->name, mem->name_len,
-            "does not hold the row its name says, so nothing was written");
-      }
-      goto done;
-    }
-    listed += 1;
-    nkv += 1;
   }
   /* Each listed once, in the order an export writes them: declarations
    * before the entities of their type. */
@@ -974,7 +644,6 @@ static GDEFSTOR_Result import_zip(GDEFSTOR_Store * store,
     }
     mem = find_mem(mems, count, name, name_len);
     if (mem == NULL || mem == manifest || mem->kind != 0 ||
-        prefix_kind(name, name_len) != 0 ||
         (name_len == strlen(LEDGER_NAME) &&
             memcmp(name, LEDGER_NAME, name_len) == 0)) {
       rc = GDEFSTOR_ERR_CORRUPT;
@@ -983,19 +652,19 @@ static GDEFSTOR_Result import_zip(GDEFSTOR_Store * store,
     mem->kind = KIND_MODEL;
     rc = gdefstor_snap_model_member(&sm, store->alloc, &cap, mem->name,
         mem->name_len, mem->bytes, mem->len);
+    if (rc == GDEFSTOR_ERR_UNSUPPORTED) {
+      why_member(why, mem->name, mem->name_len,
+          "is at a version this build does not read (it reads "
+          "defiant-revision/1, defiant-type/1 and defiant-draft/1, and no "
+          "other version), so nothing was written");
+    } else if (rc == GDEFSTOR_ERR_CORRUPT) {
+      why_member(why, mem->name, mem->name_len,
+          "is not what defiant-snapshot/1 holds there, so nothing was "
+          "written");
+    }
     if (rc != GDEFSTOR_OK) {
-      if (rc == GDEFSTOR_ERR_CORRUPT || rc == GDEFSTOR_ERR_UNSUPPORTED) {
-        why_member(why, mem->name, mem->name_len,
-            "is not what defiant-snapshot/2 holds there, so nothing was "
-            "written");
-      }
       goto done;
     }
-    listed += 1;
-  }
-  if (listed + 1 + extra != count) {
-    rc = GDEFSTOR_ERR_CORRUPT;
-    goto done;
   }
   rc = gdefstor_snap_model_check(sm);
   if (rc != GDEFSTOR_OK) {
@@ -1008,149 +677,38 @@ static GDEFSTOR_Result import_zip(GDEFSTOR_Store * store,
   }
   if (!gdefstor_snap_model_none(sm) && !gdefstor_snap_model_can_hold(store)) {
     why_set(why, "this store cannot hold the snapshot's entity part: its "
-                 "backend has no entity port or cannot restore one, so "
-                 "nothing was written");
+                 "backend cannot restore one, so nothing was written");
     rc = GDEFSTOR_ERR_UNSUPPORTED;
     goto done;
-  }
-  {
-    size_t nrev = 0;
-    size_t nblob = 0;
-    size_t nproj = 0;
-    size_t nout = 0;
-    for (i = 0; i < count; i++) {
-      if (mems[i].kind == GDEFSTOR_KIND_REV) {
-        nrev += 1;
-      } else if (mems[i].kind == GDEFSTOR_KIND_BLOB) {
-        nblob += 1;
-      } else if (mems[i].kind == GDEFSTOR_KIND_PROJ) {
-        nproj += 1;
-      } else if (mems[i].kind == GDEFSTOR_KIND_OUT) {
-        nout += 1;
-      }
-    }
-    if (nrev > cap.max_revisions || nblob > cap.max_blobs ||
-        nproj > cap.max_projections || nout > cap.max_outbox_rows) {
-      rc = GDEFSTOR_ERR_LIMIT;
-      goto done;
-    }
   }
   rc = gdefstor_write_begin(store, tenant, tenant_len, &cap, &write);
   if (rc != GDEFSTOR_OK) {
     goto done;
   }
-  /* Only into an empty tenant: no key/bytes row, and no entity truth. */
-  rc = store->backend.list(store->backend.ctx, tenant, tenant_len, "", 0, &keys,
-      &lens, &have);
-  if (rc != GDEFSTOR_OK) {
-    gdefstor_write_abort(write);
-    write = NULL;
-    goto done;
+  /* Only into an empty tenant. The entity part is written in the entity
+   * transaction: open it first, so that a backend that makes a tenant's
+   * tables in its first write has made them before they are read. */
+  if (!gdefstor_snap_model_none(sm)) {
+    rc = gdefstor_snap_model_open(write);
   }
-  free_keys(store->alloc, keys, lens, have);
-  keys = NULL;
-  if (have != 0) {
-    gdefstor_write_abort(write);
-    write = NULL;
+  if (rc == GDEFSTOR_OK) {
+    rc = gdefstor_snap_model_empty(store, tenant, tenant_len, &empty);
+  }
+  if (rc == GDEFSTOR_OK && !empty) {
     why_set(why, "the tenant already holds data, and a snapshot is imported "
                  "only into an empty tenant, so nothing was written");
     rc = GDEFSTOR_ERR_INVALID;
-    goto done;
   }
-  {
-    int empty = 1;
-    /* An entity part is written in the entity transaction: open it first,
-     * so that a backend that makes a tenant's tables in its first write
-     * has made them before they are read. */
-    if (!gdefstor_snap_model_none(sm)) {
-      rc = gdefstor_snap_model_open(write);
-    }
-    if (rc == GDEFSTOR_OK) {
-      rc = gdefstor_snap_model_empty(store, tenant, tenant_len, &empty);
-    }
-    if (rc == GDEFSTOR_OK && !empty) {
-      why_set(why, "the tenant already holds entity data, and a snapshot is "
-                   "imported only into an empty tenant, so nothing was "
-                   "written");
-      rc = GDEFSTOR_ERR_INVALID;
-    }
-    if (rc != GDEFSTOR_OK) {
-      gdefstor_write_abort(write);
-      write = NULL;
-      goto done;
-    }
-  }
-  /* The entity part commits in the entity transaction, and the key/bytes
-   * rows in a write of their own after it: a write holds one kind or the
-   * other (model.h). */
-  if (!gdefstor_snap_model_none(sm)) {
+  if (rc == GDEFSTOR_OK && !gdefstor_snap_model_none(sm)) {
     rc = gdefstor_snap_model_import(write, sm);
     if (rc == GDEFSTOR_OK) {
       rc = gdefstor_write_commit(write);
-    } else {
-      gdefstor_write_abort(write);
-    }
-    write = NULL;
-    if (rc != GDEFSTOR_OK || nkv == 0) {
-      goto done;
-    }
-    rc = gdefstor_write_begin(store, tenant, tenant_len, &cap, &write);
-    if (rc != GDEFSTOR_OK) {
-      why_set(why, "the snapshot's entity part was imported, and its "
-                   "key/bytes rows could not be: the tenant holds the "
-                   "entity part only");
-      goto done;
+      write = NULL;
     }
   }
-  for (i = 0; i < count; i++) {
-    GDEFSTOR_Pending * row;
-    if (mems[i].kind < GDEFSTOR_KIND_REV || mems[i].kind > GDEFSTOR_KIND_OUT) {
-      continue;
-    }
-    row = (GDEFSTOR_Pending *)gdefstor_mem0(store->alloc, sizeof *row);
-    if (row == NULL) {
-      rc = GDEFSTOR_ERR_OOM;
-      break;
-    }
-    row->kind = mems[i].kind;
-    row->encoded = 1;
-    row->key = gdefstor_dup(store->alloc, mems[i].name, mems[i].name_len);
-    row->bytes = (uint8_t *)gdefstor_mem(store->alloc, mems[i].len);
-    if (row->key == NULL || row->bytes == NULL) {
-      gdefstor_free_pending(store->alloc, row);
-      rc = GDEFSTOR_ERR_OOM;
-      break;
-    }
-    row->key_len = mems[i].name_len;
-    if (mems[i].len > 0) {
-      memcpy(row->bytes, mems[i].bytes, mems[i].len);
-    }
-    row->len = mems[i].len;
-    if (mems[i].id != NULL) {
-      row->id = gdefstor_dup(store->alloc, mems[i].id, mems[i].id_len);
-      row->id_len = mems[i].id_len;
-      if (row->id == NULL) {
-        gdefstor_free_pending(store->alloc, row);
-        rc = GDEFSTOR_ERR_OOM;
-        break;
-      }
-    }
-    rc = gdefstor_stage(write, row);
-    if (rc != GDEFSTOR_OK) {
-      gdefstor_free_pending(store->alloc, row);
-      break;
-    }
-  }
-  if (rc == GDEFSTOR_OK) {
-    rc = gdefstor_write_commit(write);
-    write = NULL;
-  } else {
+  if (write != NULL) {
     gdefstor_write_abort(write);
     write = NULL;
-  }
-  if (rc != GDEFSTOR_OK && !gdefstor_snap_model_none(sm)) {
-    why_set(why, "the snapshot's entity part was imported, and its key/bytes "
-                 "rows could not be: the tenant holds the entity part only");
   }
 done:
   if (root != NULL) {

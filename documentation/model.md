@@ -374,10 +374,11 @@ All three families are truth: `gdefstor_model_rebuild()` never touches them,
 
 ## Snapshots
 
-A snapshot (`snapshot.h`, AD-23) is a logical export of a tenant: on a store
-with this port, `gdefstor_snapshot_export()` and its variants add the
-**entity part** to the key/bytes rows, in `defiant-snapshot/2`
-(`formats.md`). It is the truth `dump` visits, read through the backend:
+A snapshot (`snapshot.h`, AD-23) is a logical export of a tenant's truth:
+`gdefstor_snapshot_export()` and its variants write the **entity part**, in
+`defiant-snapshot/1` (`formats.md`), each entity's revisions a
+`defiant-revision/1` member. It is the truth `dump` visits, read through the
+backend:
 declarations, entities with their state history, revisions with who, when,
 why, commit sequence and languages, every item version of every language,
 drafts, records, counters and outbox rows. Derived data stays out: no current
@@ -398,12 +399,10 @@ source's had. The same truth always exports to the same bytes, whichever
 backend held it.
 
 An import refuses, in words through `gdefstor_snapshot_import_explain()`, a
-tenant that holds anything (`GDEFSTOR_ERR_INVALID`), a newer format
-(`GDEFSTOR_ERR_UNSUPPORTED`), a store that cannot hold an entity part
-(`GDEFSTOR_ERR_UNSUPPORTED`) and any member that is not what an export writes
-(`GDEFSTOR_ERR_CORRUPT`), and writes nothing when it refuses. A snapshot that
-holds key/bytes rows as well commits them in a second write, after the entity
-part.
+tenant that holds anything (`GDEFSTOR_ERR_INVALID`), a snapshot or member at
+another version than 1 (`GDEFSTOR_ERR_UNSUPPORTED`), a store that cannot hold
+an entity part (`GDEFSTOR_ERR_UNSUPPORTED`) and any member that is not what an
+export writes (`GDEFSTOR_ERR_CORRUPT`), and writes nothing when it refuses.
 
 ## Derived data
 

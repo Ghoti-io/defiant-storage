@@ -72,7 +72,8 @@ inline std::vector<std::pair<std::string, std::string>> ZipMembers(
 }
 
 inline std::string ZipOf(
-    const std::vector<std::pair<std::string, std::string>> & members) {
+    const std::vector<std::pair<std::string, std::string>> & members,
+    bool deflate = false) {
   GARC_Sink * sink = nullptr;
   GARC_Writer * w = nullptr;
   GARC_Writer_Options opt;
@@ -83,6 +84,9 @@ inline std::string ZipOf(
     return out;
   }
   garc_writer_options_default(&opt);
+  if (deflate) {
+    opt.zip_method = GARC_ZIP_METHOD_DEFLATE;
+  }
   if (garc_writer_create(sink, GARC_FORMAT_ZIP, &opt, &w) != GARC_OK) {
     garc_sink_destroy(sink);
     return out;
@@ -480,23 +484,90 @@ TEST_F(ModelSnapshot, ImportIntoANonEmptyTenantIsRefusedInWords) {
   ModelClose(third);
 }
 
-/* A newer format is refused in words naming both versions, and so is a
- * member that is not what the format holds; nothing is written. */
-TEST_F(ModelSnapshot, ANewerFormatOrABadMemberIsRefusedInWords) {
+/* The manifest and every entity's member say their format, at version 1
+ * (AD-34): defiant-snapshot/1, and defiant-revision/1 first in each member
+ * of one entity's revisions. A member without it is refused in words. */
+TEST_F(ModelSnapshot, EveryEntityMemberSaysItsFormat) {
+  ASSERT_EQ(GDEFSTOR_OK, snapshot_fixture::Populate(store, kTenant, false));
+  auto members = ZipMembers(snapshot_fixture::Export(store, kTenant));
+  ASSERT_FALSE(members.empty());
+  ASSERT_EQ("manifest", members[0].first);
+  EXPECT_EQ(0u, members[0].second.find("{\"format\":\"defiant-snapshot/1\","))
+      << members[0].second;
+  size_t entities = 0;
+  for (const auto & m : members) {
+    /* model/<type>/<id>.json, beside the type's type.json and entities.json */
+    size_t a = m.first.find('/');
+    size_t b = a == std::string::npos ? a : m.first.find('/', a + 1);
+    if (m.first.rfind("model/", 0) != 0 || b == std::string::npos ||
+        m.first.compare(b, std::string::npos, "/type.json") == 0 ||
+        m.first.compare(b, std::string::npos, "/entities.json") == 0) {
+      continue;
+    }
+    EXPECT_EQ(0u, m.second.find("{\"format\":\"defiant-revision/1\",\"type\":"))
+        << m.first << ": " << m.second.substr(0, 80);
+    entities += 1;
+  }
+  EXPECT_GE(entities, 4u);
+  /* Without its format, a member is not what the snapshot holds. */
+  auto bare = members;
+  bool changed = false;
+  for (auto & m : bare) {
+    size_t f = m.second.find("\"format\":\"defiant-revision/1\",");
+    if (f != std::string::npos) {
+      m.second.erase(f, 30);
+      changed = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(changed);
+  std::string why;
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT,
+      snapshot_fixture::Import(copy, kTenant, ZipOf(bare), &why));
+  EXPECT_NE(std::string::npos, why.find("is not what defiant-snapshot/1 holds"))
+      << why;
+  EXPECT_EQ("", snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH));
+}
+
+/* A snapshot at another version than 1, or an entity's member at another
+ * version than defiant-revision/1, is refused in words naming the version
+ * read, and nothing is written; so is a member that is not what the format
+ * holds. The untouched archive imports. */
+TEST_F(ModelSnapshot, ASnapshotOrMemberAtAnotherVersionIsRefusedInWords) {
   ASSERT_EQ(GDEFSTOR_OK, snapshot_fixture::Populate(store, kTenant, false));
   std::string zip = snapshot_fixture::Export(store, kTenant);
   auto members = ZipMembers(zip);
   ASSERT_FALSE(members.empty());
   ASSERT_EQ("manifest", members[0].first);
-  auto newer = members;
-  size_t at = newer[0].second.find("defiant-snapshot/2");
-  ASSERT_NE(std::string::npos, at);
-  newer[0].second.replace(at, 18, "defiant-snapshot/3");
   std::string why;
+  for (const char * other : {"defiant-snapshot/9", "defiant-snapshot/0",
+           "defiant-snapshot/10"}) {
+    auto at_other = members;
+    size_t at = at_other[0].second.find("defiant-snapshot/1\"");
+    ASSERT_NE(std::string::npos, at);
+    at_other[0].second.replace(at, 18, other);
+    EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED,
+        snapshot_fixture::Import(copy, kTenant, ZipOf(at_other), &why))
+        << other;
+    EXPECT_NE(std::string::npos, why.find(std::string(other) + ",")) << why;
+    EXPECT_NE(std::string::npos, why.find("reads defiant-snapshot/1")) << why;
+    EXPECT_EQ("", snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH));
+  }
+  auto member_other = members;
+  std::string named;
+  for (auto & m : member_other) {
+    size_t f = m.second.find("\"format\":\"defiant-revision/1\"");
+    if (f != std::string::npos) {
+      m.second.replace(f, 29, "\"format\":\"defiant-revision/9\"");
+      named = m.first;
+      break;
+    }
+  }
+  ASSERT_FALSE(named.empty());
   EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED,
-      snapshot_fixture::Import(copy, kTenant, ZipOf(newer), &why));
-  EXPECT_NE(std::string::npos, why.find("defiant-snapshot/3")) << why;
-  EXPECT_NE(std::string::npos, why.find("defiant-snapshot/2")) << why;
+      snapshot_fixture::Import(copy, kTenant, ZipOf(member_other), &why));
+  EXPECT_NE(std::string::npos, why.find(named)) << why;
+  EXPECT_NE(std::string::npos, why.find("defiant-revision/1")) << why;
   EXPECT_EQ("", snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH));
   /* An item version moved to a revision the entity does not have. */
   auto bad = members;
@@ -520,6 +591,114 @@ TEST_F(ModelSnapshot, ANewerFormatOrABadMemberIsRefusedInWords) {
       << why;
   EXPECT_EQ(snapshot_fixture::Dump(store, kTenant, GDEFSTOR_MODEL_TRUTH),
       snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH));
+}
+
+inline GDEFSTOR_Result ImportWith(GDEFSTOR_Store * s, const std::string & zip,
+    const GDEFSTOR_Limits * limits) {
+  return gdefstor_snapshot_import(s, kTenant, 2,
+      reinterpret_cast<const uint8_t *>(zip.data()), zip.size(), limits);
+}
+
+/* The archive is judged before anything is written: a manifest that names
+ * another format, one that holds what the format does not, a member the
+ * manifest does not list, a name that would climb out of a directory, a
+ * member over the member cap, too many members, a compression ratio over the
+ * cap and a manifest deeper than the JSON cap are each refused, and the
+ * tenant keeps nothing. A ratio at the cap, and a member count at it, pass. */
+TEST_F(ModelSnapshot, TheArchiveIsJudgedBeforeAnythingIsWritten) {
+  const std::string empty = "{\"format\":\"defiant-snapshot/1\",\"model\":[]}";
+  std::string why;
+  EXPECT_EQ(GDEFSTOR_OK, ImportWith(copy, ZipOf({{"manifest", empty}}), nullptr));
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, snapshot_fixture::Import(copy, kTenant,
+      ZipOf({{"manifest", "{\"format\":\"nope/1\",\"model\":[]}"}}), &why));
+  EXPECT_NE(std::string::npos, why.find("does not name the defiant-snapshot"))
+      << why;
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, snapshot_fixture::Import(copy, kTenant,
+      ZipOf({{"manifest",
+          "{\"format\":\"defiant-snapshot/1\",\"entries\":[],\"model\":[]}"}}),
+      &why));
+  EXPECT_NE(std::string::npos, why.find("manifest is not what")) << why;
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, ImportWith(copy,
+      ZipOf({{"manifest", "{\"format\":\"defiant-snapshot/1\"}"}}), nullptr));
+  const char * stray = "defiant-storage-stray-member";
+  unlink(stray);
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, snapshot_fixture::Import(copy, kTenant,
+      ZipOf({{"manifest", empty}, {stray, "x"}}), &why));
+  EXPECT_NE(std::string::npos, why.find("does not list")) << why;
+  EXPECT_NE(0, access(stray, F_OK));
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT,
+      ImportWith(copy, ZipOf({{"manifest", empty}, {"../x", "x"}}), nullptr));
+  GDEFSTOR_Limits limits;
+  gdefstor_limits_default(&limits);
+  limits.max_member_bytes = 8;
+  EXPECT_EQ(GDEFSTOR_ERR_LIMIT,
+      ImportWith(copy, ZipOf({{"manifest", empty}}), &limits));
+  gdefstor_limits_default(&limits);
+  limits.max_members = 1;
+  EXPECT_EQ(GDEFSTOR_OK, ImportWith(copy, ZipOf({{"manifest", empty}}),
+      &limits));
+  EXPECT_EQ(GDEFSTOR_ERR_LIMIT, ImportWith(copy,
+      ZipOf({{"manifest", empty}, {"ledger", ""}}), &limits));
+  gdefstor_limits_default(&limits);
+  limits.max_zip_ratio = 1;
+  EXPECT_EQ(GDEFSTOR_OK, ImportWith(copy, ZipOf({{"manifest", empty}}),
+      &limits));
+  limits.max_zip_ratio = 2;
+  EXPECT_EQ(GDEFSTOR_ERR_LIMIT, ImportWith(copy,
+      ZipOf({{"manifest", empty}, {"ledger", std::string(65536, '\0')}}, true),
+      &limits));
+  gdefstor_limits_default(&limits);
+  limits.max_json_depth = 1;
+  EXPECT_EQ(GDEFSTOR_ERR_LIMIT,
+      ImportWith(copy, ZipOf({{"manifest", empty}}), &limits));
+  limits.max_json_depth = 2;
+  EXPECT_EQ(GDEFSTOR_OK, ImportWith(copy, ZipOf({{"manifest", empty}}),
+      &limits));
+  EXPECT_EQ("", snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH));
+}
+
+/* When a data set was taken is in its manifest and read back without an
+ * import; a plain export records none; the ledger member is copied out, and
+ * a data set has none. */
+TEST_F(ModelSnapshot, TheTimeTakenAndTheLedgerAreReadBack) {
+  ASSERT_EQ(GDEFSTOR_OK, snapshot_fixture::Populate(store, kTenant, false));
+  uint8_t * zip = nullptr;
+  size_t zip_len = 0;
+  int found = -1;
+  int64_t taken = -1;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_snapshot_export_at(store, kTenant,
+      2, nullptr, -1, &zip, &zip_len));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_snapshot_export_at(store, kTenant, 2,
+      nullptr, 1760000000123LL, &zip, &zip_len));
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_snapshot_taken(store, zip, zip_len, nullptr, &found, &taken));
+  EXPECT_EQ(1, found);
+  EXPECT_EQ(1760000000123LL, taken);
+  uint8_t * ledger = nullptr;
+  size_t ledger_len = 9;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_snapshot_ledger(store, zip, zip_len, nullptr,
+      &ledger, &ledger_len));
+  EXPECT_EQ(0u, ledger_len);
+  gdefstor_bytes_free(nullptr, ledger);
+  gdefstor_bytes_free(nullptr, zip);
+  const uint8_t copy_of[] = {'l', '1', '\n'};
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_snapshot_export_ledger(store, kTenant, 2,
+      nullptr, copy_of, sizeof copy_of, &zip, &zip_len));
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_snapshot_taken(store, zip, zip_len, nullptr, &found, &taken));
+  EXPECT_EQ(0, found);
+  EXPECT_EQ(0, taken);
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_snapshot_ledger(store, zip, zip_len, nullptr,
+      &ledger, &ledger_len));
+  EXPECT_EQ(std::string("l1\n"),
+      std::string(reinterpret_cast<const char *>(ledger), ledger_len));
+  gdefstor_bytes_free(nullptr, ledger);
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_snapshot_import(copy, kTenant, 2, zip,
+      zip_len, nullptr));
+  gdefstor_bytes_free(nullptr, zip);
+  EXPECT_NE(GDEFSTOR_OK, gdefstor_snapshot_taken(store,
+      reinterpret_cast<const uint8_t *>("not a zip"), 9, nullptr, &found,
+      &taken));
 }
 
 /* A tenant with no entity truth exports no entity member, and a snapshot of

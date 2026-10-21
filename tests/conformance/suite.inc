@@ -279,36 +279,6 @@ static int make_zip(const char * name, size_t name_len, const uint8_t * body,
   return 1;
 }
 
-TEST_F(Limits, MemberStopsAtBound) {
-  GDEFSTOR_Limits limits;
-  uint8_t * zip = NULL;
-  size_t zip_len = 0;
-  const uint8_t body[] = {'h', 'e', 'l', 'l', 'o'};
-  ASSERT_TRUE(make_zip("b:aa", 4, body, sizeof body, 0, &zip, &zip_len));
-  gdefstor_limits_default(&limits);
-  limits.max_member_bytes = 4;
-  EXPECT_EQ(GDEFSTOR_ERR_LIMIT,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          &limits));
-  free(zip);
-  expect_absent(store);
-}
-
-TEST_F(Limits, ZipRatioStopsAtBound) {
-  GDEFSTOR_Limits limits;
-  uint8_t * zip = NULL;
-  size_t zip_len = 0;
-  std::vector<uint8_t> zeros(64 * 1024, 0);
-  ASSERT_TRUE(make_zip("b:aa", 4, zeros.data(), zeros.size(), 1, &zip, &zip_len));
-  gdefstor_limits_default(&limits);
-  limits.max_zip_ratio = 2;
-  EXPECT_EQ(GDEFSTOR_ERR_LIMIT,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          &limits));
-  free(zip);
-  expect_absent(store);
-}
-
 struct Park {
   GDEFSTOR_Store * store;
   GDEFSTOR_Result begin_rc;
@@ -390,161 +360,6 @@ TEST_F(Formats, NewerVersion) {
   EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED,
       gdefstor_revision_append(write, (const uint8_t *)doc, strlen(doc)));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(write));
-}
-
-TEST_F(Snapshot, RoundTrip) {
-  GDEFSTOR_Store * other = NULL;
-  GDEFSTOR_Write * write = NULL;
-  uint8_t * zip = NULL;
-  size_t zip_len = 0;
-  uint8_t * a = NULL;
-  uint8_t * b = NULL;
-  size_t a_len = 0;
-  size_t b_len = 0;
-  GDEFSTOR_Projection * left = NULL;
-  GDEFSTOR_Projection * right = NULL;
-  GDEFSTOR_Column ca;
-  GDEFSTOR_Column cb;
-  GDEFSTOR_Outbox_Row * oa = NULL;
-  GDEFSTOR_Outbox_Row * ob = NULL;
-  size_t pa = 0;
-  size_t pb = 0;
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
-  ASSERT_EQ(GDEFSTOR_OK, stage_all(write));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(write));
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_snapshot_export(store, kTenant, strlen(kTenant), NULL, &zip,
-          &zip_len));
-  ASSERT_EQ(GDEFSTOR_OK, ConformanceOpen(&other, NULL));
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_snapshot_import(other, kTenant, strlen(kTenant), zip, zip_len,
-          NULL));
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_revision_get(store, kTenant, strlen(kTenant), kRow,
-          strlen(kRow), 1, &a, &a_len));
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_revision_get(other, kTenant, strlen(kTenant), kRow,
-          strlen(kRow), 1, &b, &b_len));
-  ASSERT_EQ(a_len, b_len);
-  EXPECT_EQ(0, memcmp(a, b, a_len));
-  gdefstor_bytes_free(NULL, a);
-  gdefstor_bytes_free(NULL, b);
-  a = NULL;
-  b = NULL;
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_blob_get(store, kTenant, strlen(kTenant), kHash, strlen(kHash),
-          &a, &a_len));
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_blob_get(other, kTenant, strlen(kTenant), kHash, strlen(kHash),
-          &b, &b_len));
-  ASSERT_EQ(a_len, b_len);
-  EXPECT_EQ(0, memcmp(a, b, a_len));
-  gdefstor_bytes_free(NULL, a);
-  gdefstor_bytes_free(NULL, b);
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_projection_get(store, kTenant, strlen(kTenant), kType,
-          strlen(kType), kEntity, strlen(kEntity), &left));
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_projection_get(other, kTenant, strlen(kTenant), kType,
-          strlen(kType), kEntity, strlen(kEntity), &right));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_column(left, 0, &ca));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_column(right, 0, &cb));
-  ASSERT_EQ(ca.value_len, cb.value_len);
-  EXPECT_EQ(0, memcmp(ca.value, cb.value, ca.value_len));
-  gdefstor_projection_free(left);
-  gdefstor_projection_free(right);
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_outbox_get(store, kTenant, strlen(kTenant), kOutId,
-          strlen(kOutId), &oa));
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_outbox_get(other, kTenant, strlen(kTenant), kOutId,
-          strlen(kOutId), &ob));
-  EXPECT_EQ(gdefstor_outbox_row_seq(oa), gdefstor_outbox_row_seq(ob));
-  ASSERT_NE(nullptr, gdefstor_outbox_row_payload(oa, &pa));
-  ASSERT_NE(nullptr, gdefstor_outbox_row_payload(ob, &pb));
-  ASSERT_EQ(pa, pb);
-  EXPECT_EQ(0, memcmp(gdefstor_outbox_row_payload(oa, NULL),
-                    gdefstor_outbox_row_payload(ob, NULL), pa));
-  gdefstor_outbox_row_free(oa);
-  gdefstor_outbox_row_free(ob);
-  EXPECT_EQ(GDEFSTOR_ERR_INVALID,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          NULL));
-  gdefstor_bytes_free(NULL, zip);
-  ConformanceClose(other);
-}
-
-/* The data half of a backup pair records when it was taken; an import reads
- * the rows as from any snapshot, and a snapshot without a time says so. */
-TEST_F(Snapshot, TheTimeTakenIsRecordedAndReadBack) {
-  GDEFSTOR_Store * other = NULL;
-  GDEFSTOR_Write * write = NULL;
-  uint8_t * zip = NULL;
-  size_t zip_len = 0;
-  uint8_t * plain = NULL;
-  size_t plain_len = 0;
-  uint8_t * ledger = NULL;
-  size_t ledger_len = 9;
-  int found = -1;
-  int64_t taken = -1;
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_write_begin(store, kTenant, strlen(kTenant), NULL, &write));
-  ASSERT_EQ(GDEFSTOR_OK, stage_all(write));
-  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(write));
-  EXPECT_EQ(GDEFSTOR_ERR_INVALID,
-      gdefstor_snapshot_export_at(store, kTenant, strlen(kTenant), NULL, -1,
-          &zip, &zip_len));
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_snapshot_export_at(store, kTenant, strlen(kTenant), NULL,
-          1760000000123LL, &zip, &zip_len));
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_snapshot_taken(store, zip, zip_len, NULL, &found, &taken));
-  EXPECT_EQ(1, found);
-  EXPECT_EQ(1760000000123LL, taken);
-  /* No ledger member: the data set carries none. */
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_snapshot_ledger(store, zip, zip_len, NULL, &ledger, &ledger_len));
-  EXPECT_EQ(0u, ledger_len);
-  gdefstor_bytes_free(NULL, ledger);
-  ASSERT_EQ(GDEFSTOR_OK, ConformanceOpen(&other, NULL));
-  EXPECT_EQ(GDEFSTOR_OK,
-      gdefstor_snapshot_import(other, kTenant, strlen(kTenant), zip, zip_len,
-          NULL));
-  ConformanceClose(other);
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_snapshot_export(store, kTenant, strlen(kTenant), NULL, &plain,
-          &plain_len));
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_snapshot_taken(store, plain, plain_len, NULL, &found, &taken));
-  EXPECT_EQ(0, found);
-  EXPECT_EQ(0, taken);
-  EXPECT_NE(GDEFSTOR_OK,
-      gdefstor_snapshot_taken(store, (const uint8_t *)"not a zip", 9, NULL,
-          &found, &taken));
-  gdefstor_bytes_free(NULL, zip);
-  gdefstor_bytes_free(NULL, plain);
-}
-
-TEST_F(Snapshot, BadMember) {
-  uint8_t * zip = NULL;
-  size_t zip_len = 0;
-  const char * stray = "defiant-storage-stray-member";
-  const uint8_t body[] = {'x'};
-  unlink(stray);
-  ASSERT_TRUE(make_zip(stray, strlen(stray), body, sizeof body, 0, &zip, &zip_len));
-  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          NULL));
-  free(zip);
-  EXPECT_NE(0, access(stray, F_OK));
-  expect_absent(store);
-  unlink(stray);
-  ASSERT_TRUE(make_zip("../x", 4, body, sizeof body, 0, &zip, &zip_len));
-  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          NULL));
-  free(zip);
 }
 
 struct ClockBox {
@@ -822,9 +637,7 @@ TEST_F(StoreFix, ProjectionDelete) {
 
 TEST_F(Revision, KeyIsRowId) {
   uint8_t * bytes = NULL;
-  uint8_t * zip = NULL;
   size_t len = 0;
-  size_t zip_len = 0;
   GDEFSTOR_Revision * rev = NULL;
   const char * entity = NULL;
   size_t entity_len = 0;
@@ -844,18 +657,6 @@ TEST_F(Revision, KeyIsRowId) {
   EXPECT_EQ(0, memcmp(entity, kEntity, entity_len));
   gdefstor_revision_free(rev);
   gdefstor_bytes_free(NULL, bytes);
-  ASSERT_EQ(GDEFSTOR_OK,
-      gdefstor_snapshot_export(store, kTenant, strlen(kTenant), NULL, &zip,
-          &zip_len));
-  EXPECT_NE(std::search(zip, zip + zip_len,
-                reinterpret_cast<const uint8_t *>("r:31:31"),
-                reinterpret_cast<const uint8_t *>("r:31:31") + 7),
-      zip + zip_len);
-  EXPECT_EQ(std::search(zip, zip + zip_len,
-                reinterpret_cast<const uint8_t *>("r:706f737431:"),
-                reinterpret_cast<const uint8_t *>("r:706f737431:") + 13),
-      zip + zip_len);
-  gdefstor_bytes_free(NULL, zip);
 }
 
 TEST_F(Revision, DestroyDropsStaged) {
@@ -988,91 +789,6 @@ static int make_zip_n(const ZipPart * parts, size_t n, int deflate,
   return 1;
 }
 
-TEST_F(Formats, SnapshotVersion) {
-  uint8_t * zip = NULL;
-  size_t zip_len = 0;
-  /* One version past what this build writes (snapshot.h). */
-  const char manifest[] = "{\"format\":\"defiant-snapshot/3\",\"entries\":[]}";
-  const char unknown[] = "{\"format\":\"nope/1\",\"entries\":[]}";
-  const char listed[] =
-      "{\"format\":\"defiant-snapshot/1\",\"entries\":[{\"key\":\"o:65767431\","
-      "\"kind\":\"outbox\"}]}";
-  const char out_v2[] =
-      "{\"format\":\"defiant-outbox/2\",\"id\":\"evt1\",\"stream\":\"posts\","
-      "\"seq\":1,\"payload\":{\"n\":1}}";
-  const char out_name[] =
-      "{\"format\":\"nope/1\",\"id\":\"evt1\",\"stream\":\"posts\","
-      "\"seq\":1,\"payload\":{\"n\":1}}";
-  ZipPart one;
-  ZipPart two[2];
-  one.name = "manifest";
-  one.body = (const uint8_t *)manifest;
-  one.body_len = strlen(manifest);
-  ASSERT_TRUE(make_zip_n(&one, 1, 0, &zip, &zip_len));
-  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          NULL));
-  free(zip);
-  expect_absent(store);
-  one.body = (const uint8_t *)unknown;
-  one.body_len = strlen(unknown);
-  ASSERT_TRUE(make_zip_n(&one, 1, 0, &zip, &zip_len));
-  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          NULL));
-  free(zip);
-  expect_absent(store);
-  two[0].name = "manifest";
-  two[0].body = (const uint8_t *)listed;
-  two[0].body_len = strlen(listed);
-  two[1].name = "o:65767431";
-  two[1].body = (const uint8_t *)out_v2;
-  two[1].body_len = strlen(out_v2);
-  ASSERT_TRUE(make_zip_n(two, 2, 0, &zip, &zip_len));
-  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          NULL));
-  free(zip);
-  expect_absent(store);
-  two[1].body = (const uint8_t *)out_name;
-  two[1].body_len = strlen(out_name);
-  ASSERT_TRUE(make_zip_n(two, 2, 0, &zip, &zip_len));
-  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          NULL));
-  free(zip);
-  expect_absent(store);
-}
-
-TEST_F(Limits, ZipRatioAtBound) {
-  GDEFSTOR_Limits limits;
-  uint8_t * zip = NULL;
-  size_t zip_len = 0;
-  const char manifest[] = "{\"format\":\"defiant-snapshot/1\",\"entries\":[]}";
-  uint8_t extra[6];
-  ZipPart one;
-  memset(extra, 0, sizeof extra);
-  one.name = "manifest";
-  one.body = (const uint8_t *)manifest;
-  one.body_len = strlen(manifest);
-  ASSERT_TRUE(make_zip_n(&one, 1, 0, &zip, &zip_len));
-  gdefstor_limits_default(&limits);
-  limits.max_zip_ratio = 1;
-  EXPECT_EQ(GDEFSTOR_OK,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          &limits));
-  free(zip);
-  expect_absent(store);
-  one.body = extra;
-  one.body_len = sizeof extra;
-  ASSERT_TRUE(make_zip_n(&one, 1, 1, &zip, &zip_len));
-  EXPECT_EQ(GDEFSTOR_ERR_LIMIT,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          &limits));
-  free(zip);
-  expect_absent(store);
-}
-
 TEST_F(Limits, RevisionsAtBound) {
   GDEFSTOR_Limits limits;
   GDEFSTOR_Write * write = NULL;
@@ -1145,39 +861,6 @@ TEST_F(Limits, ColumnsAtBound) {
       gdefstor_projection_put(write, kType, strlen(kType), kEntity,
           strlen(kEntity), columns, 2));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(write));
-}
-
-TEST_F(Limits, MembersAtBound) {
-  GDEFSTOR_Limits limits;
-  uint8_t * zip = NULL;
-  size_t zip_len = 0;
-  const char empty[] = "{\"format\":\"defiant-snapshot/1\",\"entries\":[]}";
-  const char listed[] =
-      "{\"format\":\"defiant-snapshot/1\",\"entries\":[{\"key\":\"b:61\","
-      "\"kind\":\"blob\"}]}";
-  const uint8_t blob[] = {'x'};
-  ZipPart one;
-  ZipPart two[2];
-  gdefstor_limits_default(&limits);
-  limits.max_members = 1;
-  one.name = "manifest";
-  one.body = (const uint8_t *)empty;
-  one.body_len = strlen(empty);
-  ASSERT_TRUE(make_zip_n(&one, 1, 0, &zip, &zip_len));
-  EXPECT_EQ(GDEFSTOR_OK,
-      gdefstor_snapshot_import(store, kTenant, strlen(kTenant), zip, zip_len,
-          &limits));
-  free(zip);
-  two[0].name = "manifest";
-  two[0].body = (const uint8_t *)listed;
-  two[0].body_len = strlen(listed);
-  two[1].name = "b:61";
-  two[1].body = blob;
-  two[1].body_len = sizeof blob;
-  ASSERT_TRUE(make_zip_n(two, 2, 0, &zip, &zip_len));
-  EXPECT_EQ(GDEFSTOR_ERR_LIMIT,
-      gdefstor_snapshot_import(store, "other", 5, zip, zip_len, &limits));
-  free(zip);
 }
 
 TEST_F(Limits, JsonDepthAtBound) {
