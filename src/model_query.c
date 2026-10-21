@@ -161,7 +161,7 @@ static GDEFSTOR_Result operand_class(const GDEFSTOR_QueryOperand * o,
     out->scale = 0;
     return GDEFSTOR_OK;
   default:
-    /* COLUMN and CONST are the projection form's. */
+    /* A CONST is a blind MAC's alone (BLIND); nothing else is an operand. */
     return GDEFSTOR_ERR_INVALID;
   }
 }
@@ -345,9 +345,8 @@ static GDEFSTOR_Result check_node(Check * c, const GDEFSTOR_QueryNode * n,
 static GDEFSTOR_Result check_sort(const Check * c, const GDEFSTOR_QuerySort * s) {
   const GDEFSTOR_QueryOperand * o = &s->key;
   Class k;
-  if (s->numeric != 0 ||
-      (o->flags & ~(GDEFSTOR_QUERY_EMPTY_IF_NONE | GDEFSTOR_QUERY_FIRST)) !=
-          0) {
+  if ((o->flags & ~(GDEFSTOR_QUERY_EMPTY_IF_NONE | GDEFSTOR_QUERY_FIRST)) !=
+      0) {
     return GDEFSTOR_ERR_INVALID;
   }
   if (o->kind == GDEFSTOR_QUERY_FIELD) {
@@ -399,8 +398,7 @@ static GDEFSTOR_Result run(GDEFSTOR_Store * store, const char * tenant,
   if (q->sort_count > GDEFSTOR_QUERY_MAX_SORTS) {
     return GDEFSTOR_ERR_LIMIT;
   }
-  if ((q->sorts == NULL && q->sort_count != 0) || q->select_count != 0 ||
-      q->entity_numeric != 0 ||
+  if ((q->sorts == NULL && q->sort_count != 0) ||
       !gdefstor_model_lang_ok(q->language, q->language_len)) {
     /* One language, always: every field in the query reads it. */
     return GDEFSTOR_ERR_INVALID;

@@ -2293,12 +2293,11 @@ TEST_F(ModelQuery, RefusesWhatItCannotAnswer) {
   refused(q.Cmp(GDEFSTOR_QUERY_EQ, q.Field("total"),
       q.Values({Decimal(1)})), GDEFSTOR_OK);
   {
-    GDEFSTOR_QueryOperand col;
-    std::memset(&col, 0, sizeof col);
-    col.kind = GDEFSTOR_QUERY_COLUMN;
-    col.column = "number";
-    col.column_len = 6;
-    refused(q.Cmp(GDEFSTOR_QUERY_EQ, col, q.Values({Text("x")})), I);
+    /* An operand of no kind the form has. */
+    GDEFSTOR_QueryOperand odd;
+    std::memset(&odd, 0, sizeof odd);
+    odd.kind = 99;
+    refused(q.Cmp(GDEFSTOR_QUERY_EQ, odd, q.Values({Text("x")})), I);
   }
   std::vector<GDEFSTOR_Value> lots(GDEFSTOR_QUERY_MAX_TEXTS + 1, Text("x"));
   refused(q.Cmp(GDEFSTOR_QUERY_IN, q.Field("number"), q.Values(lots)),
@@ -2313,11 +2312,6 @@ TEST_F(ModelQuery, RefusesWhatItCannotAnswer) {
   refused(nullptr, I, {By(q.Field("notes"))});
   refused(nullptr, I, {By(q.Field("lines.sku"))});
   refused(nullptr, I, {By(q.Values({Text("x")}))});
-  {
-    GDEFSTOR_QuerySort s = By(q.Field("total"));
-    s.numeric = 1;
-    refused(nullptr, I, {s});
-  }
   /* A deep tree is a limit, not a crash. */
   const GDEFSTOR_QueryNode * deep = q.Op(GDEFSTOR_QUERY_TRUE, {});
   for (int i = 0; i < GDEFSTOR_QUERY_MAX_DEPTH + 1; i++) {
@@ -2332,13 +2326,10 @@ TEST_F(ModelQuery, RefusesWhatItCannotAnswer) {
       q.Values({Text("x")}))).rc);
   EXPECT_EQ(I, Ask(store, "site.p", q.Cmp(GDEFSTOR_QUERY_EQ, q.Field("gone"),
       q.Values({Text("x")}))).rc);
-  /* A select, or the projection form's numeric tiebreak. */
+  /* A query that binds no language. */
   GDEFSTOR_Query bad;
   std::memset(&bad, 0, sizeof bad);
   bad.size = sizeof bad;
-  bad.language = kLang;
-  bad.language_len = kLangLen;
-  bad.entity_numeric = 1;
   GDEFSTOR_QueryResult * r = nullptr;
   EXPECT_EQ(I, gdefstor_entity_query(store, kTenant, 2, kPo, std::strlen(kPo),
       &bad, &r));

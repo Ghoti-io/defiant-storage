@@ -1,78 +1,14 @@
-# Queries over projections
+# Queries over entities
 
-`query.h` adds a backend-neutral way to ask which rows of one projection type
-match a condition, in what order, a page at a time (AD-13: the entity layer
-never speaks SQL). `gdefstor_projection_query()` returns a page and the total;
-`gdefstor_projection_count()` returns only the total.
-
-A query is data. The caller builds a bounded tree of predicates (`and`, `or`,
-`not`, `=`, `!=`, `in`, `<`, `<=`, `>`, `>=`, `true`, `false`) over operands that
-are sets of texts: constants, a column of the row, a column of another
-projection type's row with the same entity argument (a semi-join on identity),
-or the entity argument itself. A column can hold a JSON document, an object of
-objects whose leaves are arrays of strings, which is what a revision's `lang`
-is; the operand then names a language and a field and reads the array there.
-The meaning of each operator, of an absent column, of the empty-if-none flag,
-of the integer rule and of the sort keys is in the header comment, and the
-reference for all of it is `src/query.c`.
-
-## What a backend does
-
-`GDEFSTOR_Backend::query` is optional. A backend that leaves it NULL is
-answered by the port's own scan: it lists the keys of the type, reads each row
-through `get`, and evaluates the tree row by row. That is the reference
-answer, and it is what the memory backend uses. A backend that sets `query`
-must give the same rows, in the same order, with the same total, for every
-query. The conformance suite (`tests/conformance/query.inc`, installed with
-`suite.inc`) checks every backend against a model written apart from the
-library, over generated rows and generated queries, and over the named cases
-(numeric text, constants that look like SQL, type names that look like
-patterns, damaged documents, the caps).
-
-The SQLite backend answers `query` by compiling the tree into one `SELECT`
-over `defiant_record` and running it. See its documentation for exactly what
-that pushes down and what it does not.
-
-## Limits
-
-| Limit | Value |
-|---|---|
-| nesting of the tree | 64 |
-| nodes, counted as the tree is walked | 8192 |
-| texts in one constant operand | 256 |
-| bytes in one text of a constant | 65536 |
-| sort keys | 4 |
-| returned columns | 8 |
-| page size | 1000; a larger limit is clamped, 0 means every match |
-
-A tree over a limit is `GDEFSTOR_ERR_LIMIT`; a shape that makes no sense is
-`GDEFSTOR_ERR_INVALID`; a row that cannot be read (a damaged JSON document) is
-`GDEFSTOR_ERR_CORRUPT` and no partial answer is returned.
-
-## Order
-
-Rows come in the order of the sort keys, then by the entity argument, which is
-the final tiebreak, so a page is always a slice of one total order. By default
-the entity argument sorts as bytes; with `entity_numeric` it sorts as an
-integer first (a row whose entity argument is not an integer sorts ahead of
-those that are), then as bytes.
-
-## What it does not do
-
-It checks no permission. It cannot index: projections are stored as encoded
-rows under one key each, so a query reads every row of the type. An index
-would need the columns to be stored apart from the encoded row, which is a
-change to the physical layout of every backend (AD-14's column projection) and
-is not part of this form.
-
-## Over entities
-
-`gdefstor_entity_query()` and `gdefstor_entity_count()` ask the same tree, a
-sort and a page of the current entities of one declared type (the entity
-port, `documentation/model.md`), **in one language**: the query names it
-(`GDEFSTOR_Query::language`, a language tag; the count takes it as an
-argument) and it is required. The operators and the limits are the ones
-above; the operands are typed:
+`gdefstor_entity_query()` and `gdefstor_entity_count()` ask a tree of
+predicates (`and`, `or`, `not`, `=`, `!=`, `in`, `<`, `<=`, `>`, `>=`, `true`,
+`false`, `EXISTS`, `BLIND`), a sort and a page of the current entities of one
+declared type (the entity port, `documentation/model.md`), **in one
+language**: the query names it (`GDEFSTOR_Query::language`, a language tag;
+the count takes it as an argument) and it is required (AD-13: the entity
+layer never speaks SQL). A query is data: the caller builds a bounded tree in
+its own memory and the port reads it during one call. The operands are
+typed:
 
 | Operand | Its values on an entity | Type |
 |---|---|---|
@@ -105,7 +41,8 @@ What it supports:
   `in`, range or `BLIND` holds on it, `!=` and a `not` around a comparison
   do, and it sorts as no value. `META` and `ENTITY` read alike in every
   language.
-- `and`, `or`, `not`, `true`, `false`, as above.
+- `and`, `or` and `not` are the usual truth tables; an `and` or `or` with no
+  children is true and false.
 - `EXISTS` names another declared type and holds when some entity of it
   satisfies the child, whose `OUTER` operands read the entity being decided:
   `EXISTS site.customer (ENTITY = OUTER customer and vip = true)`. One level;
@@ -149,12 +86,24 @@ retired field, a field that does not exist); a personal field anywhere but
 in `BLIND` (its value is ciphertext: never compared, ranged or sorted), and a
 `BLIND` on anything else or with a MAC of another length; sides of different
 types; an ordered comparison on text, references or booleans; `in` without a
-constant list; `COLUMN` and `CONST` (the projection form's operands) outside
-`BLIND`; flags other than `OUTER` and the three above, or one of those
-where it does not apply; `OUTER` outside an `EXISTS`; an `EXISTS` inside
-another, or one naming a language tag that is not one; a sort on a nested
-field, on a multiple field without `FIRST`, or with `numeric`; select columns;
-`entity_numeric`. The caps above are `GDEFSTOR_ERR_LIMIT`.
+constant list; a `CONST` outside `BLIND`; flags other than `OUTER` and the
+three above, or one of those where it does not apply; `OUTER` outside an
+`EXISTS`; an `EXISTS` inside another, or one naming a language tag that is not
+one; a sort on a nested field or on a multiple field without `FIRST`. The caps
+below are `GDEFSTOR_ERR_LIMIT`.
+
+| Limit | Value |
+|---|---|
+| nesting of the tree | 64 |
+| nodes, counted as the tree is walked | 8192 |
+| constants in one operand | 256 |
+| bytes in one text of a constant | 65536 |
+| sort keys | 4 |
+| page size | 1000; a larger limit is clamped, 0 means every match |
+
+The query sees the last commit and checks no permission: the caller of the
+port is the trusted layer, and a caller that serves a visitor puts the
+visitor's access filter into the tree.
 
 A backend answers through `GDEFSTOR_ModelBackend::query`, handed the checked
 query and the declaration of every type it names, and must give the answer

@@ -20,88 +20,18 @@
 
 /**
  * @file query.h
- * @brief A backend-neutral query over the rows of one projection type.
+ * @brief The query form over the current entities of one declared type.
  * @stability free
  *
  * A query is **data, not code**: a bounded tree of predicates, a sort, an
- * offset, a limit and the columns to return. The caller builds the tree in its
- * own memory and the port reads it during one call. Nothing in it is ever
- * spliced into SQL: a backend that speaks SQL builds its statement from a fixed
- * vocabulary, and every constant, and the page, reach it as a bound value.
+ * offset and a limit. The caller builds the tree in its own memory and the
+ * port reads it during one call. Nothing in it is ever spliced into SQL: a
+ * backend that speaks SQL builds its statement from a fixed vocabulary, and
+ * every constant, and the page, reach it as a bound value.
+ * gdefstor_entity_query() and gdefstor_entity_count() ask it of the entities
+ * of one declared type (model.h), over their current trees.
  *
- * ## What a predicate sees
- *
- * Every operand is a **set of texts** (byte strings):
- *
- * - ::GDEFSTOR_QUERY_CONST: the listed texts. Zero texts is the empty set.
- * - ::GDEFSTOR_QUERY_COLUMN: a column of the row, or of another projection
- *   type's row with the same entity argument (`join_type`). A column that is
- *   not there, and a joined row that is not there, is the empty set. With a
- *   path, the column is a JSON document, an object of objects whose leaves are
- *   arrays of strings (`{"en":{"title":["a","b"]}}`), and the operand is the
- *   array at `path1` then `path2`; anything missing is the empty set.
- *   ::GDEFSTOR_QUERY_EMPTY_IF_NONE turns an empty set into the single empty
- *   text, which is how a field with no value reads.
- * - ::GDEFSTOR_QUERY_ENTITY: the row's entity argument.
- *
- * `=` holds when some text on the left equals some text on the right, byte for
- * byte; `!=` holds exactly when `=` does not; `in` is `=` against a constant
- * list. `<`, `<=`, `>` and `>=` hold when some pair of texts are both integers
- * (`-?[0-9]{1,18}`, so "07" is 7) and stand in the relation; a text that is
- * not an integer makes its pair false, never an error. `and`, `or` and `not`
- * are the usual truth tables, and an `and` or `or` with no children is true
- * and false.
- *
- * ## A semi-join
- *
- * ::GDEFSTOR_QUERY_EXISTS holds on a row when some row of another projection
- * type (`exists_type`, any entity) satisfies its one child, which is a
- * predicate of that other row. Operands of the child flagged
- * ::GDEFSTOR_QUERY_OUTER are of the row EXISTS is being decided for, so the
- * child can say "the other row's column equals this row's column". An
- * EXISTS inside an EXISTS is refused, and so is an OUTER operand outside one.
- * A relation read as a condition is one of these.
- *
- * ## Order and pages
- *
- * Rows are ordered by the sort keys, then by the entity argument, which is
- * the final tiebreak, so a page is always the same slice of one total order.
- * A sort key is the first text of its operand (none sorts before every text
- * including the empty one). A numeric key puts a text that is not an integer
- * where "none" is, ahead of every integer, tied with the others like it. The
- * entity tiebreak is by bytes, or by integer value (then bytes) when
- * GDEFSTOR_Query::entity_numeric is set. A limit above
- * ::GDEFSTOR_QUERY_LIMIT_MAX is clamped to it; a limit of 0 asks for every
- * match. The total is the number of matches before the offset and the limit.
- *
- * ## Limits
- *
- * A tree deeper than ::GDEFSTOR_QUERY_MAX_DEPTH, with more than
- * ::GDEFSTOR_QUERY_MAX_NODES nodes, or a constant larger than the caps below
- * is refused with ::GDEFSTOR_ERR_LIMIT. A shape that makes no sense is
- * ::GDEFSTOR_ERR_INVALID. A row that cannot be read (a column table or a JSON
- * document that is damaged) is ::GDEFSTOR_ERR_CORRUPT and no partial answer is
- * returned.
- *
- * The query sees the last commit. It checks no permission: the caller of the
- * port is the trusted layer, and a caller that serves a visitor puts the
- * visitor's access filter into the tree.
- *
- * ## Over entities
- *
- * gdefstor_entity_query() and gdefstor_entity_count() ask the same form of
- * the entities of one declared type (model.h), over their current trees. The
- * operands are typed there, and the text operands above are refused.
- *
- * A query binds **one language** (GDEFSTOR_Query::language, required there):
- * every FIELD operand and every FIELD sort key in it, inside an EXISTS too,
- * reads the current items of that language's tree and of no other, so two
- * conditions on one entity are always about the same language. An entity
- * with no tree in that language is still an entity of the type: it reads as
- * one whose every field is absent, so no comparison of a field matches it
- * (a NOT around one does, as for an absent value) and it sorts as no value.
- * META and ENTITY operands are the entity's and read the same in every
- * language.
+ * ## Operands
  *
  * - ::GDEFSTOR_QUERY_FIELD: a field path (`lines.taxes.amount`) to an active,
  *   non-personal scalar field. Its set is that field's values on every current
@@ -112,20 +42,51 @@
  * - ::GDEFSTOR_QUERY_VALUES: typed constants (GDEFSTOR_Value), all of one type.
  * - ::GDEFSTOR_QUERY_META: a fact of the entity record (::GDEFSTOR_QueryMeta).
  * - ::GDEFSTOR_QUERY_ENTITY: the entity's public id, typed as a reference.
+ * - ::GDEFSTOR_QUERY_CONST: texts; only the MAC of blind-index equality.
  *
  * The two sides of a comparison have the same type (a reference compares with
  * a reference or the public id; a decimal with a decimal of the same scale).
  * `=`, `!=` and `in` take any type; `<`, `<=`, `>`, `>=` take integer, decimal,
- * float, date and date-time, and compare numbers, not text. EXISTS names
- * another declared type; its child is a predicate over that type's entities,
- * and an ::GDEFSTOR_QUERY_OUTER operand reads the entity EXISTS is decided
- * for. A sort key is a single scalar field of the root group, a META fact or
- * the public id; no value sorts before every value; text sorts by bytes. The
+ * float, date and date-time, and compare numbers, not text. `=` holds when
+ * some value on the left equals some on the right; `!=` holds exactly when
+ * `=` does not; `in` is `=` against a list. `and`, `or` and `not` are the
+ * usual truth tables, and an `and` or `or` with no children is true and false.
+ *
+ * ## Languages
+ *
+ * A query binds **one language** (GDEFSTOR_Query::language, required): every
+ * FIELD operand and every FIELD sort key in it, inside an EXISTS too, reads
+ * the current items of that language's tree and of no other, so two
+ * conditions on one entity are always about the same language. An entity
+ * with no tree in that language is still an entity of the type: it reads as
+ * one whose every field is absent, so no comparison of a field matches it
+ * (a NOT around one does, as for an absent value) and it sorts as no value.
+ * META and ENTITY operands are the entity's and read the same in every
+ * language.
+ *
+ * ## A semi-join
+ *
+ * ::GDEFSTOR_QUERY_EXISTS names another declared type; its one child is a
+ * predicate over that type's entities, and an operand flagged
+ * ::GDEFSTOR_QUERY_OUTER reads the entity EXISTS is decided for, so the child
+ * can say "the other entity's field equals this one's". An EXISTS inside an
+ * EXISTS is refused, and so is an OUTER operand outside one. A relation read
+ * as a condition is one of these. An EXISTS may name the language its other
+ * type is read in (GDEFSTOR_QueryNode::exists_language): its FIELD operands
+ * then read that language's items, and its OUTER operands the query's. With
+ * none it is the query's language, as everywhere else.
+ *
+ * ## Order and pages
+ *
+ * A sort key is a single scalar field of the root group, a META fact or the
+ * public id; no value sorts before every value; text sorts by bytes. The
  * final tiebreak is the internal row, ascending even under a descending sort,
- * which is creation order. The total counts every match before the offset and
- * the limit. Flags other than the three below, a select, `numeric` on a
- * sort and `entity_numeric` are ::GDEFSTOR_ERR_INVALID, and so is a type that
- * was never declared.
+ * which is creation order, so a page is always the same slice of one total
+ * order. A limit above ::GDEFSTOR_QUERY_LIMIT_MAX is clamped to it; a limit
+ * of 0 asks for every match. The total counts every match before the offset
+ * and the limit.
+ *
+ * ## Flags
  *
  * Three flags read an operand or a sort key the way a caller whose own values
  * are texts reads them (core's conditions are), and are refused anywhere else:
@@ -142,10 +103,7 @@
  *   of the root group, and an entity sorts by the value of its first item
  *   (the lowest order key, then the lowest item id) that has one.
  *
- * An EXISTS may name the language its other type is read in
- * (GDEFSTOR_QueryNode::exists_language): its FIELD operands then read that
- * language's items, and its OUTER operands the query's. With none it is the
- * query's language, as everywhere else.
+ * ## Blind-index equality
  *
  * A personal field holds ciphertext, so the comparisons above refuse it; it is
  * matched only by ::GDEFSTOR_QUERY_BLIND, blind-index equality: the left
@@ -155,10 +113,21 @@
  * field's group, in the query's language, has a value whose current version
  * has a blind row with that MAC (gdefstor_tree_set_blind()), so "some item
  * matches" for multiples and groups, and an older version's MAC does not
- * match. It composes with every
- * other node, inside an EXISTS too. A personal field is never a sort key and
- * never compared by range. On a store whose backend has no blind table the
- * node is ::GDEFSTOR_ERR_UNSUPPORTED.
+ * match. It composes with every other node, inside an EXISTS too. A personal
+ * field is never a sort key and never compared by range. On a store whose
+ * backend has no blind table the node is ::GDEFSTOR_ERR_UNSUPPORTED.
+ *
+ * ## Limits and refusals
+ *
+ * A tree deeper than ::GDEFSTOR_QUERY_MAX_DEPTH, with more than
+ * ::GDEFSTOR_QUERY_MAX_NODES nodes, or a constant larger than the caps below
+ * is refused with ::GDEFSTOR_ERR_LIMIT. A shape that makes no sense, a flag
+ * where it does not apply, and a type that was never declared are
+ * ::GDEFSTOR_ERR_INVALID.
+ *
+ * The query sees the last commit. It checks no permission: the caller of the
+ * port is the trusted layer, and a caller that serves a visitor puts the
+ * visitor's access filter into the tree.
  */
 
 #ifndef GHOTI_IO_GDEFSTOR_QUERY_H
@@ -184,21 +153,19 @@ extern "C" {
 #define GDEFSTOR_QUERY_MAX_TEXT_BYTES 65536
 /** Sort keys. */
 #define GDEFSTOR_QUERY_MAX_SORTS 4
-/** Columns returned with each row. */
-#define GDEFSTOR_QUERY_MAX_SELECT 8
 /** The largest page. A larger limit is clamped to this. */
 #define GDEFSTOR_QUERY_LIMIT_MAX 1000
 
-/** An operand's flag: an empty set is the single empty text. */
+/** An operand's flag: a text or reference field with no value is the single
+ * empty text ("Flags"). */
 #define GDEFSTOR_QUERY_EMPTY_IF_NONE 1
-/** An operand's flag, inside an EXISTS: the operand is of the row the EXISTS
- * is being decided for (the outer row), not of the row it looks at. */
+/** An operand's flag, inside an EXISTS: the operand is of the entity the
+ * EXISTS is being decided for (the outer one), not of the one it looks at. */
 #define GDEFSTOR_QUERY_OUTER 2
-/** An operand's flag, over entities: a REFERENCE operand is compared as TEXT
- * ("Over entities"). */
+/** An operand's flag: a REFERENCE operand is compared as TEXT ("Flags"). */
 #define GDEFSTOR_QUERY_AS_TEXT 4
-/** A sort key's flag, over entities: a root MULTIPLE scalar field, sorted by
- * its first item's value ("Over entities"). */
+/** A sort key's flag: a root MULTIPLE scalar field, sorted by its first
+ * item's value ("Flags"). */
 #define GDEFSTOR_QUERY_FIRST 8
 
 /** One text. Borrowed for the call that takes it. */
@@ -209,12 +176,11 @@ typedef struct GDEFSTOR_QueryText {
 
 /** What an operand is. */
 typedef enum GDEFSTOR_QueryKind {
-  GDEFSTOR_QUERY_CONST = 1, ///< The texts listed.
-  GDEFSTOR_QUERY_COLUMN,    ///< A column, see the file comment.
-  GDEFSTOR_QUERY_ENTITY,    ///< The entity argument of the row (an entity's public id).
-  GDEFSTOR_QUERY_FIELD,     ///< Entities only: the values of a field path.
-  GDEFSTOR_QUERY_VALUES,    ///< Entities only: typed constants.
-  GDEFSTOR_QUERY_META       ///< Entities only: a fact of the entity record.
+  GDEFSTOR_QUERY_CONST = 1, ///< The texts listed: a blind MAC.
+  GDEFSTOR_QUERY_ENTITY,    ///< The entity's public id.
+  GDEFSTOR_QUERY_FIELD,     ///< The values of a field path.
+  GDEFSTOR_QUERY_VALUES,    ///< Typed constants.
+  GDEFSTOR_QUERY_META       ///< A fact of the entity record.
 } GDEFSTOR_QueryKind;
 
 /** The facts of an entity record a ::GDEFSTOR_QUERY_META operand reads. */
@@ -229,19 +195,10 @@ typedef enum GDEFSTOR_QueryMeta {
   GDEFSTOR_META_REVISION_WHO
 } GDEFSTOR_QueryMeta;
 
-/** One side of a comparison, a sort key or a returned column. */
+/** One side of a comparison, or a sort key. */
 typedef struct GDEFSTOR_QueryOperand {
   int kind;                   ///< A ::GDEFSTOR_QueryKind.
   int flags;                  ///< ::GDEFSTOR_QUERY_EMPTY_IF_NONE and the others, or 0.
-  const char * column;        ///< COLUMN: the column name.
-  size_t column_len;          ///< Length of @ref column.
-  const char * join_type;     ///< COLUMN: another projection type, or NULL.
-  size_t join_type_len;       ///< Length of @ref join_type.
-  int path_depth;             ///< COLUMN: 0 (plain), or 2 (JSON, two keys).
-  const char * path1;         ///< The first key when @ref path_depth is 2.
-  size_t path1_len;           ///< Length of @ref path1.
-  const char * path2;         ///< The second key when @ref path_depth is 2.
-  size_t path2_len;           ///< Length of @ref path2.
   const GDEFSTOR_QueryText * texts; ///< CONST: the texts.
   size_t text_count;          ///< CONST: how many.
   const char * field;         ///< FIELD: a dotted path of field names.
@@ -258,18 +215,18 @@ typedef enum GDEFSTOR_QueryOp {
   GDEFSTOR_QUERY_AND,      ///< Every child holds.
   GDEFSTOR_QUERY_OR,       ///< Some child holds.
   GDEFSTOR_QUERY_NOT,      ///< The one child does not hold.
-  GDEFSTOR_QUERY_EQ,       ///< Some left text equals some right text.
-  GDEFSTOR_QUERY_NE,       ///< No left text equals any right text.
-  GDEFSTOR_QUERY_IN,       ///< EQ against a constant list (right is CONST).
-  GDEFSTOR_QUERY_LT,       ///< Some integer pair, left < right.
-  GDEFSTOR_QUERY_LE,       ///< Some integer pair, left <= right.
-  GDEFSTOR_QUERY_GT,       ///< Some integer pair, left > right.
-  GDEFSTOR_QUERY_GE,       ///< Some integer pair, left >= right.
-  GDEFSTOR_QUERY_EXISTS,   ///< Some row of another type satisfies the child.
-  /** Entities only: blind-index equality. Left is a FIELD naming a personal
-   * field, right a CONST of one text, the ::GDEFSTOR_BLIND_MAC_BYTES bytes of
-   * a MAC: holds when some current value version of the field has a blind
-   * row with that MAC ("Over entities"). */
+  GDEFSTOR_QUERY_EQ,       ///< Some left value equals some right value.
+  GDEFSTOR_QUERY_NE,       ///< No left value equals any right value.
+  GDEFSTOR_QUERY_IN,       ///< EQ against a list (right is VALUES).
+  GDEFSTOR_QUERY_LT,       ///< Some pair, left < right.
+  GDEFSTOR_QUERY_LE,       ///< Some pair, left <= right.
+  GDEFSTOR_QUERY_GT,       ///< Some pair, left > right.
+  GDEFSTOR_QUERY_GE,       ///< Some pair, left >= right.
+  GDEFSTOR_QUERY_EXISTS,   ///< Some entity of another type satisfies the child.
+  /** Blind-index equality. Left is a FIELD naming a personal field, right a
+   * CONST of one text, the ::GDEFSTOR_BLIND_MAC_BYTES bytes of a MAC: holds
+   * when some current value version of the field has a blind row with that
+   * MAC ("Blind-index equality"). */
   GDEFSTOR_QUERY_BLIND
 } GDEFSTOR_QueryOp;
 
@@ -280,19 +237,17 @@ typedef struct GDEFSTOR_QueryNode {
   GDEFSTOR_QueryOperand right;              ///< Comparisons only.
   const struct GDEFSTOR_QueryNode * const * children; ///< AND, OR, NOT, EXISTS.
   size_t child_count;                       ///< How many children.
-  const char * exists_type;                 ///< EXISTS: the projection type.
+  const char * exists_type;                 ///< EXISTS: the other declared type.
   size_t exists_type_len;                   ///< Length of @ref exists_type.
-  /** EXISTS over entities: the language the other type's FIELD operands read
-   * (a language tag), or NULL for the query's. OUTER operands always read
-   * the query's. The projection form does not read it. */
+  /** EXISTS: the language the other type's FIELD operands read (a language
+   * tag), or NULL for the query's. OUTER operands always read the query's. */
   const char * exists_language;
   size_t exists_language_len;               ///< Its length.
 } GDEFSTOR_QueryNode;
 
 /** One sort key. */
 typedef struct GDEFSTOR_QuerySort {
-  GDEFSTOR_QueryOperand key; ///< COLUMN or ENTITY.
-  int numeric;               ///< Compare as integers.
+  GDEFSTOR_QueryOperand key; ///< FIELD, META or ENTITY ("Order and pages").
   int descending;            ///< Largest first.
 } GDEFSTOR_QuerySort;
 
@@ -302,14 +257,10 @@ typedef struct GDEFSTOR_Query {
   const GDEFSTOR_QueryNode * where;       ///< NULL is every row.
   const GDEFSTOR_QuerySort * sorts;       ///< Sort keys, or NULL.
   size_t sort_count;                      ///< How many.
-  int entity_numeric;                     ///< Final tiebreak as integers.
   uint64_t offset;                        ///< Matches skipped.
   uint64_t limit;                         ///< Rows returned, 0 for all.
-  const GDEFSTOR_QueryOperand * select;   ///< Columns to return, or NULL.
-  size_t select_count;                    ///< How many.
-  /** Over entities: the one language every field operand and sort key reads
-   * (a language tag, model.h); required there. The projection form does not
-   * read it. */
+  /** The one language every field operand and sort key reads (a language
+   * tag, model.h). Required. */
   const char * language;
   size_t language_len;                    ///< Its length.
 } GDEFSTOR_Query;
@@ -325,7 +276,7 @@ GDEFSTOR_API uint64_t gdefstor_query_result_total(
     const GDEFSTOR_QueryResult * r);
 
 /**
- * @brief The entity argument of a row. Valid until the result is freed.
+ * @brief The public id of a row's entity. Valid until the result is freed.
  *
  * @return ::GDEFSTOR_OK or ::GDEFSTOR_ERR_INVALID for an index out of range.
  */
@@ -339,12 +290,12 @@ GDEFSTOR_API void gdefstor_query_result_free(GDEFSTOR_QueryResult * r);
 /**
  * @brief Run a query over the current entities of one declared type.
  *
- * See "Over entities" above. gdefstor_query_result_entity() gives each
- * entity's public id; there are no select columns.
+ * See the file comment. gdefstor_query_result_entity() gives each entity's
+ * public id.
  *
  * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID, ::GDEFSTOR_ERR_LIMIT,
- *   ::GDEFSTOR_ERR_UNSUPPORTED (a store without the entity port),
- *   ::GDEFSTOR_ERR_OOM, or a backend's error.
+ *   ::GDEFSTOR_ERR_UNSUPPORTED (a blind node on a backend without the blind
+ *   table), ::GDEFSTOR_ERR_OOM, or a backend's error.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_query(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * type, size_t type_len,
