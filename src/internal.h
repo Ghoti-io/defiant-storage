@@ -44,6 +44,7 @@
 #define gdefstor_model_finish GHOTIIO_DEFSTOR(gdefstor_model_finish)
 #define gdefstor_store_create_on GHOTIIO_DEFSTOR(gdefstor_store_create_on)
 #define gdefstor_span_ok GHOTIIO_DEFSTOR(gdefstor_span_ok)
+#define gdefstor_schema_ok GHOTIIO_DEFSTOR(gdefstor_schema_ok)
 
 typedef struct GDEFSTOR_Waiter {
   GCU_Fiber * fiber;
@@ -96,6 +97,8 @@ void gdefstor_limits_resolve(const GDEFSTOR_Limits * in,
     GDEFSTOR_Limits * out);
 
 int gdefstor_span_ok(const char * p, size_t n, size_t cap);
+/* A schema stamp, `<component>/<version>` (gdefstor_schema_parse()). */
+int gdefstor_schema_ok(const char * stamp, size_t len);
 
 GDEFSTOR_Result gdefstor_json_escape_append(char ** buf, size_t * len,
     size_t * cap, const GDEFSTOR_Allocator * alloc, const char * s,

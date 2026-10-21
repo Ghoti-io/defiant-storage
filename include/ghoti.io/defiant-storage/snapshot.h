@@ -34,8 +34,10 @@
  * it is stored, ciphertext and subject. So a snapshot of one backend imports
  * into any other. The data set of a backup pair
  * (gdefstor_snapshot_export_tenant()) also says when it was taken and what
- * the tenant needs to come back up: its edition and its enabled modules with
- * the schema version of each one's stored data.
+ * the tenant needs to come back up: its edition and the components whose
+ * data it holds (core and its modules) with the schema version each one's
+ * current data is in. Every revision, draft and record carries the schema
+ * stamp it was written with (model.h), and a snapshot carries each exactly.
  *
  * A member named `ledger` is a copy of an erasure ledger. It is not imported
  * into the tenant. Import refuses any other member the manifest does not
@@ -130,8 +132,9 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_snapshot_export_at(
 #define GDEFSTOR_SNAPSHOT_MODULES_MAX 1024
 
 /**
- * @brief One module a data set names (AD-23): a module the tenant has
- * enabled, and the version of the stored-data schema its data is in (AD-15).
+ * @brief One component a data set names (AD-23): core (`core`) or a module
+ * whose data the tenant holds, and the version of the stored-data schema its
+ * current data is in (AD-15).
  *
  * The name is a module's machine name: a lowercase letter, then lowercase
  * letters, digits and hyphens, at most ::GDEFSTOR_SNAPSHOT_MODULE_NAME_MAX
@@ -149,10 +152,10 @@ typedef struct GDEFSTOR_SnapshotModule {
  *
  * As gdefstor_snapshot_export_at(), and the manifest also says the tenant's
  * edition (`"edition"`, `defiant-edition/<n>`, or null for a tenant that pins
- * none) and its enabled modules with the schema version of each one's stored
- * data (`"modules"`, by name). Storage does not read the tenant's enablement
- * itself: the caller (core) names the modules. Nothing is written to the
- * store.
+ * none) and the components whose data it holds with the schema version of
+ * each one's current data (`"modules"`, by name). Storage does not read the
+ * tenant's records itself: the caller (core) names the components. Nothing is
+ * written to the store.
  *
  * @param edition `defiant-edition/<n>`, or NULL with @p edition_len 0 for
  *   none.

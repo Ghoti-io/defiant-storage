@@ -132,14 +132,14 @@ static GDEFSTOR_Result own_end(GDEFSTOR_Write * w, GDEFSTOR_Result rc) {
 /* ---- records ------------------------------------------------------------- */
 
 GDEFSTOR_Result gdefstor_record_put(GDEFSTOR_Write * write, const char * ns,
-    size_t ns_len, const char * key, size_t key_len, const uint8_t * bytes,
-    size_t len) {
+    size_t ns_len, const char * key, size_t key_len, const char * schema,
+    size_t schema_len, const uint8_t * bytes, size_t len) {
   GDEFSTOR_ModelRecord r;
   GDEFSTOR_Store * store;
   void * txn = NULL;
   GDEFSTOR_Result rc;
   if (!name_ok(ns, ns_len) || !key_ok(key, key_len) ||
-      (bytes == NULL && len != 0)) {
+      (bytes == NULL && len != 0) || !gdefstor_schema_ok(schema, schema_len)) {
     return GDEFSTOR_ERR_INVALID;
   }
   if (len > GDEFSTOR_RECORD_MAX_BYTES) {
@@ -157,6 +157,8 @@ GDEFSTOR_Result gdefstor_record_put(GDEFSTOR_Write * write, const char * ns,
   r.key_len = key_len;
   r.bytes = len == 0 ? NULL : bytes;
   r.len = len;
+  r.schema = schema;
+  r.schema_len = schema_len;
   rc = store->model.record_put(store->model.sys_ctx, txn, &r);
   return rc == GDEFSTOR_OK ? rc : gdefstor_model_break(write, rc);
 }
@@ -195,15 +197,23 @@ typedef struct RecCatch {
   int found;
   uint8_t * bytes;
   size_t len;
+  char schema[GDEFSTOR_SCHEMA_MAX_BYTES + 1];
+  size_t schema_len;
 } RecCatch;
 
 static GDEFSTOR_Result catch_record(void * ctx, const GDEFSTOR_ModelRecord * r) {
   RecCatch * c = (RecCatch *)ctx;
   if (c->found || r == NULL || !same_span(r->ns, r->ns_len, c->ns, c->ns_len) ||
       !same_span(r->key, r->key_len, c->key, c->key_len) ||
-      (r->bytes == NULL && r->len != 0)) {
+      (r->bytes == NULL && r->len != 0) ||
+      (r->schema_len != 0 && !gdefstor_schema_ok(r->schema, r->schema_len))) {
     return GDEFSTOR_ERR_CORRUPT;
   }
+  if (r->schema_len > 0) {
+    memcpy(c->schema, r->schema, r->schema_len);
+  }
+  c->schema[r->schema_len] = '\0';
+  c->schema_len = r->schema_len;
   /* One byte more, so that an empty value is a block too. */
   c->bytes = (uint8_t *)gdefstor_mem(c->alloc, r->len + 1);
   if (c->bytes == NULL) {
@@ -220,7 +230,7 @@ static GDEFSTOR_Result catch_record(void * ctx, const GDEFSTOR_ModelRecord * r) 
 GDEFSTOR_Result gdefstor_record_get(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * ns, size_t ns_len,
     const char * key, size_t key_len, int * out_found, uint8_t ** out_bytes,
-    size_t * out_len) {
+    size_t * out_len, char * out_schema, size_t * out_schema_len) {
   RecCatch c;
   GDEFSTOR_ModelVisitor v;
   GDEFSTOR_Result rc = read_ready(store, tenant, tenant_len);
@@ -249,6 +259,12 @@ GDEFSTOR_Result gdefstor_record_get(GDEFSTOR_Store * store,
   *out_found = c.found;
   *out_bytes = c.bytes;
   *out_len = c.len;
+  if (out_schema != NULL) {
+    memcpy(out_schema, c.schema, c.schema_len + 1);
+  }
+  if (out_schema_len != NULL) {
+    *out_schema_len = c.schema_len;
+  }
   return GDEFSTOR_OK;
 }
 
@@ -257,6 +273,8 @@ typedef struct RecItem {
   size_t key_len;
   uint8_t * bytes;
   size_t len;
+  char * schema;
+  size_t schema_len;
 } RecItem;
 
 struct GDEFSTOR_RecordList {
@@ -280,6 +298,7 @@ void gdefstor_record_list_free(GDEFSTOR_RecordList * list) {
   for (i = 0; i < list->n; i++) {
     gcu_allocator_free(list->alloc, list->v[i].key);
     gcu_allocator_free(list->alloc, list->v[i].bytes);
+    gcu_allocator_free(list->alloc, list->v[i].schema);
   }
   gcu_allocator_free(list->alloc, list->v);
   gcu_allocator_free(list->alloc, list);
@@ -305,7 +324,8 @@ static GDEFSTOR_Result take_record(void * ctx, const GDEFSTOR_ModelRecord * r) {
       !key_ok(r->key, r->key_len) || r->key_len < l->prefix_len ||
       (l->prefix_len > 0 && memcmp(r->key, l->prefix, l->prefix_len) != 0) ||
       (l->n > 0 && key_cmp(l->v[l->n - 1].key, l->v[l->n - 1].key_len, r->key,
-                       r->key_len) >= 0)) {
+                       r->key_len) >= 0) ||
+      (r->schema_len != 0 && !gdefstor_schema_ok(r->schema, r->schema_len))) {
     return GDEFSTOR_ERR_CORRUPT;
   }
   if (l->n == l->cap) {
@@ -321,13 +341,18 @@ static GDEFSTOR_Result take_record(void * ctx, const GDEFSTOR_ModelRecord * r) {
   o = &l->v[l->n];
   memset(o, 0, sizeof *o);
   o->key = gdefstor_dup(l->alloc, r->key, r->key_len);
-  if (o->key == NULL) {
+  o->schema = gdefstor_dup(l->alloc, r->schema, r->schema_len);
+  if (o->key == NULL || o->schema == NULL) {
+    gcu_allocator_free(l->alloc, o->key);
+    gcu_allocator_free(l->alloc, o->schema);
     return GDEFSTOR_ERR_OOM;
   }
+  o->schema_len = r->schema_len;
   if (r->len > 0) {
     o->bytes = (uint8_t *)gdefstor_mem(l->alloc, r->len);
     if (o->bytes == NULL) {
       gcu_allocator_free(l->alloc, o->key);
+      gcu_allocator_free(l->alloc, o->schema);
       return GDEFSTOR_ERR_OOM;
     }
     memcpy(o->bytes, r->bytes, r->len);
@@ -386,7 +411,8 @@ size_t gdefstor_record_list_count(const GDEFSTOR_RecordList * list) {
 
 GDEFSTOR_Result gdefstor_record_list_item(const GDEFSTOR_RecordList * list,
     size_t index, const char ** out_key, size_t * out_key_len,
-    const uint8_t ** out_bytes, size_t * out_len) {
+    const uint8_t ** out_bytes, size_t * out_len, const char ** out_schema,
+    size_t * out_schema_len) {
   if (list == NULL || index >= list->n || out_key == NULL ||
       out_key_len == NULL || out_bytes == NULL || out_len == NULL) {
     return GDEFSTOR_ERR_INVALID;
@@ -395,6 +421,12 @@ GDEFSTOR_Result gdefstor_record_list_item(const GDEFSTOR_RecordList * list,
   *out_key_len = list->v[index].key_len;
   *out_bytes = list->v[index].bytes;
   *out_len = list->v[index].len;
+  if (out_schema != NULL) {
+    *out_schema = list->v[index].schema;
+  }
+  if (out_schema_len != NULL) {
+    *out_schema_len = list->v[index].schema_len;
+  }
   return GDEFSTOR_OK;
 }
 

@@ -104,6 +104,36 @@ extern "C" {
  */
 #define GDEFSTOR_MODEL_MAX_LANGUAGES 64
 
+/* ---- schema stamps (AD-15) ------------------------------------------------ */
+
+/** Bytes of a schema stamp's component name, at most. */
+#define GDEFSTOR_SCHEMA_COMPONENT_MAX 64
+/** Bytes of a schema stamp, at most: a component, `/`, and up to ten digits. */
+#define GDEFSTOR_SCHEMA_MAX_BYTES (GDEFSTOR_SCHEMA_COMPONENT_MAX + 11)
+
+/**
+ * @brief Split a schema stamp into its component and version.
+ *
+ * Every revision, draft and record carries a schema stamp: which component
+ * wrote it, and the version of that component's stored-data schema it was
+ * written in (AD-15), spelled `<component>/<version>` (`core/1`, `blog/3`).
+ * The component is a machine name: a lowercase letter, then lowercase
+ * letters, digits and hyphens, at most ::GDEFSTOR_SCHEMA_COMPONENT_MAX bytes.
+ * The version is 1 to 4294967295 in decimal, without leading zeros. Storage
+ * keeps a stamp exactly as it was written, through every export and import,
+ * and never reads it: what a version means is the writer's.
+ *
+ * @param out_component Receives the component, borrowed from @p stamp. May be
+ *   NULL.
+ * @param out_component_len Receives its length. May be NULL.
+ * @param out_version Receives the version. May be NULL.
+ * @return ::GDEFSTOR_OK, or ::GDEFSTOR_ERR_INVALID for anything that is not a
+ *   stamp. Nothing is written on failure.
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_schema_parse(const char * stamp,
+    size_t len, const char ** out_component, size_t * out_component_len,
+    uint32_t * out_version);
+
 /* ---- the store ------------------------------------------------------------ */
 
 struct GDEFSTOR_ModelBackend;
@@ -492,7 +522,14 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_entity_set_state(GDEFSTOR_Write * write,
     const char * public_id, size_t public_id_len, int published, int deleted,
     const char * actor, size_t actor_len, int64_t when_ms, int * out_changed);
 
-/** Who, when and why for a revision. */
+/**
+ * Who, when and why for a revision, and the schema stamp of its trees.
+ *
+ * @ref schema is required (gdefstor_schema_parse()): the component whose data
+ * the revision is and the version of that component's schema its trees are
+ * in. A save, a language removal and a revert take it from here; a draft
+ * applied takes the draft's own (gdefstor_draft_apply()).
+ */
 typedef struct GDEFSTOR_RevisionMeta {
   size_t size;          ///< `sizeof(GDEFSTOR_RevisionMeta)`.
   const char * who;     ///< The principal's public id; empty for the system.
@@ -500,6 +537,8 @@ typedef struct GDEFSTOR_RevisionMeta {
   int64_t when_ms;      ///< When, by the caller's clock.
   const char * why;     ///< Free text, UTF-8, up to 4096 bytes. May be empty.
   size_t why_len;       ///< Its length.
+  const char * schema;  ///< Its schema stamp, `<component>/<version>`.
+  size_t schema_len;    ///< Its length.
 } GDEFSTOR_RevisionMeta;
 
 /** One language's part of a save. @ref size is `sizeof(GDEFSTOR_LanguageTree)`. */
@@ -643,6 +682,11 @@ typedef struct GDEFSTOR_RevisionInfo {
    * by bytes and joined by `,`: `de,fr`. */
   const char * languages;
   size_t languages_len;  ///< Its length.
+  /** Its schema stamp, as written (GDEFSTOR_RevisionMeta::schema). Empty only
+   * for a revision a SQL store held before it took the step that added the
+   * stamp column (a store made before stamps existed). */
+  const char * schema;
+  size_t schema_len;     ///< Its length.
 } GDEFSTOR_RevisionInfo;
 
 /** One state change. Pointers are valid until the history is freed. */
@@ -758,7 +802,8 @@ typedef struct GDEFSTOR_DraftTree {
  * declared, and @p base_revision is 0. Each JSON is checked to be well formed
  * now; it is validated against the type when applied. Nothing outside the
  * draft is written. The stored draft is one JSON document (`defiant-draft/1`,
- * model.md) holding each language's tree as given.
+ * model.md) holding each language's tree as given, and @p schema, the stamp
+ * of the shape those trees are in (gdefstor_schema_parse()), beside it.
  *
  * @param trees The languages, each at most once, at most
  *   ::GDEFSTOR_MODEL_MAX_LANGUAGES; NULL when @p count is 0. A language the
@@ -770,8 +815,8 @@ typedef struct GDEFSTOR_DraftTree {
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_put(GDEFSTOR_Write * write,
     const char * type, size_t type_len, const char * public_id,
-    size_t public_id_len, uint64_t base_revision,
-    const GDEFSTOR_DraftTree * trees, size_t count);
+    size_t public_id_len, uint64_t base_revision, const char * schema,
+    size_t schema_len, const GDEFSTOR_DraftTree * trees, size_t count);
 
 /** A stored draft. Opaque. */
 typedef struct GDEFSTOR_Draft GDEFSTOR_Draft;
@@ -783,6 +828,8 @@ typedef struct GDEFSTOR_DraftInfo {
   size_t type_len;        ///< Its length.
   uint64_t base_revision; ///< The revision it was made from; 0 for a new entity.
   size_t language_count;  ///< Its languages: gdefstor_draft_tree() reads each.
+  const char * schema;    ///< Its schema stamp, as put (empty: see GDEFSTOR_RevisionInfo::schema).
+  size_t schema_len;      ///< Its length.
 } GDEFSTOR_DraftInfo;
 
 /**
@@ -854,6 +901,10 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_draft_delete(GDEFSTOR_Write * write,
 /**
  * @brief Apply a draft: gdefstor_entity_save_languages() with the draft's
  * trees and base revision, then delete the draft.
+ *
+ * The revision carries the draft's schema stamp, the shape its trees were
+ * written in, never @p meta's (which may be empty here): a draft put at an
+ * older version of its component's schema is applied as data of that version.
  *
  * For a reserved id this first creates the entity, with @p meta's who and when
  * as its creator and creation time. When the head has moved since the draft's
@@ -1066,6 +1117,8 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_blind_put(GDEFSTOR_Write * write,
  * gdefstor_model_rebuild() never touches records, and a snapshot export
  * includes them (AD-23; the format is the export's).
  *
+ * @param schema The record's schema stamp (gdefstor_schema_parse()): the
+ *   component that wrote it and its schema version. Required.
  * @param bytes The value, copied. May be NULL when @p len is 0: an empty
  *   value, which is a record (gdefstor_record_get() finds it).
  * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID (a name, a key or a write that
@@ -1075,7 +1128,7 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_blind_put(GDEFSTOR_Write * write,
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_record_put(GDEFSTOR_Write * write,
     const char * ns, size_t ns_len, const char * key, size_t key_len,
-    const uint8_t * bytes, size_t len);
+    const char * schema, size_t schema_len, const uint8_t * bytes, size_t len);
 
 /**
  * @brief Delete a record in this write. A record that is not there deletes
@@ -1099,13 +1152,17 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_record_delete(GDEFSTOR_Write * write,
  *   gdefstor_bytes_free() and the store's allocator; a non-NULL block even for
  *   an empty value), else NULL.
  * @param out_len Receives its length.
+ * @param out_schema NULL, or ::GDEFSTOR_SCHEMA_MAX_BYTES + 1 bytes that
+ *   receive the record's schema stamp, NUL-terminated (empty when not found,
+ *   and as GDEFSTOR_RevisionInfo::schema says).
+ * @param out_schema_len Receives its length. May be NULL.
  * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID, ::GDEFSTOR_ERR_UNSUPPORTED,
  *   ::GDEFSTOR_ERR_OOM, or a backend's error.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_record_get(GDEFSTOR_Store * store,
     const char * tenant, size_t tenant_len, const char * ns, size_t ns_len,
     const char * key, size_t key_len, int * out_found, uint8_t ** out_bytes,
-    size_t * out_len);
+    size_t * out_len, char * out_schema, size_t * out_schema_len);
 
 /** A page of records. Opaque. */
 typedef struct GDEFSTOR_RecordList GDEFSTOR_RecordList;
@@ -1135,10 +1192,14 @@ GDEFSTOR_API size_t gdefstor_record_list_count(const GDEFSTOR_RecordList * list)
  * @brief Record @p index of the page. Borrowed until the list is freed.
  * @param out_key Receives its key (not NUL-terminated by contract).
  * @param out_bytes Receives its value; may be NULL for an empty value.
+ * @param out_schema Receives its schema stamp (not NUL-terminated by
+ *   contract). May be NULL.
+ * @param out_schema_len Receives its length. May be NULL.
  */
 GDEFSTOR_API GDEFSTOR_Result gdefstor_record_list_item(
     const GDEFSTOR_RecordList * list, size_t index, const char ** out_key,
-    size_t * out_key_len, const uint8_t ** out_bytes, size_t * out_len);
+    size_t * out_key_len, const uint8_t ** out_bytes, size_t * out_len,
+    const char ** out_schema, size_t * out_schema_len);
 
 /** @brief Release a page. NULL is ignored. */
 GDEFSTOR_API void gdefstor_record_list_free(GDEFSTOR_RecordList * list);

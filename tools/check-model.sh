@@ -281,6 +281,24 @@ plant as-text-ignored src/model_query.c testModel \
   '  }
   return GDEFSTOR_OK;'
 
+# An import that writes every revision back at one stamp, the entity's
+# newest, so history loses the versions it was written at (AD-15).
+plant snapshot-import-restamps-history src/model_snapshot.c testModel \
+  'ModelSnapshot.EveryRowKeepsItsSchemaStampThroughAnExportAndAnImport' \
+  '    rev.schema = sr->schema;
+    rev.schema_len = sr->schema_len;' \
+  '    rev.schema = m->revs[e->rev0 + e->nrev - 1].schema;
+    rev.schema_len = m->revs[e->rev0 + e->nrev - 1].schema_len;'
+
+# A draft applied as data of the apply's stamp, not of the shape the draft
+# was written in.
+plant draft-applied-at-the-callers-stamp src/model.c testModel \
+  'ModelSnapshot.EveryRowKeepsItsSchemaStampThroughAnExportAndAnImport' \
+  '  stamped.schema = c.schema;
+  stamped.schema_len = c.schema_len;' \
+  '  stamped.schema = meta->schema;
+  stamped.schema_len = meta->schema_len;'
+
 # The writer queue admitting a second writer of a tenant while the first is
 # open (store.h): writes to one tenant stop being serializable.
 plant second-writer-admitted src/store.c testModel \

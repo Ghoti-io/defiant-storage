@@ -46,6 +46,12 @@
 #include <string>
 #include <vector>
 
+/* The schema stamp (model.h) every write of these suites carries: which
+ * component wrote the row and its schema version. Storage keeps it and never
+ * reads it, so one stamp serves every test that is not about stamps. */
+inline constexpr char kStamp[] = "test/1";
+inline constexpr size_t kStampLen = sizeof kStamp - 1;
+
 namespace snapshot_fixture {
 
 inline GDEFSTOR_Value V(int type) {
@@ -127,6 +133,8 @@ inline GDEFSTOR_RevisionMeta Meta(const char * who, int64_t when,
   m.when_ms = when;
   m.why = why;
   m.why_len = std::strlen(why);
+  m.schema = kStamp;
+  m.schema_len = kStampLen;
   return m;
 }
 
@@ -469,9 +477,9 @@ inline GDEFSTOR_Result Populate(GDEFSTOR_Store * s, const char * tenant,
     t[1].language = "fr";
     t[1].json = reinterpret_cast<const uint8_t *>(fr);
     t[1].json_len = std::strlen(fr);
-    GDEFSTOR_Result rc = gdefstor_draft_put(w, nullptr, 0, "o1", 2, 4, t, 2);
+    GDEFSTOR_Result rc = gdefstor_draft_put(w, nullptr, 0, "o1", 2, 4, kStamp, kStampLen, t, 2);
     if (rc == GDEFSTOR_OK) {
-      rc = gdefstor_draft_put(w, "shop.order", 10, "o9", 2, 0, t, 1);
+      rc = gdefstor_draft_put(w, "shop.order", 10, "o9", 2, 0, kStamp, kStampLen, t, 1);
     }
     return rc;
   }));
@@ -480,12 +488,13 @@ inline GDEFSTOR_Result Populate(GDEFSTOR_Store * s, const char * tenant,
     static const uint8_t bin[] = {0x00, 0xff, 0x10, 0x80};
     static const char text[] = "{\"on\":true,\"name\":\"caf\xc3\xa9\"}";
     GDEFSTOR_Result rc = gdefstor_record_put(w, "core.module", 11, "alpha", 5,
+        kStamp, kStampLen,
         reinterpret_cast<const uint8_t *>(text), std::strlen(text));
     if (rc == GDEFSTOR_OK) {
-      rc = gdefstor_record_put(w, "core.name", 9, "x:1", 3, bin, sizeof bin);
+      rc = gdefstor_record_put(w, "core.name", 9, "x:1", 3, kStamp, kStampLen, bin, sizeof bin);
     }
     if (rc == GDEFSTOR_OK) {
-      rc = gdefstor_record_put(w, "core.name", 9, "empty", 5, nullptr, 0);
+      rc = gdefstor_record_put(w, "core.name", 9, "empty", 5, kStamp, kStampLen, nullptr, 0);
     }
     return rc;
   }));

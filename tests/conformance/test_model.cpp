@@ -67,6 +67,7 @@ struct Rev {
   int64_t when = 0;
   std::string why;
   std::string langs;
+  std::string schema;
 };
 
 struct State {
@@ -110,6 +111,12 @@ struct Draft {
   std::string type;
   uint64_t base = 0;
   std::string json;
+  std::string schema;
+};
+
+struct Rec {
+  std::string bytes;
+  std::string schema;
 };
 
 struct Ob {
@@ -128,7 +135,7 @@ struct Tenant {
   std::map<std::string, Draft> drafts;
   uint64_t commit_seq = 0;
   /* Records, counters and the outbox: truth, which derive() leaves alone. */
-  std::map<std::string, std::map<std::string, std::string>> recs; /* ns, key */
+  std::map<std::string, std::map<std::string, Rec>> recs; /* ns, key */
   std::map<std::pair<int, std::string>, uint64_t> counters;
   std::map<std::pair<std::string, uint64_t>, Ob> outbox; /* stream, seq */
 };
@@ -477,6 +484,7 @@ static GDEFSTOR_Result s_apply(void * ctx, void * txn,
   r.when = a->revision->when_ms;
   r.why.assign(a->revision->why, a->revision->why_len);
   r.langs.assign(a->revision->languages, a->revision->languages_len);
+  r.schema.assign(a->revision->schema, a->revision->schema_len);
   e.revs.push_back(r);
   e.revision = n;
   e.last_item = a->last_item;
@@ -522,6 +530,8 @@ static GDEFSTOR_Result s_history(void * ctx, void * txn, const char * t,
     m.why_len = r.why.size();
     m.languages = r.langs.data();
     m.languages_len = r.langs.size();
+    m.schema = r.schema.data();
+    m.schema_len = r.schema.size();
     GDEFSTOR_Result rc = v->revision(v->ctx, row, &m);
     if (rc != GDEFSTOR_OK) {
       return rc;
@@ -578,6 +588,7 @@ static GDEFSTOR_Result s_draft_put(void * ctx, void * txn,
   x.type.assign(d->type, d->type_len);
   x.base = d->base_revision;
   x.json.assign(reinterpret_cast<const char *>(d->json), d->json_len);
+  x.schema.assign(d->schema, d->schema_len);
   static_cast<Txn *>(txn)->copy.drafts[std::string(d->public_id,
       d->public_id_len)] = x;
   return GDEFSTOR_OK;
@@ -603,6 +614,8 @@ static GDEFSTOR_Result s_draft_get(void * ctx, void * txn, const char * t,
   m.base_revision = it->second.base;
   m.json = reinterpret_cast<const uint8_t *>(it->second.json.data());
   m.json_len = it->second.json.size();
+  m.schema = it->second.schema.data();
+  m.schema_len = it->second.schema.size();
   return v->draft(v->ctx, &m);
 }
 
@@ -653,6 +666,8 @@ static GDEFSTOR_Result s_scan(void * ctx, const char * type, size_t type_len,
       m.why_len = r.why.size();
       m.languages = r.langs.data();
       m.languages_len = r.langs.size();
+      m.schema = r.schema.data();
+      m.schema_len = r.schema.size();
       rc = v->revision(v->ctx, e.row, &m);
     }
     if (rc != GDEFSTOR_OK) {
@@ -707,6 +722,8 @@ static GDEFSTOR_Result s_dump(void * ctx, const char * t, size_t tl, int which,
       m.base_revision = kv.second.base;
       m.json = reinterpret_cast<const uint8_t *>(kv.second.json.data());
       m.json_len = kv.second.json.size();
+      m.schema = kv.second.schema.data();
+      m.schema_len = kv.second.schema.size();
       rc = v->draft(v->ctx, &m);
       if (rc != GDEFSTOR_OK) {
         return rc;
@@ -888,7 +905,8 @@ static GDEFSTOR_Result s_blind_put(void * ctx, void * txn,
 /* ---- records, counters and the outbox ---------------------------------- */
 
 static GDEFSTOR_Result visit_record(const GDEFSTOR_ModelVisitor * v,
-    const std::string & ns, const std::string & key, const std::string & b) {
+    const std::string & ns, const std::string & key, const Rec & rec) {
+  const std::string & b = rec.bytes;
   GDEFSTOR_ModelRecord r;
   std::memset(&r, 0, sizeof r);
   r.ns = ns.data();
@@ -897,6 +915,8 @@ static GDEFSTOR_Result visit_record(const GDEFSTOR_ModelVisitor * v,
   r.key_len = key.size();
   r.bytes = b.empty() ? nullptr : reinterpret_cast<const uint8_t *>(b.data());
   r.len = b.size();
+  r.schema = rec.schema.data();
+  r.schema_len = rec.schema.size();
   return v->record(v->ctx, &r);
 }
 
@@ -924,8 +944,10 @@ static GDEFSTOR_Result s_record_put(void * ctx, void * txn,
     const GDEFSTOR_ModelRecord * r) {
   (void)ctx;
   Tenant & t = static_cast<Txn *>(txn)->copy;
-  t.recs[std::string(r->ns, r->ns_len)][std::string(r->key, r->key_len)] =
-      std::string(reinterpret_cast<const char *>(r->bytes), r->len);
+  Rec rec;
+  rec.bytes.assign(reinterpret_cast<const char *>(r->bytes), r->len);
+  rec.schema.assign(r->schema, r->schema_len);
+  t.recs[std::string(r->ns, r->ns_len)][std::string(r->key, r->key_len)] = rec;
   return GDEFSTOR_OK;
 }
 
@@ -1284,6 +1306,7 @@ TEST(ModelPort, ABackendWithoutTheSystemFamiliesServesTheRest) {
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(old, "t1", 2, nullptr, &w));
   uint64_t v = 0;
   EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_record_put(w, "a", 1, "b", 1,
+      kStamp, kStampLen,
       nullptr, 0));
   EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_counter_next(w, "a", 1, &v));
   EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_model_outbox_append(w, "s", 1,

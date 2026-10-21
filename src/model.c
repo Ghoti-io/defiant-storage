@@ -701,12 +701,15 @@ static size_t find_id(const Item * v, const size_t * idx, size_t n,
 
 /* ---- checking arguments -------------------------------------------------- */
 
-static GDEFSTOR_Result check_meta(const GDEFSTOR_Store * store,
-    const GDEFSTOR_RevisionMeta * meta) {
+/* @p need_schema: the revision takes its stamp from @p meta (every write but
+ * a draft's apply, which takes the draft's). */
+static GDEFSTOR_Result check_meta_as(const GDEFSTOR_Store * store,
+    const GDEFSTOR_RevisionMeta * meta, int need_schema) {
   if (meta == NULL || meta->size != sizeof(GDEFSTOR_RevisionMeta) ||
       !gdefstor_model_id_ok(meta->who, meta->who_len,
           store->limits.max_public_id_bytes, 1) ||
-      (meta->why == NULL && meta->why_len != 0)) {
+      (meta->why == NULL && meta->why_len != 0) ||
+      (need_schema && !gdefstor_schema_ok(meta->schema, meta->schema_len))) {
     return GDEFSTOR_ERR_INVALID;
   }
   if (meta->why_len > GDEFSTOR_MODEL_MAX_WHY_BYTES) {
@@ -716,6 +719,11 @@ static GDEFSTOR_Result check_meta(const GDEFSTOR_Store * store,
     return GDEFSTOR_ERR_INVALID;
   }
   return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result check_meta(const GDEFSTOR_Store * store,
+    const GDEFSTOR_RevisionMeta * meta) {
+  return check_meta_as(store, meta, 1);
 }
 
 static GDEFSTOR_Result write_store(GDEFSTOR_Write * write,
@@ -2218,6 +2226,8 @@ static GDEFSTOR_Result multi_apply(Multi * m, GDEFSTOR_Write * write,
   r.why_len = meta->why_len;
   r.languages = text;
   r.languages_len = text_len;
+  r.schema = meta->schema;
+  r.schema_len = meta->schema_len;
   nclose = 0;
   ninsert = 0;
   nblind = 0;
@@ -2771,6 +2781,7 @@ void gdefstor_history_free(GDEFSTOR_History * h) {
     gcu_allocator_free(h->alloc, (void *)h->revs[i].who);
     gcu_allocator_free(h->alloc, (void *)h->revs[i].why);
     gcu_allocator_free(h->alloc, (void *)h->revs[i].languages);
+    gcu_allocator_free(h->alloc, (void *)h->revs[i].schema);
   }
   for (i = 0; i < h->nstate; i++) {
     gcu_allocator_free(h->alloc, (void *)h->states[i].actor);
@@ -2841,7 +2852,8 @@ static GDEFSTOR_Result catch_revision(void * ctx, uint64_t row,
     h->revs = next;
     h->caprev = grown;
   }
-  if (!langs_text_ok(r->languages, r->languages_len)) {
+  if (!langs_text_ok(r->languages, r->languages_len) ||
+      (r->schema_len != 0 && !gdefstor_schema_ok(r->schema, r->schema_len))) {
     return GDEFSTOR_ERR_CORRUPT;
   }
   o = &h->revs[h->nrev];
@@ -2849,10 +2861,13 @@ static GDEFSTOR_Result catch_revision(void * ctx, uint64_t row,
   o->who = gdefstor_dup(h->alloc, r->who, r->who_len);
   o->why = gdefstor_dup(h->alloc, r->why, r->why_len);
   o->languages = gdefstor_dup(h->alloc, r->languages, r->languages_len);
-  if (o->who == NULL || o->why == NULL || o->languages == NULL) {
+  o->schema = gdefstor_dup(h->alloc, r->schema, r->schema_len);
+  if (o->who == NULL || o->why == NULL || o->languages == NULL ||
+      o->schema == NULL) {
     gcu_allocator_free(h->alloc, (void *)o->who);
     gcu_allocator_free(h->alloc, (void *)o->why);
     gcu_allocator_free(h->alloc, (void *)o->languages);
+    gcu_allocator_free(h->alloc, (void *)o->schema);
     return GDEFSTOR_ERR_OOM;
   }
   h->nrev += 1;
@@ -2983,6 +2998,7 @@ GDEFSTOR_Result gdefstor_entity_history(GDEFSTOR_Store * store,
         gcu_allocator_free(h->alloc, (void *)r->who);
         gcu_allocator_free(h->alloc, (void *)r->why);
         gcu_allocator_free(h->alloc, (void *)r->languages);
+        gcu_allocator_free(h->alloc, (void *)r->schema);
       }
     }
     h->nrev = k;
@@ -3016,6 +3032,8 @@ GDEFSTOR_Result gdefstor_history_revision(const GDEFSTOR_History * h,
   out->why_len = r->why_len;
   out->languages = r->languages;
   out->languages_len = r->languages_len;
+  out->schema = r->schema;
+  out->schema_len = r->schema_len;
   return GDEFSTOR_OK;
 }
 
@@ -3242,16 +3260,21 @@ typedef struct DraftCatch {
   size_t json_len;
   GDEFSTOR_DraftPart * parts; /* its languages, in order */
   size_t nparts;
+  char * schema;      /* its schema stamp, as put */
+  size_t schema_len;
 } DraftCatch;
 
 static void draft_catch_release(DraftCatch * c) {
   gcu_allocator_free(c->alloc, c->type);
   gcu_allocator_free(c->alloc, c->json);
   gcu_allocator_free(c->alloc, c->parts);
+  gcu_allocator_free(c->alloc, c->schema);
   c->type = NULL;
   c->json = NULL;
   c->parts = NULL;
   c->nparts = 0;
+  c->schema = NULL;
+  c->schema_len = 0;
 }
 
 static GDEFSTOR_Result catch_draft(void * ctx, const GDEFSTOR_ModelDraft * d) {
@@ -3259,12 +3282,17 @@ static GDEFSTOR_Result catch_draft(void * ctx, const GDEFSTOR_ModelDraft * d) {
   if (c->seen) {
     return GDEFSTOR_ERR_INTERNAL;
   }
+  if (d->schema_len != 0 && !gdefstor_schema_ok(d->schema, d->schema_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
   c->type = gdefstor_dup(c->alloc, d->type, d->type_len);
   c->json = (uint8_t *)gdefstor_mem(c->alloc, d->json_len + 1);
-  if (c->type == NULL || c->json == NULL) {
+  c->schema = gdefstor_dup(c->alloc, d->schema, d->schema_len);
+  if (c->type == NULL || c->json == NULL || c->schema == NULL) {
     draft_catch_release(c);
     return GDEFSTOR_ERR_OOM;
   }
+  c->schema_len = d->schema_len;
   if (d->json_len > 0) {
     memcpy(c->json, d->json, d->json_len);
   }
@@ -3382,11 +3410,13 @@ static GDEFSTOR_Result draft_document(const GDEFSTOR_Allocator * alloc,
 static GDEFSTOR_Result draft_store(GDEFSTOR_Write * write,
     GDEFSTOR_Store * store, void * txn, const char * type, size_t type_len,
     const char * public_id, size_t public_id_len, uint64_t base_revision,
-    const uint8_t * json, size_t json_len);
+    const char * schema, size_t schema_len, const uint8_t * json,
+    size_t json_len);
 
 GDEFSTOR_Result gdefstor_draft_put(GDEFSTOR_Write * write, const char * type,
     size_t type_len, const char * public_id, size_t public_id_len,
-    uint64_t base_revision, const GDEFSTOR_DraftTree * trees, size_t count) {
+    uint64_t base_revision, const char * schema, size_t schema_len,
+    const GDEFSTOR_DraftTree * trees, size_t count) {
   GDEFSTOR_Store * store;
   void * txn = NULL;
   uint8_t * json = NULL;
@@ -3396,7 +3426,8 @@ GDEFSTOR_Result gdefstor_draft_put(GDEFSTOR_Write * write, const char * type,
     return rc;
   }
   if (!gdefstor_model_id_ok(public_id, public_id_len,
-          write->limits.max_public_id_bytes, 0)) {
+          write->limits.max_public_id_bytes, 0) ||
+      !gdefstor_schema_ok(schema, schema_len)) {
     return GDEFSTOR_ERR_INVALID;
   }
   rc = draft_document(store->alloc, trees, count, &json, &json_len);
@@ -3405,7 +3436,7 @@ GDEFSTOR_Result gdefstor_draft_put(GDEFSTOR_Write * write, const char * type,
   }
   if (rc == GDEFSTOR_OK) {
     rc = draft_store(write, store, txn, type, type_len, public_id,
-        public_id_len, base_revision, json, json_len);
+        public_id_len, base_revision, schema, schema_len, json, json_len);
   }
   gcu_allocator_free(store->alloc, json);
   return rc;
@@ -3415,7 +3446,8 @@ GDEFSTOR_Result gdefstor_draft_put(GDEFSTOR_Write * write, const char * type,
 static GDEFSTOR_Result draft_store(GDEFSTOR_Write * write,
     GDEFSTOR_Store * store, void * txn, const char * type, size_t type_len,
     const char * public_id, size_t public_id_len, uint64_t base_revision,
-    const uint8_t * json, size_t json_len) {
+    const char * schema, size_t schema_len, const uint8_t * json,
+    size_t json_len) {
   GDEFSTOR_ModelDraft d;
   GDEFSTOR_Type * t = NULL;
   Ent e;
@@ -3453,6 +3485,8 @@ static GDEFSTOR_Result draft_store(GDEFSTOR_Write * write,
   d.base_revision = base_revision;
   d.json = json;
   d.json_len = json_len;
+  d.schema = schema;
+  d.schema_len = schema_len;
   rc = store->model.draft_put(store->model.ctx, txn, &d);
   if (exists) {
     ent_release(store->alloc, &e);
@@ -3498,6 +3532,8 @@ GDEFSTOR_Result gdefstor_draft_info(const GDEFSTOR_Draft * draft,
   out->type_len = draft->c.type_len;
   out->base_revision = draft->c.base;
   out->language_count = draft->c.nparts;
+  out->schema = draft->c.schema;
+  out->schema_len = draft->c.schema_len;
   return GDEFSTOR_OK;
 }
 
@@ -3744,11 +3780,12 @@ GDEFSTOR_Result gdefstor_draft_apply(GDEFSTOR_Write * write,
   Ent e;
   void * txn = NULL;
   int exists;
+  GDEFSTOR_RevisionMeta stamped;
   GDEFSTOR_Result rc = write_store(write, &store);
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
-  rc = check_meta(store, meta);
+  rc = check_meta_as(store, meta, 0);
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
@@ -3760,6 +3797,15 @@ GDEFSTOR_Result gdefstor_draft_apply(GDEFSTOR_Write * write,
       public_id_len, &c);
   if (rc != GDEFSTOR_OK) {
     return rc;
+  }
+  /* The revision is data of the shape the draft was written in. A draft a
+   * store kept from before stamps has none to give, and is not applied. */
+  stamped = *meta;
+  stamped.schema = c.schema;
+  stamped.schema_len = c.schema_len;
+  if (!gdefstor_schema_ok(c.schema, c.schema_len)) {
+    draft_catch_release(&c);
+    return GDEFSTOR_ERR_CORRUPT;
   }
   rc = find_entity(store, txn, write->tenant, write->tenant_len, public_id,
       public_id_len, &e);
@@ -3826,7 +3872,7 @@ GDEFSTOR_Result gdefstor_draft_apply(GDEFSTOR_Write * write,
     }
   }
   if (rc == GDEFSTOR_OK) {
-    rc = multi_apply(&m, write, exists ? e.row : row, e.revision, meta,
+    rc = multi_apply(&m, write, exists ? e.row : row, e.revision, &stamped,
         out_revision);
   }
   if (rc == GDEFSTOR_OK) {
@@ -4133,6 +4179,11 @@ static GDEFSTOR_Result dump_revision(void * ctx, uint64_t row,
   l_i64(l, r->when_ms);
   l_hex(l, r->why, r->why_len);
   l_hex(l, r->languages, r->languages_len);
+  /* The stamp is last, and only when there is one: a row a store kept from
+   * before stamps reads as it did. */
+  if (r->schema_len > 0) {
+    l_hex(l, r->schema, r->schema_len);
+  }
   l_end(l);
   return l->rc;
 }
@@ -4175,6 +4226,9 @@ static GDEFSTOR_Result dump_draft(void * ctx, const GDEFSTOR_ModelDraft * d) {
   l_hex(l, d->type, d->type_len);
   l_u64(l, d->base_revision);
   l_hex(l, d->json, d->json_len);
+  if (d->schema_len > 0) {
+    l_hex(l, d->schema, d->schema_len);
+  }
   l_end(l);
   return l->rc;
 }
@@ -4208,6 +4262,9 @@ static GDEFSTOR_Result dump_record(void * ctx, const GDEFSTOR_ModelRecord * r) {
   l_hex(l, r->ns, r->ns_len);
   l_hex(l, r->key, r->key_len);
   l_hex(l, r->bytes, r->len);
+  if (r->schema_len > 0) {
+    l_hex(l, r->schema, r->schema_len);
+  }
   l_end(l);
   return l->rc;
 }

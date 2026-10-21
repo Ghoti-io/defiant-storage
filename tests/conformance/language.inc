@@ -541,7 +541,7 @@ TEST_F(ModelLanguage, ADraftHoldsEveryLanguageItChanges) {
   t[1].json_len = de_json.size();
   std::string truth = Dump(GDEFSTOR_MODEL_TRUTH);
   ASSERT_EQ(GDEFSTOR_OK, InWrite([&](GDEFSTOR_Write * w) {
-    return gdefstor_draft_put(w, nullptr, 0, "a1", 2, 1, t, 2);
+    return gdefstor_draft_put(w, nullptr, 0, "a1", 2, 1, kStamp, kStampLen, t, 2);
   }));
   /* One draft for the entity, holding both, in language order, as put. */
   EXPECT_EQ(1u, NewRows(truth, Dump(GDEFSTOR_MODEL_TRUTH), 'D'));
@@ -579,16 +579,17 @@ TEST_F(ModelLanguage, ADraftHoldsEveryLanguageItChanges) {
   /* A language twice, or a tag that is not one, is refused at put. */
   t[1].language = "fr";
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, InWrite([&](GDEFSTOR_Write * w) {
-    return gdefstor_draft_put(w, nullptr, 0, "a1", 2, 2, t, 2);
+    return gdefstor_draft_put(w, nullptr, 0, "a1", 2, 2, kStamp, kStampLen, t, 2);
   }));
   t[1].language = "f_r";
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, InWrite([&](GDEFSTOR_Write * w) {
-    return gdefstor_draft_put(w, nullptr, 0, "a1", 2, 2, t, 2);
+    return gdefstor_draft_put(w, nullptr, 0, "a1", 2, 2, kStamp, kStampLen, t, 2);
   }));
   /* A reserved id: the entity and its two trees in one revision. */
   t[1].language = "de";
   ASSERT_EQ(GDEFSTOR_OK, InWrite([&](GDEFSTOR_Write * w) {
     return gdefstor_draft_put(w, kArticle, std::strlen(kArticle), "a9", 2, 0,
+        kStamp, kStampLen,
         t, 2);
   }));
   ASSERT_EQ(GDEFSTOR_OK, InWrite([&](GDEFSTOR_Write * w) {

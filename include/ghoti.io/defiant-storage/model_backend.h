@@ -128,6 +128,10 @@ typedef struct GDEFSTOR_ModelRevision {
    * stored as given. */
   const char * languages;
   size_t languages_len;   ///< Its length.
+  /** Its schema stamp (model.h), from the port, stored as given. A backend
+   * that holds a row from before it kept stamps visits it empty. */
+  const char * schema;
+  size_t schema_len;      ///< Its length.
 } GDEFSTOR_ModelRevision;
 
 /** One version of one item: a row of a group table. */
@@ -199,6 +203,8 @@ typedef struct GDEFSTOR_ModelRecord {
   size_t key_len;         ///< Its length.
   const uint8_t * bytes;  ///< The value; may be NULL when @ref len is 0.
   size_t len;             ///< Its length.
+  const char * schema;    ///< Its schema stamp, as GDEFSTOR_ModelRevision::schema.
+  size_t schema_len;      ///< Its length.
 } GDEFSTOR_ModelRecord;
 
 /** GDEFSTOR_ModelBackend::counter_next: a caller's counter (model.h), whose
@@ -233,6 +239,8 @@ typedef struct GDEFSTOR_ModelDraft {
   uint64_t base_revision; ///< Its base.
   const uint8_t * json;   ///< The tree.
   size_t json_len;        ///< Its length.
+  const char * schema;    ///< Its schema stamp, as GDEFSTOR_ModelRevision::schema.
+  size_t schema_len;      ///< Its length.
 } GDEFSTOR_ModelDraft;
 
 /**

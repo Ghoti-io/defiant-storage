@@ -262,6 +262,8 @@ inline GDEFSTOR_RevisionMeta Meta(const char * who = "u1", int64_t when = 1000,
   m.when_ms = when;
   m.why = why;
   m.why_len = std::strlen(why);
+  m.schema = kStamp;
+  m.schema_len = kStampLen;
   return m;
 }
 
@@ -276,7 +278,7 @@ inline GDEFSTOR_Result DraftPut(GDEFSTOR_Write * w, const char * type,
   t.language_len = std::strlen(lang);
   t.json = json;
   t.json_len = json_len;
-  return gdefstor_draft_put(w, type, type_len, pid, pid_len, base, &t, 1);
+  return gdefstor_draft_put(w, type, type_len, pid, pid_len, base, kStamp, kStampLen, &t, 1);
 }
 
 class ModelTest : public ::testing::Test {
@@ -3853,7 +3855,7 @@ class ModelWriters : public ModelTest {
     uint8_t * bytes = nullptr;
     size_t len = 0;
     park->get_rc = gdefstor_record_get(park->store, kTenant, 2, "core.q", 6,
-        "k", 1, &park->found, &bytes, &len);
+        "k", 1, &park->found, &bytes, &len, nullptr, nullptr);
     gdefstor_bytes_free(nullptr, bytes);
     gdefstor_write_abort(w);
   }
@@ -3862,6 +3864,7 @@ class ModelWriters : public ModelTest {
     GDEFSTOR_Result rc = gdefstor_write_begin(store, kTenant, 2, nullptr, out);
     if (rc == GDEFSTOR_OK) {
       rc = gdefstor_record_put(*out, "core.q", 6, "k", 1,
+          kStamp, kStampLen,
           reinterpret_cast<const uint8_t *>("v"), 1);
     }
     return rc;
@@ -3872,7 +3875,7 @@ class ModelWriters : public ModelTest {
     size_t len = 0;
     int found = -1;
     EXPECT_EQ(GDEFSTOR_OK, gdefstor_record_get(store, kTenant, 2, "core.q", 6,
-        "k", 1, &found, &bytes, &len));
+        "k", 1, &found, &bytes, &len, nullptr, nullptr));
     gdefstor_bytes_free(nullptr, bytes);
     return found;
   }

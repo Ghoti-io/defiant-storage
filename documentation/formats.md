@@ -31,9 +31,10 @@ an earlier shape. The member named `manifest` is:
 together, when `gdefstor_snapshot_export_tenant` made it (the data set of a
 backup pair, AD-23): what the tenant needs to come back up. `edition` is the
 tenant's edition, `defiant-edition/<n>` (n a positive integer without leading
-zeros), or `null` for a tenant that pins none; `modules` is every module the
-tenant has enabled, by name in byte order, each once, each with `schema`, the
-version (1 or more) of the stored-data schema its data is in (AD-15). A
+zeros), or `null` for a tenant that pins none; `modules` is every component
+whose stored data the tenant holds (core names itself `core`, beside each of
+its modules), by name in byte order, each once, each with `schema`, the
+version (1 or more) of the stored-data schema its current data is in (AD-15). A
 module name is a lowercase letter, then lowercase letters, digits and
 hyphens, at most 64 bytes; at most 1024 modules. Storage carries them and does
 not act on them: `gdefstor_snapshot_about` reads them back, an import checks
@@ -81,7 +82,7 @@ and item versions. It says its format first; a member without it is
 
 ```json
 {"format":"defiant-revision/1","type":"shop.order","id":"o1",
- "revisions":[{"revision":1,"commit":1,"who":"u1","when_ms":1000,"why":"first","languages":"en"}],
+ "revisions":[{"revision":1,"commit":1,"who":"u1","when_ms":1000,"why":"first","languages":"en","schema":"shop/1"}],
  "items":[{"lang":"en","group":0,"item":1,"parent":0,"order":"0000000000000000","from":1,"to":2,
            "values":{"number":"A-1","total":"19.99","paid":false,"note":{"@c":"01fe","@s":"subj1"}}},
           {"lang":"en","group":2,"item":4,"parent":1,"order":"3ff0000000000000","from":1,"to":0,
@@ -90,7 +91,10 @@ and item versions. It says its format first; a member without it is
 
 `revisions` are revisions 1 to the entity's newest, each with its commit
 sequence (`commit`: the same for every revision one write made), who, when,
-why and the languages it changed. `items` is every item version of every
+why, the languages it changed, and `schema`, the stamp it was written with
+(`<component>/<version>`, model.md "Schema stamps"), exactly; an empty
+`schema` is a revision its store kept from before stamps, and a row without
+`schema` is `GDEFSTOR_ERR_CORRUPT`. `items` is every item version of every
 language, by group, item and `from`: `group` is the group number of the
 declaration (0 the root group), `item` and `parent` the stable item ids,
 `order` the order key's IEEE-754 bits in 16 hex digits (exact, and no locale
@@ -99,13 +103,14 @@ is open). `values` names each value by its field's name in that group and
 spells it as `defiant-tree/1` does (model.md); a column with no value is left
 out.
 
-**`model/drafts.json`**: `{"drafts":[{"id":"o1","type":"shop.order","base":4,"document":"..."}]}`,
+**`model/drafts.json`**: `{"drafts":[{"id":"o1","type":"shop.order","base":4,"document":"...","schema":"shop/1"}]}`,
 by public id; `document` is the stored `defiant-draft/1` document, byte for
-byte, as a JSON string.
+byte, as a JSON string, and `schema` the draft's stamp, as for a revision.
 
-**`model/records.json`**: `{"records":[{"namespace":"core.module","key":"alpha","text":"..."}]}`,
+**`model/records.json`**: `{"records":[{"namespace":"core.module","key":"alpha","text":"...","schema":"core/1"}]}`,
 by namespace and key. A value that is UTF-8 without NUL is `"text"`; any
-other is `"hex"`, lowercase.
+other is `"hex"`, lowercase. `schema` is the record's stamp, as for a
+revision.
 
 **`model/counters.json`**: `{"counters":[{"kind":"counter","name":"core.epoch","value":3}]}`:
 every caller's counter (`counter`) and every outbox stream's sequence
@@ -148,4 +153,7 @@ whose declared size is not is over the cap.
 of the source and requires a named test to fail; the snapshot's include a
 member written without its format (`snapshot-member-without-format`) and a
 reader that takes another version (`revision-reader-takes-another-version`,
-`snapshot-reader-takes-another-version`). The unpatched tree passes.
+`snapshot-reader-takes-another-version`), an import that writes every
+revision back at its entity's newest stamp (`snapshot-import-restamps-history`)
+and a draft applied at the caller's stamp instead of its own
+(`draft-applied-at-the-callers-stamp`). The unpatched tree passes.

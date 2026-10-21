@@ -381,7 +381,7 @@ TEST_F(ModelSnapshot, CountersContinueAndOutboxRowsKeepTheirPlace) {
   uint8_t * bytes = nullptr;
   size_t len = 0;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_get(copy, kTenant, 2, "core.name", 9,
-      "x:1", 3, &found, &bytes, &len));
+      "x:1", 3, &found, &bytes, &len, nullptr, nullptr));
   EXPECT_EQ(1, found);
   EXPECT_EQ(std::string("\x00\xff\x10\x80", 4),
       std::string(reinterpret_cast<const char *>(bytes), len));
@@ -892,6 +892,280 @@ TEST_F(ModelSnapshot, EveryDraftOfATenantIsListed) {
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_draft_list(store, kTenant, 2,
       nullptr));
   EXPECT_EQ(nullptr, l);
+}
+
+/* ---- schema stamps (model.h; AD-15) ------------------------------------- */
+
+/* The stamps of an entity's revisions, oldest first, joined by spaces. */
+inline std::string RevisionStamps(GDEFSTOR_Store * s, const char * pid) {
+  GDEFSTOR_History * h = nullptr;
+  if (gdefstor_entity_history(s, kTenant, 2, pid, std::strlen(pid), nullptr, 0,
+          &h) != GDEFSTOR_OK) {
+    return "<failed>";
+  }
+  std::string out;
+  for (size_t i = 0; i < gdefstor_history_revision_count(h); i++) {
+    GDEFSTOR_RevisionInfo r;
+    std::memset(&r, 0, sizeof r);
+    r.size = sizeof r;
+    gdefstor_history_revision(h, i, &r);
+    out += (i == 0 ? "" : " ") + std::string(r.schema, r.schema_len);
+  }
+  gdefstor_history_free(h);
+  return out;
+}
+
+inline std::string DraftStamp(GDEFSTOR_Store * s, const char * pid) {
+  GDEFSTOR_Draft * d = nullptr;
+  if (gdefstor_draft_get(s, kTenant, 2, pid, std::strlen(pid), &d) !=
+      GDEFSTOR_OK) {
+    return "<none>";
+  }
+  GDEFSTOR_DraftInfo info;
+  std::memset(&info, 0, sizeof info);
+  info.size = sizeof info;
+  gdefstor_draft_info(d, &info);
+  std::string out(info.schema, info.schema_len);
+  gdefstor_draft_free(d);
+  return out;
+}
+
+/* A record's stamp, read once by itself and once from a page of its
+ * namespace; "<none>" when there is no record, "<differ>" when the two
+ * reads disagree. */
+inline std::string RecordStamp(GDEFSTOR_Store * s, const char * ns,
+    const char * key) {
+  int found = 0;
+  uint8_t * bytes = nullptr;
+  size_t len = 0;
+  char stamp[GDEFSTOR_SCHEMA_MAX_BYTES + 1];
+  size_t stamp_len = 99;
+  if (gdefstor_record_get(s, kTenant, 2, ns, std::strlen(ns), key,
+          std::strlen(key), &found, &bytes, &len, stamp, &stamp_len) !=
+          GDEFSTOR_OK ||
+      !found) {
+    gdefstor_bytes_free(nullptr, bytes);
+    return "<none>";
+  }
+  gdefstor_bytes_free(nullptr, bytes);
+  std::string got(stamp, stamp_len);
+  EXPECT_EQ(std::strlen(stamp), stamp_len);
+  GDEFSTOR_RecordList * l = nullptr;
+  std::string listed = "<missing>";
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_record_list(s, kTenant, 2, ns,
+      std::strlen(ns), key, std::strlen(key), 0, 10, &l));
+  for (size_t i = 0; i < gdefstor_record_list_count(l); i++) {
+    const char * k = nullptr;
+    size_t kn = 0;
+    const uint8_t * b = nullptr;
+    size_t bn = 0;
+    const char * st = nullptr;
+    size_t stn = 0;
+    EXPECT_EQ(GDEFSTOR_OK, gdefstor_record_list_item(l, i, &k, &kn, &b, &bn,
+        &st, &stn));
+    if (std::string(k, kn) == key) {
+      listed.assign(st, stn);
+    }
+  }
+  gdefstor_record_list_free(l);
+  return listed == got ? got : "<differ>";
+}
+
+/* A tenant whose rows were written at different versions of two components:
+ * revisions at blog/1, blog/2 and blog/12, a draft at blog/2 and one that
+ * reserves an id at blog/1, records at core/1 and blog/3. */
+inline GDEFSTOR_Result PopulateStamped(GDEFSTOR_Store * s) {
+  GDEFSTOR_Result rc = snapshot_fixture::InWrite(s, kTenant,
+      [](GDEFSTOR_Write * w) {
+    SpecHolder h("blog.post", {F("title", GDEFSTOR_FIELD_TEXT)});
+    GDEFSTOR_Result r = gdefstor_type_declare(w, &h.spec);
+    if (r == GDEFSTOR_OK) {
+      r = gdefstor_entity_create(w, "blog.post", 9, "p1", 2, "u1", 2, 10,
+          nullptr);
+    }
+    return r;
+  });
+  const char * stamps[] = {"blog/1", "blog/2", "blog/12"};
+  for (uint64_t k = 0; rc == GDEFSTOR_OK && k < 3; k++) {
+    rc = snapshot_fixture::InWrite(s, kTenant, [&](GDEFSTOR_Write * w) {
+      GDEFSTOR_Type * type = nullptr;
+      GDEFSTOR_Tree * tree = nullptr;
+      std::string json = "{\"format\":\"defiant-tree/1\",\"root\":{\"title\":"
+                         "\"t" + std::to_string(k) + "\"}}";
+      GDEFSTOR_Result r = gdefstor_type_get(s, kTenant, 2, "blog.post", 9,
+          &type);
+      if (r == GDEFSTOR_OK) {
+        r = gdefstor_tree_from_json(type,
+            reinterpret_cast<const uint8_t *>(json.data()), json.size(),
+            nullptr, &tree);
+      }
+      if (r == GDEFSTOR_OK) {
+        GDEFSTOR_RevisionMeta m = snapshot_fixture::Meta("u1",
+            100 + static_cast<int64_t>(k));
+        m.schema = stamps[k];
+        m.schema_len = std::strlen(stamps[k]);
+        r = gdefstor_entity_save(w, "p1", 2, k, &m, "en", 2, tree, nullptr);
+      }
+      gdefstor_tree_free(tree);
+      gdefstor_type_free(type);
+      return r;
+    });
+  }
+  if (rc == GDEFSTOR_OK) {
+    rc = snapshot_fixture::InWrite(s, kTenant, [](GDEFSTOR_Write * w) {
+      static const char tree[] =
+          "{\"format\":\"defiant-tree/1\",\"root\":{\"title\":\"draft\"}}";
+      GDEFSTOR_DraftTree t;
+      std::memset(&t, 0, sizeof t);
+      t.size = sizeof t;
+      t.language = "en";
+      t.language_len = 2;
+      t.json = reinterpret_cast<const uint8_t *>(tree);
+      t.json_len = sizeof tree - 1;
+      GDEFSTOR_Result r = gdefstor_draft_put(w, nullptr, 0, "p1", 2, 3,
+          "blog/2", 6, &t, 1);
+      if (r == GDEFSTOR_OK) {
+        r = gdefstor_draft_put(w, "blog.post", 9, "p9", 2, 0, "blog/1", 6,
+            &t, 1);
+      }
+      if (r == GDEFSTOR_OK) {
+        r = gdefstor_record_put(w, "core.x", 6, "k", 1, "core/1", 6,
+            reinterpret_cast<const uint8_t *>("v"), 1);
+      }
+      if (r == GDEFSTOR_OK) {
+        r = gdefstor_record_put(w, "core.x", 6, "e", 1, "blog/3", 6, nullptr,
+            0);
+      }
+      return r;
+    });
+  }
+  return rc;
+}
+
+/* Every revision, draft and record carries the stamp it was written with,
+ * and a snapshot carries each one exactly: the export spells it, the import
+ * writes it back, and a draft applied afterwards is data of its own stamp. */
+TEST_F(ModelSnapshot, EveryRowKeepsItsSchemaStampThroughAnExportAndAnImport) {
+  ASSERT_EQ(GDEFSTOR_OK, PopulateStamped(store));
+  EXPECT_EQ("blog/1 blog/2 blog/12", RevisionStamps(store, "p1"));
+  EXPECT_EQ("blog/2", DraftStamp(store, "p1"));
+  EXPECT_EQ("blog/1", DraftStamp(store, "p9"));
+  EXPECT_EQ("core/1", RecordStamp(store, "core.x", "k"));
+  EXPECT_EQ("blog/3", RecordStamp(store, "core.x", "e"));
+  EXPECT_EQ("<none>", RecordStamp(store, "core.x", "zz"));
+  std::string zip = snapshot_fixture::Export(store, kTenant);
+  size_t spelled = 0;
+  for (const auto & m : ZipMembers(zip)) {
+    for (const char * s : {"\"schema\":\"blog/1\"", "\"schema\":\"blog/2\"",
+             "\"schema\":\"blog/12\"", "\"schema\":\"blog/3\"",
+             "\"schema\":\"core/1\""}) {
+      for (size_t at = m.second.find(s); at != std::string::npos;
+           at = m.second.find(s, at + 1)) {
+        spelled += 1;
+      }
+    }
+  }
+  EXPECT_EQ(7u, spelled);
+  std::string why;
+  ASSERT_EQ(GDEFSTOR_OK, snapshot_fixture::Import(copy, kTenant, zip, &why))
+      << why;
+  EXPECT_EQ(snapshot_fixture::Dump(store, kTenant, GDEFSTOR_MODEL_TRUTH),
+      snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH));
+  EXPECT_EQ("blog/1 blog/2 blog/12", RevisionStamps(copy, "p1"));
+  EXPECT_EQ("blog/2", DraftStamp(copy, "p1"));
+  EXPECT_EQ("blog/1", DraftStamp(copy, "p9"));
+  EXPECT_EQ("core/1", RecordStamp(copy, "core.x", "k"));
+  EXPECT_EQ("blog/3", RecordStamp(copy, "core.x", "e"));
+  EXPECT_EQ(zip, snapshot_fixture::Export(copy, kTenant));
+  /* The reserving draft becomes revision 1 of p9, at its own stamp, though
+   * the apply's meta says another. */
+  ASSERT_EQ(GDEFSTOR_OK, snapshot_fixture::InWrite(copy, kTenant,
+      [](GDEFSTOR_Write * w) {
+    GDEFSTOR_RevisionMeta m = snapshot_fixture::Meta("u2", 900);
+    m.schema = "blog/7";
+    m.schema_len = 6;
+    uint64_t rev = 0;
+    GDEFSTOR_Result r = gdefstor_draft_apply(w, "p9", 2, &m, &rev);
+    EXPECT_EQ(1u, rev);
+    return r;
+  }));
+  EXPECT_EQ("blog/1", RevisionStamps(copy, "p9"));
+}
+
+/* A stamp is `<component>/<version>`: a write without one, or with anything
+ * else, is refused and writes nothing; and a snapshot member whose row says
+ * no stamp is not what the format holds. */
+TEST_F(ModelSnapshot, AStampIsRequiredAndOnlyAStampIsTaken) {
+  const char * component = nullptr;
+  size_t component_len = 0;
+  uint32_t version = 0;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_schema_parse("blog-x2/4294967295", 18,
+      &component, &component_len, &version));
+  EXPECT_EQ("blog-x2", std::string(component, component_len));
+  EXPECT_EQ(4294967295u, version);
+  for (const char * bad : {"", "blog", "blog/", "/1", "Blog/1", "1blog/1",
+           "blog/0", "blog/01", "blog/1x", "blog/4294967296", "blog_x/1",
+           "b/l/1"}) {
+    EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_schema_parse(bad,
+        std::strlen(bad), nullptr, nullptr, nullptr)) << bad;
+  }
+  std::string long_name(GDEFSTOR_SCHEMA_COMPONENT_MAX, 'a');
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_schema_parse((long_name + "/1").c_str(),
+      long_name.size() + 2, nullptr, nullptr, nullptr));
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_schema_parse(
+      (long_name + "a/1").c_str(), long_name.size() + 3, nullptr, nullptr,
+      nullptr));
+  ASSERT_EQ(GDEFSTOR_OK, PopulateStamped(store));
+  std::string before = snapshot_fixture::Dump(store, kTenant,
+      GDEFSTOR_MODEL_TRUTH);
+  for (const char * bad : {"", "blog", "blog/0"}) {
+    EXPECT_EQ(GDEFSTOR_ERR_INVALID, snapshot_fixture::InWrite(store, kTenant,
+        [&](GDEFSTOR_Write * w) {
+      GDEFSTOR_RevisionMeta m = snapshot_fixture::Meta("u1", 2000);
+      m.schema = bad;
+      m.schema_len = std::strlen(bad);
+      return gdefstor_entity_remove_language(w, "p1", 2, 3, &m, "en", 2,
+          nullptr);
+    })) << bad;
+    EXPECT_EQ(GDEFSTOR_ERR_INVALID, snapshot_fixture::InWrite(store, kTenant,
+        [&](GDEFSTOR_Write * w) {
+      return gdefstor_record_put(w, "core.x", 6, "k", 1, bad,
+          std::strlen(bad), nullptr, 0);
+    })) << bad;
+    EXPECT_EQ(GDEFSTOR_ERR_INVALID, snapshot_fixture::InWrite(store, kTenant,
+        [&](GDEFSTOR_Write * w) {
+      return gdefstor_draft_put(w, nullptr, 0, "p1", 2, 3, bad,
+          std::strlen(bad), nullptr, 0);
+    })) << bad;
+  }
+  EXPECT_EQ(before, snapshot_fixture::Dump(store, kTenant,
+      GDEFSTOR_MODEL_TRUTH));
+  /* Each kind of row in a member without its "schema" is refused, and
+   * nothing is imported. */
+  auto members = ZipMembers(snapshot_fixture::Export(store, kTenant));
+  const std::pair<const char *, const char *> cuts[] = {
+      {"model/drafts.json", ",\"schema\":\"blog/2\""},
+      {"model/records.json", ",\"schema\":\"core/1\""},
+      {"/", ",\"schema\":\"blog/12\""}};
+  for (const auto & c : cuts) {
+    const char * stamp = c.second;
+    auto cut = members;
+    bool changed = false;
+    for (auto & m : cut) {
+      size_t at = m.second.find(stamp);
+      if (m.first.find(c.first) != std::string::npos &&
+          at != std::string::npos) {
+        m.second.erase(at, std::strlen(stamp));
+        changed = true;
+        break;
+      }
+    }
+    ASSERT_TRUE(changed) << stamp;
+    std::string why;
+    EXPECT_EQ(GDEFSTOR_ERR_CORRUPT,
+        snapshot_fixture::Import(copy, kTenant, ZipOf(cut), &why)) << stamp;
+    EXPECT_EQ("", snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH));
+  }
 }
 
 /* Every allocation an export or an import makes may fail: each failure is

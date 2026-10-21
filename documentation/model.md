@@ -189,6 +189,18 @@ is what queries and `gdefstor_entity_get()` see.
 - Who, when and why (free text, UTF-8, up to 4096 bytes) are recorded, and
   every revision a write makes carries the tenant's commit sequence of that
   write.
+- **Schema stamps.** Every revision, draft and record carries the stamp it
+  was written with, `<component>/<version>` (`core/1`, `blog/3`;
+  `gdefstor_schema_parse()`): which component's data it is and the version
+  of that component's stored-data schema its content is in (AD-15). The
+  caller gives it (`GDEFSTOR_RevisionMeta::schema`, and an argument of
+  `gdefstor_draft_put()` and `gdefstor_record_put()`); a write without a
+  valid one is `GDEFSTOR_ERR_INVALID`. Storage keeps it exactly, through
+  every export and import, and never reads it: history keeps each revision's
+  stamp, so a reader knows the shape of what it reads. A draft applied is
+  data of the draft's stamp, not the apply's. A SQL store made before stamps
+  existed takes the step that adds them on its first use, and the rows it
+  held then read with an empty stamp.
 
 **Order keys** are doubles, per parent and field. The items that stay under
 the same parent keep their keys when they lie on the longest run of keys
@@ -423,18 +435,19 @@ sorted bytewise, strings in lower-case hex (`-` when empty), doubles as their
 T <type> <declaration>
 E <row> <type> <public id> <creator> <created> <revision> <last item> <published> <deleted>
 S <row> <seq> <published> <deleted> <actor> <when>
-R <row> <revision> <commit seq> <who> <when> <why> <languages>
+R <row> <revision> <commit seq> <who> <when> <why> <languages> [<schema>]
 I <row> <group> <item> <valid_from> <valid_to> <parent> <order> <n> <value>... <language>
-D <public id> <type> <base> <json>
+D <public id> <type> <base> <json> [<schema>]
 B <row> <item> <valid_from> <field id> <subject> <mac> <key id> <version> <language>
-K <namespace> <key> <value>
+K <namespace> <key> <value> [<schema>]
 C <kind> <name> <value>
 O <stream> <seq> <public id> <format> <payload> <lease until> <failures> <parked>
 ```
 
 A value is `v<type>`, then for a set value its integer, its double, its bytes
 and its subject. The language is the last word of an `I` and a `B` row, so
-the words before it keep their places. Trailing absent columns are left out, so a row written
+the words before it keep their places. The schema stamp is the last word of
+an `R`, a `D` and a `K` row, and only when the row has one. Trailing absent columns are left out, so a row written
 before a column existed and one written after with it empty read alike.
 `GDEFSTOR_MODEL_TRUTH` dumps `T`, `E`, `S`, `R`, every `I` version, `D`,
 every blind row `B`, every record `K`, every counter `C` with a committed

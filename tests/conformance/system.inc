@@ -40,7 +40,7 @@ class ModelSystem : public ModelSave {
       const std::string & value) {
     return InWrite([&](GDEFSTOR_Write * w) {
       return gdefstor_record_put(w, ns.data(), ns.size(), key.data(),
-          key.size(), reinterpret_cast<const uint8_t *>(value.data()),
+          key.size(), kStamp, kStampLen, reinterpret_cast<const uint8_t *>(value.data()),
           value.size());
     });
   }
@@ -60,7 +60,7 @@ class ModelSystem : public ModelSave {
     uint8_t * bytes = nullptr;
     size_t len = 0;
     GDEFSTOR_Result rc = gdefstor_record_get(store, tenant, std::strlen(tenant),
-        ns.data(), ns.size(), key.data(), key.size(), &found, &bytes, &len);
+        ns.data(), ns.size(), key.data(), key.size(), &found, &bytes, &len, nullptr, nullptr);
     EXPECT_EQ(GDEFSTOR_OK, rc);
     if (rc != GDEFSTOR_OK) {
       return "<error>";
@@ -88,7 +88,7 @@ class ModelSystem : public ModelSave {
       size_t kn = 0;
       const uint8_t * b = nullptr;
       size_t bn = 0;
-      EXPECT_EQ(GDEFSTOR_OK, gdefstor_record_list_item(l, i, &k, &kn, &b, &bn));
+      EXPECT_EQ(GDEFSTOR_OK, gdefstor_record_list_item(l, i, &k, &kn, &b, &bn, nullptr, nullptr));
       out.push_back(std::string(k, kn) + "=" +
                     std::string(reinterpret_cast<const char *>(b), bn));
     }
@@ -237,12 +237,13 @@ TEST_F(ModelRecords, AListIsOneNamespaceAndPrefixInKeyOrderPagedByOffsetAndLimit
   ASSERT_EQ(GDEFSTOR_OK, InWrite([&](GDEFSTOR_Write * w) {
     for (const char * k : keys) {
       GDEFSTOR_Result rc = gdefstor_record_put(w, "core.map", 8, k,
-          std::strlen(k), reinterpret_cast<const uint8_t *>(k), std::strlen(k));
+          std::strlen(k), kStamp, kStampLen, reinterpret_cast<const uint8_t *>(k), std::strlen(k));
       if (rc != GDEFSTOR_OK) {
         return rc;
       }
     }
     return gdefstor_record_put(w, "core.other", 10, "a", 1,
+        kStamp, kStampLen,
         reinterpret_cast<const uint8_t *>("other"), 5);
   }));
   /* By bytes: "B" before "a", and "-" "." ":" "_" in their byte order. */
@@ -287,18 +288,21 @@ TEST_F(ModelRecords, NamesValuesAndPagesAreChecked) {
         {"core.\xc3\xa9", "k"}};
     for (const Bad & b : bad) {
       if (gdefstor_record_put(w, b.ns.data(), b.ns.size(), b.key.data(),
-              b.key.size(), v, 1) != GDEFSTOR_ERR_INVALID) {
+              b.key.size(), kStamp, kStampLen, v, 1) != GDEFSTOR_ERR_INVALID) {
         ADD_FAILURE() << "accepted ns [" << b.ns << "] key [" << b.key << "]";
       }
     }
     EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_record_put(w, "core.x", 6, "k", 1,
+        kStamp, kStampLen,
         nullptr, 1));
     EXPECT_EQ(GDEFSTOR_ERR_LIMIT, gdefstor_record_put(w, "core.x", 6, "k", 1,
+        kStamp, kStampLen,
         reinterpret_cast<const uint8_t *>(big.data()), big.size()));
     EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_record_delete(w, "", 0, "k", 1,
         nullptr));
     /* Refused calls leave the write usable. */
     return gdefstor_record_put(w, "core.x", 6, max_key.data(), max_key.size(),
+        kStamp, kStampLen,
         v, 1);
   }));
   EXPECT_EQ("v", Get("core.x", max_key));
@@ -316,9 +320,9 @@ TEST_F(ModelRecords, NamesValuesAndPagesAreChecked) {
   uint8_t * b = nullptr;
   size_t n = 0;
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_record_get(store, kTenant, 2,
-      "core.x", 6, "a b", 3, &found, &b, &n));
+      "core.x", 6, "a b", 3, &found, &b, &n, nullptr, nullptr));
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_record_get(store, kTenant, 2,
-      "core.x", 6, "k", 1, nullptr, &b, &n));
+      "core.x", 6, "k", 1, nullptr, &b, &n, nullptr, nullptr));
 }
 
 /* A record is written in the write's transaction: an abort leaves no record
@@ -329,12 +333,15 @@ TEST_F(ModelRecords, AnAbortedWriteLeavesNoRecord) {
   GDEFSTOR_Write * w = nullptr;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, kTenant, 2, nullptr, &w));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "core.module", 11, "new", 3,
+      kStamp, kStampLen,
       reinterpret_cast<const uint8_t *>("x"), 1));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "core.module", 11, "kept", 4,
+      kStamp, kStampLen,
       reinterpret_cast<const uint8_t *>("changed"), 7));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_delete(w, "core.module", 11, "kept", 4,
       nullptr));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "core.module", 11, "kept", 4,
+      kStamp, kStampLen,
       reinterpret_cast<const uint8_t *>("again"), 5));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(w));
   EXPECT_EQ("<missing>", Get("core.module", "new"));
@@ -343,6 +350,7 @@ TEST_F(ModelRecords, AnAbortedWriteLeavesNoRecord) {
   /* A write that takes a counter after its records is aborted the same. */
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, kTenant, 2, nullptr, &w));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "core.module", 11, "new", 3,
+      kStamp, kStampLen,
       reinterpret_cast<const uint8_t *>("y"), 1));
   Next(w, "core.epoch");
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_abort(w));
@@ -355,8 +363,10 @@ TEST_F(ModelRecords, AnOpenWriteIsInvisibleToReaders) {
   GDEFSTOR_Write * w = nullptr;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, kTenant, 2, nullptr, &w));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "core.module", 11, "a", 1,
+      kStamp, kStampLen,
       reinterpret_cast<const uint8_t *>("2"), 1));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "core.module", 11, "b", 1,
+      kStamp, kStampLen,
       reinterpret_cast<const uint8_t *>("3"), 1));
   EXPECT_EQ("1", Get("core.module", "a"));
   EXPECT_EQ("<missing>", Get("core.module", "b"));
@@ -654,6 +664,7 @@ TEST_F(ModelOutbox, ArgumentsAreChecked) {
   GDEFSTOR_Write * w = nullptr;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, kTenant, 2, nullptr, &w));
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "core.x", 6, "k", 1,
+      kStamp, kStampLen,
       reinterpret_cast<const uint8_t *>("v"), 1));
   EXPECT_EQ(GDEFSTOR_ERR_INVALID, Append(w, "core.log", "i1"));
   EXPECT_NE(GDEFSTOR_OK, gdefstor_write_commit(w));
@@ -678,6 +689,7 @@ TEST_F(ModelSystem, AnEntitySaveARecordACounterAndAnAppendCommitTogetherOrNotAtA
     ASSERT_EQ(GDEFSTOR_OK, gdefstor_entity_save(w, "po1", 3, 1, &m, kLang, kLangLen, t, nullptr));
     gdefstor_tree_free(t);
     ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "core.module", 11, "blog", 4,
+        kStamp, kStampLen,
         reinterpret_cast<const uint8_t *>("on"), 2));
     taken[commit] = Next(w, "core.epoch");
     ASSERT_EQ(GDEFSTOR_OK, Append(w, "core.bus", "chg1"));
@@ -733,6 +745,7 @@ TEST_F(ModelSystem, RebuildLeavesRecordsCountersAndTheOutboxAlone) {
   /* What a write wrote before its rebuild survives the rebuild too. */
   ASSERT_EQ(GDEFSTOR_OK, InWrite([&](GDEFSTOR_Write * w) {
     GDEFSTOR_Result rc = gdefstor_record_put(w, "core.module", 11, "shop", 4,
+        kStamp, kStampLen,
         reinterpret_cast<const uint8_t *>("on"), 2);
     Next(w, "core.epoch");
     if (rc == GDEFSTOR_OK) {
@@ -834,6 +847,7 @@ TEST_F(ModelSystemSweep, SeededOperationsAgreeWithAnIndependentModel) {
             std::string val = "v" + std::to_string(rng() % 1000);
             ASSERT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, ns.data(), ns.size(),
                 key.data(), key.size(),
+                kStamp, kStampLen,
                 reinterpret_cast<const uint8_t *>(val.data()), val.size()));
             x.recs[ns][key] = val;
           } else if (op == 1) {
@@ -1043,9 +1057,11 @@ inline GDEFSTOR_Result SystemOomScenario(const GDEFSTOR_Allocator * alloc) {
   rc = gdefstor_write_begin(store, kTenant, 2, nullptr, &w);
   if (rc == GDEFSTOR_OK) {
     rc = gdefstor_record_put(w, "core.m", 6, "a", 1,
+        kStamp, kStampLen,
         reinterpret_cast<const uint8_t *>("x"), 1);
     if (rc == GDEFSTOR_OK) {
       rc = gdefstor_record_put(w, "core.m", 6, "b", 1,
+          kStamp, kStampLen,
           reinterpret_cast<const uint8_t *>("y"), 1);
     }
     if (rc == GDEFSTOR_OK) {
@@ -1076,7 +1092,7 @@ inline GDEFSTOR_Result SystemOomScenario(const GDEFSTOR_Allocator * alloc) {
   }
   if (rc == GDEFSTOR_OK) {
     rc = gdefstor_record_get(store, kTenant, 2, "core.m", 6, "a", 1, &found,
-        &bytes, &len);
+        &bytes, &len, nullptr, nullptr);
     gdefstor_bytes_free(alloc, bytes);
     bytes = nullptr;
   }

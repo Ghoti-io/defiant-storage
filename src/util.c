@@ -167,3 +167,57 @@ GDEFSTOR_Result gdefstor_json_escape_append(char ** buf, size_t * len,
   }
   return gdefstor_buf_append(buf, len, cap, alloc, "\"", 1);
 }
+
+/* ---- schema stamps (model.h) --------------------------------------------- */
+
+GDEFSTOR_Result gdefstor_schema_parse(const char * stamp, size_t len,
+    const char ** out_component, size_t * out_component_len,
+    uint32_t * out_version) {
+  size_t slash = 0;
+  size_t i;
+  uint64_t v = 0;
+  if (stamp == NULL || len == 0 || len > GDEFSTOR_SCHEMA_MAX_BYTES) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  while (slash < len && stamp[slash] != '/') {
+    slash += 1;
+  }
+  if (slash == 0 || slash > GDEFSTOR_SCHEMA_COMPONENT_MAX || slash == len ||
+      stamp[0] < 'a' || stamp[0] > 'z') {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  for (i = 1; i < slash; i++) {
+    char c = stamp[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) {
+      return GDEFSTOR_ERR_INVALID;
+    }
+  }
+  /* The version: 1 or more, without leading zeros, in 32 bits. */
+  if (len - slash - 1 == 0 || len - slash - 1 > 10 ||
+      stamp[slash + 1] == '0') {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  for (i = slash + 1; i < len; i++) {
+    if (stamp[i] < '0' || stamp[i] > '9') {
+      return GDEFSTOR_ERR_INVALID;
+    }
+    v = v * 10u + (uint64_t)(stamp[i] - '0');
+  }
+  if (v > UINT32_MAX) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (out_component != NULL) {
+    *out_component = stamp;
+  }
+  if (out_component_len != NULL) {
+    *out_component_len = slash;
+  }
+  if (out_version != NULL) {
+    *out_version = (uint32_t)v;
+  }
+  return GDEFSTOR_OK;
+}
+
+int gdefstor_schema_ok(const char * stamp, size_t len) {
+  return gdefstor_schema_parse(stamp, len, NULL, NULL, NULL) == GDEFSTOR_OK;
+}

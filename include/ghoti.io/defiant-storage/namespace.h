@@ -150,6 +150,7 @@
 #define gdefstor_draft_get GHOTIIO_DEFSTOR(gdefstor_draft_get)
 #define gdefstor_draft_info GHOTIIO_DEFSTOR(gdefstor_draft_info)
 #define gdefstor_draft_list GHOTIIO_DEFSTOR(gdefstor_draft_list)
+#define gdefstor_schema_parse GHOTIIO_DEFSTOR(gdefstor_schema_parse)
 #define gdefstor_draft_list_count GHOTIIO_DEFSTOR(gdefstor_draft_list_count)
 #define gdefstor_draft_list_item GHOTIIO_DEFSTOR(gdefstor_draft_list_item)
 #define gdefstor_draft_list_free GHOTIIO_DEFSTOR(gdefstor_draft_list_free)

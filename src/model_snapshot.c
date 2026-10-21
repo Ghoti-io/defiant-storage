@@ -75,6 +75,8 @@ typedef struct SRev {
   size_t why_len;
   char * langs;
   size_t langs_len;
+  char * schema;
+  size_t schema_len;
 } SRev;
 
 typedef struct SState {
@@ -126,6 +128,8 @@ typedef struct SDraft {
   uint64_t base;
   uint8_t * json;
   size_t json_len;
+  char * schema;
+  size_t schema_len;
 } SDraft;
 
 typedef struct SRec {
@@ -135,6 +139,8 @@ typedef struct SRec {
   size_t key_len;
   uint8_t * bytes;
   size_t len;
+  char * schema;
+  size_t schema_len;
 } SRec;
 
 typedef struct SCnt {
@@ -268,6 +274,7 @@ void gdefstor_snap_model_free(GDEFSTOR_SnapModel * m) {
     gcu_allocator_free(a, m->revs[i].who);
     gcu_allocator_free(a, m->revs[i].why);
     gcu_allocator_free(a, m->revs[i].langs);
+    gcu_allocator_free(a, m->revs[i].schema);
   }
   for (i = 0; i < m->nvers; i++) {
     gcu_allocator_free(a, m->vers[i].lang);
@@ -277,11 +284,13 @@ void gdefstor_snap_model_free(GDEFSTOR_SnapModel * m) {
     gcu_allocator_free(a, m->drafts[i].pid);
     gcu_allocator_free(a, m->drafts[i].type);
     gcu_allocator_free(a, m->drafts[i].json);
+    gcu_allocator_free(a, m->drafts[i].schema);
   }
   for (i = 0; i < m->nrecs; i++) {
     gcu_allocator_free(a, m->recs[i].ns);
     gcu_allocator_free(a, m->recs[i].key);
     gcu_allocator_free(a, m->recs[i].bytes);
+    gcu_allocator_free(a, m->recs[i].schema);
   }
   for (i = 0; i < m->ncnts; i++) {
     gcu_allocator_free(a, m->cnts[i].name);
@@ -538,13 +547,17 @@ static GDEFSTOR_Result take_revision(void * ctx, uint64_t row,
   n->who = copy(m->alloc, r->who, r->who_len);
   n->why = copy(m->alloc, r->why, r->why_len);
   n->langs = copy(m->alloc, r->languages, r->languages_len);
-  if (n->who == NULL || n->why == NULL || n->langs == NULL) {
+  n->schema = copy(m->alloc, r->schema, r->schema_len);
+  if (n->who == NULL || n->why == NULL || n->langs == NULL ||
+      n->schema == NULL) {
     gcu_allocator_free(m->alloc, n->who);
     gcu_allocator_free(m->alloc, n->why);
     gcu_allocator_free(m->alloc, n->langs);
+    gcu_allocator_free(m->alloc, n->schema);
     memset(n, 0, sizeof *n);
     return GDEFSTOR_ERR_OOM;
   }
+  n->schema_len = r->schema_len;
   n->row = row;
   n->revision = r->revision;
   n->commit = r->commit_seq;
@@ -617,13 +630,17 @@ static GDEFSTOR_Result take_draft(void * ctx, const GDEFSTOR_ModelDraft * d) {
   n->pid = copy(m->alloc, d->public_id, d->public_id_len);
   n->type = copy(m->alloc, d->type, d->type_len);
   n->json = (uint8_t *)copy(m->alloc, d->json, d->json_len);
-  if (n->pid == NULL || n->type == NULL || n->json == NULL) {
+  n->schema = copy(m->alloc, d->schema, d->schema_len);
+  if (n->pid == NULL || n->type == NULL || n->json == NULL ||
+      n->schema == NULL) {
     gcu_allocator_free(m->alloc, n->pid);
     gcu_allocator_free(m->alloc, n->type);
     gcu_allocator_free(m->alloc, n->json);
+    gcu_allocator_free(m->alloc, n->schema);
     memset(n, 0, sizeof *n);
     return GDEFSTOR_ERR_OOM;
   }
+  n->schema_len = d->schema_len;
   n->pid_len = d->public_id_len;
   n->type_len = d->type_len;
   n->base = d->base_revision;
@@ -647,13 +664,17 @@ static GDEFSTOR_Result take_record(void * ctx, const GDEFSTOR_ModelRecord * r) {
   n->ns = copy(m->alloc, r->ns, r->ns_len);
   n->key = copy(m->alloc, r->key, r->key_len);
   n->bytes = (uint8_t *)copy(m->alloc, r->bytes, r->len);
-  if (n->ns == NULL || n->key == NULL || n->bytes == NULL) {
+  n->schema = copy(m->alloc, r->schema, r->schema_len);
+  if (n->ns == NULL || n->key == NULL || n->bytes == NULL ||
+      n->schema == NULL) {
     gcu_allocator_free(m->alloc, n->ns);
     gcu_allocator_free(m->alloc, n->key);
     gcu_allocator_free(m->alloc, n->bytes);
+    gcu_allocator_free(m->alloc, n->schema);
     memset(n, 0, sizeof *n);
     return GDEFSTOR_ERR_OOM;
   }
+  n->schema_len = r->schema_len;
   n->ns_len = r->ns_len;
   n->key_len = r->key_len;
   n->len = r->len;
@@ -1093,6 +1114,10 @@ static GDEFSTOR_Result spell_type(Out * o, const GDEFSTOR_SnapModel * m,
       j_str(&j, r->why, r->why_len);
       j_lit(&j, ",\"languages\":");
       j_str(&j, r->langs, r->langs_len);
+      /* The stamp it was written with, exactly (AD-15): which component's
+       * data it is, and the schema version its trees are in. */
+      j_lit(&j, ",\"schema\":");
+      j_str(&j, r->schema, r->schema_len);
       j_lit(&j, "}");
     }
     j_lit(&j, "],\"items\":[");
@@ -1143,6 +1168,8 @@ static GDEFSTOR_Result spell_system(Out * o, const GDEFSTOR_SnapModel * m) {
       /* The stored defiant-draft/1 document, byte for byte. */
       j_lit(&j, ",\"document\":");
       j_str(&j, (const char *)d->json, d->json_len);
+      j_lit(&j, ",\"schema\":");
+      j_str(&j, d->schema, d->schema_len);
       j_lit(&j, "}");
     }
     j_lit(&j, "]}");
@@ -1163,6 +1190,8 @@ static GDEFSTOR_Result spell_system(Out * o, const GDEFSTOR_SnapModel * m) {
       j_str(&j, r->key, r->key_len);
       j_raw(&j, ",", 1);
       j_blob(&j, r->bytes, r->len);
+      j_lit(&j, ",\"schema\":");
+      j_str(&j, r->schema, r->schema_len);
       j_lit(&j, "}");
     }
     j_lit(&j, "]}");
@@ -1752,6 +1781,14 @@ static GDEFSTOR_Result read_order(const GTEXT_JSON_Value * o, double * out) {
   return isfinite(*out) ? GDEFSTOR_OK : GDEFSTOR_ERR_CORRUPT;
 }
 
+/* A row's "schema": the stamp it was written with (model.h), or empty for a
+ * row its store kept from before stamps; never missing. */
+static int stamp_ok(const GTEXT_JSON_Value * row, const char ** out,
+    size_t * out_len) {
+  return get_str(row, "schema", out, out_len) &&
+         (*out_len == 0 || gdefstor_schema_ok(*out, *out_len));
+}
+
 static GDEFSTOR_Result read_entity(GDEFSTOR_SnapModel * m,
     const GDEFSTOR_Limits * cap, const char * type, size_t type_len,
     const char * pid, size_t pid_len, const GTEXT_JSON_Value * root) {
@@ -1795,14 +1832,17 @@ static GDEFSTOR_Result read_entity(GDEFSTOR_SnapModel * m,
     size_t why_len;
     const char * langs;
     size_t langs_len;
+    const char * schema;
+    size_t schema_len;
     SRev * x;
-    if (!is_obj(r, 6) || !get_str(r, "who", &who, &who_len) ||
+    if (!is_obj(r, 7) || !get_str(r, "who", &who, &who_len) ||
         !gdefstor_model_id_ok(who, who_len, cap->max_public_id_bytes, 1) ||
         !get_str(r, "why", &why, &why_len) ||
         why_len > GDEFSTOR_MODEL_MAX_WHY_BYTES ||
         !gdefstor_model_utf8_ok((const uint8_t *)why, why_len) ||
         !get_str(r, "languages", &langs, &langs_len) ||
-        !gdefstor_model_langs_ok(langs, langs_len)) {
+        !gdefstor_model_langs_ok(langs, langs_len) ||
+        !stamp_ok(r, &schema, &schema_len)) {
       return GDEFSTOR_ERR_CORRUPT;
     }
     rc = GROW(m, revs);
@@ -1819,13 +1859,17 @@ static GDEFSTOR_Result read_entity(GDEFSTOR_SnapModel * m,
     x->who = copy(m->alloc, who, who_len);
     x->why = copy(m->alloc, why, why_len);
     x->langs = copy(m->alloc, langs, langs_len);
-    if (x->who == NULL || x->why == NULL || x->langs == NULL) {
+    x->schema = copy(m->alloc, schema, schema_len);
+    if (x->who == NULL || x->why == NULL || x->langs == NULL ||
+        x->schema == NULL) {
       gcu_allocator_free(m->alloc, x->who);
       gcu_allocator_free(m->alloc, x->why);
       gcu_allocator_free(m->alloc, x->langs);
+      gcu_allocator_free(m->alloc, x->schema);
       memset(x, 0, sizeof *x);
       return GDEFSTOR_ERR_OOM;
     }
+    x->schema_len = schema_len;
     x->who_len = who_len;
     x->why_len = why_len;
     x->langs_len = langs_len;
@@ -1887,9 +1931,12 @@ static GDEFSTOR_Result read_drafts(GDEFSTOR_SnapModel * m,
     size_t type_len;
     const char * doc;
     size_t doc_len;
+    const char * schema;
+    size_t schema_len;
     SDraft * x;
     GDEFSTOR_Result rc;
-    if (!is_obj(d, 4) || !get_str(d, "id", &pid, &pid_len) ||
+    if (!is_obj(d, 5) || !stamp_ok(d, &schema, &schema_len) ||
+        !get_str(d, "id", &pid, &pid_len) ||
         !gdefstor_model_id_ok(pid, pid_len, cap->max_public_id_bytes, 0) ||
         !get_str(d, "type", &type, &type_len) ||
         !gdefstor_model_type_name_ok(type, type_len) ||
@@ -1918,13 +1965,17 @@ static GDEFSTOR_Result read_drafts(GDEFSTOR_SnapModel * m,
     x->pid = copy(m->alloc, pid, pid_len);
     x->type = copy(m->alloc, type, type_len);
     x->json = (uint8_t *)copy(m->alloc, doc, doc_len);
-    if (x->pid == NULL || x->type == NULL || x->json == NULL) {
+    x->schema = copy(m->alloc, schema, schema_len);
+    if (x->pid == NULL || x->type == NULL || x->json == NULL ||
+        x->schema == NULL) {
       gcu_allocator_free(m->alloc, x->pid);
       gcu_allocator_free(m->alloc, x->type);
       gcu_allocator_free(m->alloc, x->json);
+      gcu_allocator_free(m->alloc, x->schema);
       memset(x, 0, sizeof *x);
       return GDEFSTOR_ERR_OOM;
     }
+    x->schema_len = schema_len;
     x->pid_len = pid_len;
     x->type_len = type_len;
     x->json_len = doc_len;
@@ -1946,9 +1997,12 @@ static GDEFSTOR_Result read_records(GDEFSTOR_SnapModel * m,
     size_t ns_len;
     const char * key;
     size_t key_len;
+    const char * schema;
+    size_t schema_len;
     SRec * x;
     GDEFSTOR_Result rc;
-    if (!is_obj(r, 3) || !get_str(r, "namespace", &ns, &ns_len) ||
+    if (!is_obj(r, 4) || !stamp_ok(r, &schema, &schema_len) ||
+        !get_str(r, "namespace", &ns, &ns_len) ||
         !gdefstor_model_sys_name_ok(ns, ns_len, GDEFSTOR_SYSTEM_MAX_NAME_BYTES,
             0) ||
         !get_str(r, "key", &key, &key_len) ||
@@ -1973,10 +2027,12 @@ static GDEFSTOR_Result read_records(GDEFSTOR_SnapModel * m,
     }
     x->ns = copy(m->alloc, ns, ns_len);
     x->key = copy(m->alloc, key, key_len);
+    x->schema = copy(m->alloc, schema, schema_len);
     m->nrecs += 1;
-    if (x->ns == NULL || x->key == NULL) {
+    if (x->ns == NULL || x->key == NULL || x->schema == NULL) {
       return GDEFSTOR_ERR_OOM;
     }
+    x->schema_len = schema_len;
     x->ns_len = ns_len;
     x->key_len = key_len;
   }
@@ -2544,6 +2600,8 @@ static GDEFSTOR_Result restore_revisions(GDEFSTOR_Write * write, void * txn,
     rev.why_len = sr->why_len;
     rev.languages = sr->langs;
     rev.languages_len = sr->langs_len;
+    rev.schema = sr->schema;
+    rev.schema_len = sr->schema_len;
     memset(&a, 0, sizeof a);
     a.row = e->row;
     a.revision = &rev;
@@ -2633,6 +2691,8 @@ GDEFSTOR_Result gdefstor_snap_model_import(GDEFSTOR_Write * write,
     md.base_revision = d->base;
     md.json = d->json;
     md.json_len = d->json_len;
+    md.schema = d->schema;
+    md.schema_len = d->schema_len;
     rc = store->model.draft_put(store->model.ctx, txn, &md);
   }
   for (i = 0; rc == GDEFSTOR_OK && i < m->nrecs; i++) {
@@ -2645,6 +2705,8 @@ GDEFSTOR_Result gdefstor_snap_model_import(GDEFSTOR_Write * write,
     mr.key_len = r->key_len;
     mr.bytes = r->len == 0 ? NULL : r->bytes;
     mr.len = r->len;
+    mr.schema = r->schema;
+    mr.schema_len = r->schema_len;
     rc = store->model.record_put(store->model.sys_ctx, txn, &mr);
   }
   for (i = 0; rc == GDEFSTOR_OK && i < m->ncnts; i++) {
