@@ -125,6 +125,76 @@ GDEFSTOR_Result gdefstor_store_create_model(const GDEFSTOR_Backend * backend,
   return GDEFSTOR_OK;
 }
 
+/* The key/bytes backend of a store opened over an entity backend alone: it
+ * holds nothing, and refuses to keep anything. */
+static void none_destroy(void * ctx) {
+  (void)ctx;
+}
+
+static GDEFSTOR_Result none_put(void * ctx, const char * tenant,
+    size_t tenant_len, const char * key, size_t key_len, const uint8_t * bytes,
+    size_t len) {
+  (void)ctx;
+  (void)tenant;
+  (void)tenant_len;
+  (void)key;
+  (void)key_len;
+  (void)bytes;
+  (void)len;
+  return GDEFSTOR_ERR_UNSUPPORTED;
+}
+
+static GDEFSTOR_Result none_get(void * ctx, const char * tenant,
+    size_t tenant_len, const char * key, size_t key_len, uint8_t ** out_bytes,
+    size_t * out_len) {
+  (void)ctx;
+  (void)tenant;
+  (void)tenant_len;
+  (void)key;
+  (void)key_len;
+  *out_bytes = NULL;
+  *out_len = 0;
+  return GDEFSTOR_ERR_INVALID;
+}
+
+static GDEFSTOR_Result none_remove(void * ctx, const char * tenant,
+    size_t tenant_len, const char * key, size_t key_len) {
+  (void)ctx;
+  (void)tenant;
+  (void)tenant_len;
+  (void)key;
+  (void)key_len;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result none_list(void * ctx, const char * tenant,
+    size_t tenant_len, const char * prefix, size_t prefix_len,
+    char *** out_keys, size_t ** out_key_lens, size_t * out_count) {
+  (void)ctx;
+  (void)tenant;
+  (void)tenant_len;
+  (void)prefix;
+  (void)prefix_len;
+  *out_keys = NULL;
+  *out_key_lens = NULL;
+  *out_count = 0;
+  return GDEFSTOR_OK;
+}
+
+GDEFSTOR_Result gdefstor_store_open(const GDEFSTOR_ModelBackend * model,
+    const GDEFSTOR_Allocator * allocator, const GDEFSTOR_Limits * limits,
+    GDEFSTOR_Store ** out_store) {
+  GDEFSTOR_Backend none;
+  memset(&none, 0, sizeof none);
+  none.destroy = none_destroy;
+  none.put = none_put;
+  none.get = none_get;
+  none.remove = none_remove;
+  none.list = none_list;
+  return gdefstor_store_create_model(&none, model, allocator, limits,
+      out_store);
+}
+
 int gdefstor_model_has_blind(const GDEFSTOR_Store * store) {
   return store != NULL && store->has_model &&
          store->model.blind_history != NULL;

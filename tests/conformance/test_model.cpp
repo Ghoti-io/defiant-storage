@@ -1283,7 +1283,7 @@ GDEFSTOR_Result ModelOpen(GDEFSTOR_Store ** out,
   GDEFSTOR_Backend kb;
   GDEFSTOR_ModelBackend mb;
   ScratchBackends(alloc, &kb, &mb);
-  GDEFSTOR_Result rc = gdefstor_store_create_model(&kb, &mb, alloc, nullptr, out);
+  GDEFSTOR_Result rc = gdefstor_store_open(&mb, alloc, nullptr, out);
   if (rc != GDEFSTOR_OK) {
     mb.destroy(mb.ctx);
   }
@@ -1295,6 +1295,28 @@ void ModelClose(GDEFSTOR_Store * store) {
 }
 
 #include "model.inc"
+
+/* A store opened over the entity backend alone holds no key/bytes row: a
+ * read finds none and a write that stages one is refused, while the entity
+ * port in the same store works. */
+TEST(ModelPort, AStoreOverTheEntityBackendAloneHoldsNoKeyBytesRow) {
+  GDEFSTOR_Store * store = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, ModelOpen(&store, nullptr));
+  GDEFSTOR_Write * w = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, "t1", 2, nullptr, &w));
+  const uint8_t body[] = {'x'};
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_blob_put(w, "ab", 2, body, sizeof body));
+  EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_write_commit(w));
+  uint8_t * got = nullptr;
+  size_t got_len = 0;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_blob_get(store, "t1", 2, "ab", 2,
+      &got, &got_len));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, "t1", 2, nullptr, &w));
+  EXPECT_EQ(GDEFSTOR_OK, gdefstor_record_put(w, "a", 1, "b", 1,
+      body, sizeof body));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_commit(w));
+  ModelClose(store);
+}
 
 /* A backend of the size before records, counters and the outbox: those calls
  * are refused as unsupported and nothing else changes; and a backend with

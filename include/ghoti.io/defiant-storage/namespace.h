@@ -241,6 +241,7 @@
 #define gdefstor_model_rebuild GHOTIIO_DEFSTOR(gdefstor_model_rebuild)
 #define gdefstor_model_scan GHOTIIO_DEFSTOR(gdefstor_model_scan)
 #define gdefstor_store_create_model GHOTIIO_DEFSTOR(gdefstor_store_create_model)
+#define gdefstor_store_open GHOTIIO_DEFSTOR(gdefstor_store_open)
 #define gdefstor_tree_add GHOTIIO_DEFSTOR(gdefstor_tree_add)
 #define gdefstor_tree_create GHOTIIO_DEFSTOR(gdefstor_tree_create)
 #define gdefstor_tree_free GHOTIIO_DEFSTOR(gdefstor_tree_free)

@@ -128,6 +128,22 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_store_create_model(
     const GDEFSTOR_Allocator * allocator, const GDEFSTOR_Limits * limits,
     GDEFSTOR_Store ** out_store);
 
+/**
+ * @brief Open a store over an entity backend alone.
+ *
+ * As gdefstor_store_create_model() with a key/bytes backend that holds
+ * nothing: a read of a key/bytes row finds none, and the commit of a write
+ * that holds one is ::GDEFSTOR_ERR_UNSUPPORTED. @p model is copied, its `ctx`
+ * borrowed until
+ * gdefstor_store_destroy(), which destroys it.
+ *
+ * @return As gdefstor_store_create_model().
+ */
+GDEFSTOR_API GDEFSTOR_Result gdefstor_store_open(
+    const struct GDEFSTOR_ModelBackend * model,
+    const GDEFSTOR_Allocator * allocator, const GDEFSTOR_Limits * limits,
+    GDEFSTOR_Store ** out_store);
+
 /* ---- type declarations ---------------------------------------------------- */
 
 /**
