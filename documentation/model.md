@@ -598,7 +598,10 @@ for the subject reports it erased and no new key can be made for it. A
 ledger row learned from elsewhere (a snapshot's copy, replayed on restore) is
 appended with the same effect. A key store that seals in process is given a
 cipher (`GDEFSTOR_KeyCipher`) by the caller, so this library holds no
-cryptography. Nothing is wired to the entity port yet.
+cryptography. The port itself never calls the key store: core holds both
+ports, and its erasure destroys the key and appends the ledger row here,
+then deletes the subject's blind rows through the entity port
+(`gdefstor_blind_delete_subject()`).
 
 Besides the keys it makes, a key store keeps two things a caller seals itself:
 
@@ -643,8 +646,6 @@ refused.
 - **Large values by content hash.** Values are stored inline, up to 1 MiB.
 - **Every use of the key store by the entity port**: computing MACs,
   encrypting and erasing are core's (S5b, S6).
-- **Blobs in the entity transaction.** Until then a write that holds blobs
-  holds no entity operation.
 - **Reading a record or a counter inside a write.** Reads see the last
   commit; the backend members take a transaction already, so the port call
   can be added.

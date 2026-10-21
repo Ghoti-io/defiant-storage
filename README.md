@@ -13,8 +13,10 @@ caller that is not a fiber gets `GDEFSTOR_ERR_BUSY`. A backend implements
 `documentation/model.md`. The key store port (`keystore.h`) holds subject keys
 and the erasure ledger.
 
-The in-memory backend is a separate library, `defiant-storage-memory`. SQLite
-is not this library. The port does not hash plaintext and does not encrypt.
+The backends are separate libraries: `defiant-storage-memory` (in memory),
+and `defiant-storage-sqlite` and `defiant-storage-postgres`, which share the
+SQL compiler and schema of `defiant-storage-sql`. No SQL is in this library.
+The port does not hash plaintext and does not encrypt.
 
 Formats are `defiant-snapshot/1`, whose members of one entity's revisions are
 `defiant-revision/1` (`documentation/formats.md`), and `defiant-type/1`,
