@@ -50,13 +50,7 @@ GDEFSTOR_Result gdefstor_store_open(const GDEFSTOR_ModelBackend * model,
     GDEFSTOR_Store ** out_store) {
   GDEFSTOR_ModelBackend copy;
   if (model == NULL || out_store == NULL ||
-      (model->size != sizeof(GDEFSTOR_ModelBackend) &&
-          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V1 &&
-          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V2 &&
-          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V3 &&
-          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V4 &&
-          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V5 &&
-          model->size != GDEFSTOR_MODEL_BACKEND_SIZE_V6) ||
+      model->size != sizeof(GDEFSTOR_ModelBackend) ||
       model->destroy == NULL ||
       model->begin == NULL || model->commit == NULL || model->abort == NULL ||
       model->type_load == NULL || model->type_store == NULL ||
@@ -68,11 +62,7 @@ GDEFSTOR_Result gdefstor_store_open(const GDEFSTOR_ModelBackend * model,
       model->rebuild == NULL || model->dump == NULL) {
     return GDEFSTOR_ERR_INVALID;
   }
-  /* A backend of an earlier version's size has fewer optional members: they
-   * read as NULL, never as bytes past what it filled. */
-  memset(&copy, 0, sizeof copy);
-  memcpy(&copy, model, model->size);
-  copy.size = sizeof copy;
+  copy = *model;
   /* The blind index is the three members together or not at all: a backend
    * that could write blind rows and not delete them would make erasure lie. */
   {

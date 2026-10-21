@@ -39,28 +39,25 @@
 
 struct GDEFSTOR_KeyStore {
   const GDEFSTOR_Allocator * alloc;
-  GDEFSTOR_KeyStoreBackend backend; /* the optional members NULL for V1 */
+  GDEFSTOR_KeyStoreBackend backend; /* the optional members may be NULL */
 };
 
 /* Whether the backend has the optional members (all are checked at create). */
-static int has_v2(const GDEFSTOR_KeyStore * ks) {
+static int has_sets(const GDEFSTOR_KeyStore * ks) {
   return ks->backend.sealed_put != NULL;
 }
 
 GDEFSTOR_Result gdefstor_keystore_create(const GDEFSTOR_KeyStoreBackend * backend,
     const GDEFSTOR_Allocator * allocator, GDEFSTOR_KeyStore ** out_keystore) {
   GDEFSTOR_KeyStore * ks;
-  int full;
   if (backend == NULL || out_keystore == NULL ||
-      (backend->size != sizeof(GDEFSTOR_KeyStoreBackend) &&
-          backend->size != GDEFSTOR_KEYSTORE_BACKEND_SIZE_V1) ||
+      backend->size != sizeof(GDEFSTOR_KeyStoreBackend) ||
       backend->destroy == NULL || backend->create == NULL ||
       backend->wrap == NULL || backend->unwrap == NULL ||
       backend->erase == NULL || backend->ledger == NULL) {
     return GDEFSTOR_ERR_INVALID;
   }
-  full = backend->size == sizeof(GDEFSTOR_KeyStoreBackend);
-  if (full && !((backend->sealed_put != NULL && backend->sealed_get != NULL &&
+  if (!((backend->sealed_put != NULL && backend->sealed_get != NULL &&
                     backend->secret_put != NULL &&
                     backend->secret_get != NULL && backend->dump != NULL &&
                     backend->restore != NULL) ||
@@ -75,9 +72,7 @@ GDEFSTOR_Result gdefstor_keystore_create(const GDEFSTOR_KeyStoreBackend * backen
     return GDEFSTOR_ERR_OOM;
   }
   ks->alloc = gdefstor_alloc(allocator);
-  /* A V1 backend is copied as far as it goes; the rest stays NULL. */
-  memcpy(&ks->backend, backend, full ? sizeof *backend
-                                     : GDEFSTOR_KEYSTORE_BACKEND_SIZE_V1);
+  ks->backend = *backend;
   *out_keystore = ks;
   return GDEFSTOR_OK;
 }
@@ -296,7 +291,7 @@ GDEFSTOR_Result gdefstor_keystore_subject_put(GDEFSTOR_KeyStore * keystore,
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
-  if (!has_v2(keystore)) {
+  if (!has_sets(keystore)) {
     return GDEFSTOR_ERR_UNSUPPORTED;
   }
   return keystore->backend.sealed_put(keystore->backend.ctx, tenant, tenant_len,
@@ -343,7 +338,7 @@ GDEFSTOR_Result gdefstor_keystore_subject_sealed(GDEFSTOR_KeyStore * keystore,
   if (out_erased == NULL || out_bytes == NULL || out_len == NULL) {
     return GDEFSTOR_ERR_INVALID;
   }
-  if (!has_v2(keystore)) {
+  if (!has_sets(keystore)) {
     return GDEFSTOR_ERR_UNSUPPORTED;
   }
   rc = keystore->backend.sealed_get(keystore->backend.ctx, tenant, tenant_len,
@@ -362,7 +357,7 @@ GDEFSTOR_Result gdefstor_keystore_secret_put(GDEFSTOR_KeyStore * keystore,
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
-  if (!has_v2(keystore)) {
+  if (!has_sets(keystore)) {
     return GDEFSTOR_ERR_UNSUPPORTED;
   }
   return keystore->backend.secret_put(keystore->backend.ctx, tenant, tenant_len,
@@ -382,7 +377,7 @@ GDEFSTOR_Result gdefstor_keystore_secret_get(GDEFSTOR_KeyStore * keystore,
   if (out_found == NULL || out_bytes == NULL || out_len == NULL) {
     return GDEFSTOR_ERR_INVALID;
   }
-  if (!has_v2(keystore)) {
+  if (!has_sets(keystore)) {
     return GDEFSTOR_ERR_UNSUPPORTED;
   }
   rc = keystore->backend.secret_get(keystore->backend.ctx, tenant, tenant_len,
@@ -898,7 +893,7 @@ GDEFSTOR_Result gdefstor_keystore_export(GDEFSTOR_KeyStore * keystore,
       !gdefstor_span_ok(tenant, tenant_len, KEYSTORE_TENANT_BYTES)) {
     return GDEFSTOR_ERR_INVALID;
   }
-  if (!has_v2(keystore)) {
+  if (!has_sets(keystore)) {
     return GDEFSTOR_ERR_UNSUPPORTED;
   }
   memset(&d, 0, sizeof d);
@@ -937,7 +932,7 @@ GDEFSTOR_Result gdefstor_keystore_import(GDEFSTOR_KeyStore * keystore,
       (bytes == NULL && len != 0)) {
     return GDEFSTOR_ERR_INVALID;
   }
-  if (!has_v2(keystore)) {
+  if (!has_sets(keystore)) {
     return GDEFSTOR_ERR_UNSUPPORTED;
   }
   rc = gdefstor_keyset_parse(keystore->alloc, bytes, len, &set);

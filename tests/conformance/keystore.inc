@@ -515,7 +515,7 @@ TEST_F(KeyStoreSets, AMalformedKeySetIsRefused) {
   } bad[] = {
       {"", GDEFSTOR_ERR_FORMAT},
       {"defiant-snapshot/1\n", GDEFSTOR_ERR_FORMAT},
-      {"defiant-keyset/2\ntaken 1\n", GDEFSTOR_ERR_UNSUPPORTED},
+      {"defiant-keyset/9\ntaken 1\n", GDEFSTOR_ERR_UNSUPPORTED},
       {"defiant-keyset/1\n", GDEFSTOR_ERR_CORRUPT},
       {"defiant-keyset/1\ntaken -1\n", GDEFSTOR_ERR_CORRUPT},
       {"defiant-keyset/1\ntaken 1\nsealed p1 0a", GDEFSTOR_ERR_CORRUPT},

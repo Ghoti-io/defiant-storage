@@ -584,7 +584,7 @@ TEST_F(ModelOutbox, ThePayloadIsOpaqueBytes) {
   ASSERT_EQ(GDEFSTOR_OK, InWrite([&](GDEFSTOR_Write * w) {
     GDEFSTOR_Result rc = Append(w, "core.bus", "x1", odd, nullptr,
         "defiant-change/1");
-    return rc == GDEFSTOR_OK ? Append(w, "core.bus", "x2", "", nullptr, "e.f:g/2")
+    return rc == GDEFSTOR_OK ? Append(w, "core.bus", "x2", "", nullptr, "e.f:g/9")
                              : rc;
   }));
   std::vector<GDEFSTOR_OutboxEntry> rows;
@@ -595,7 +595,7 @@ TEST_F(ModelOutbox, ThePayloadIsOpaqueBytes) {
                      rows[0].payload_len));
   EXPECT_EQ("defiant-change/1", std::string(rows[0].format, rows[0].format_len));
   EXPECT_EQ(0u, rows[1].payload_len);
-  EXPECT_EQ("e.f:g/2", std::string(rows[1].format, rows[1].format_len));
+  EXPECT_EQ("e.f:g/9", std::string(rows[1].format, rows[1].format_len));
   gdefstor_model_outbox_claim_free(c);
 }
 

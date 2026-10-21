@@ -532,44 +532,43 @@ in that header: truth is append-only and `valid_to` is set once; current
 tables are derived and rebuild to the same; a read with no transaction sees
 the last commit. `query` must answer exactly as `gdefstor_model_scan()`, the
 reference engine, which a backend with no engine of its own calls from its
-`query` (the memory backend does). One member is optional and was added
-later: `index_state`, called with `index_ctx` (so that a wrapper replacing
-`ctx` still reaches the backend), says whether an indexed field's index is
-built; a backend that leaves it NULL reads every indexed field as ready, and
-one built against the first version of the struct sets `size` to
-`GDEFSTOR_MODEL_BACKEND_SIZE_V1`. The blind index came next: `blind_ctx`,
-`blind_history`, `subject_lookup` and `blind_delete`, all three functions or
-none (`GDEFSTOR_MODEL_BACKEND_SIZE_V2` is the size before them); a backend
-that sets them also writes `GDEFSTOR_ModelApply::blinds` in `apply` and visits
-blind rows through `GDEFSTOR_ModelVisitor::blind` from `items`, `dump` and
-the reference engine's scan. Records, counters and the outbox came after:
-`sys_ctx` and eleven functions, all or none (`GDEFSTOR_MODEL_BACKEND_SIZE_V3`
-is the size before them). They keep those rows in the same transactions as
-the entities, leave them alone in `rebuild`, list them in `dump` through the
-visitor's `record`, `counter` and `outbox`, and keep each counter's floor so
-that an aborted transaction's value is never returned again
-(`model_backend.h` says each member's contract; the port checks names,
-values and what each answer holds). With languages (story S6a2) every item
-version, close and blind row carries its language and every revision row
-the languages it changed, `items` takes a language (or none, every
-language), and an optional `languages` member, with `lang_ctx`, lists the
-languages an entity has a tree in from its root items; a backend without it
-(`GDEFSTOR_MODEL_BACKEND_SIZE_V4` is the size before it) is read through
-`items` instead, which reads every language's whole tree. A backend keeps the
-language as a column, never as a table or a column per language, and reads
-one language's items without the others' where it is asked for one.
-Restoring a snapshot (story S6a3) needs three more, with `restore_ctx`, all
-or none (`GDEFSTOR_MODEL_BACKEND_SIZE_V5` is the size before them):
-`restore_revision` is an `apply` that keeps the commit sequence it is given
-and raises the tenant's to at least it, `restore_counter` sets a counter's
-committed value, and `restore_outbox` inserts an outbox row with its lease,
-failures and parked flag. A backend without them cannot be imported into.
-Rebuilding the blind index (story S6c) added `blind_put`, called with
-`blind_ctx` (`GDEFSTOR_MODEL_BACKEND_SIZE_V6` is the size before it): it
-writes one blind row for a version that exists, replacing the row of the
-same entity, item, `valid_from` and field. It is optional, and set only by a
-backend that serves the blind index; without it `gdefstor_blind_put()` is
-`GDEFSTOR_ERR_UNSUPPORTED`.
+`query` (the memory backend does). The struct has one size,
+`sizeof(GDEFSTOR_ModelBackend)`, which `size` says; a backend that says
+another is refused at open (AD-34: no size steps before the suite's first
+release). The members past the required ones are optional, each family
+whole or not at all:
+
+- `index_state`, called with `index_ctx` (so that a wrapper replacing `ctx`
+  still reaches the backend), says whether an indexed field's index is built;
+  a backend that leaves it NULL reads every indexed field as ready.
+- The blind index: `blind_ctx`, `blind_history`, `subject_lookup` and
+  `blind_delete`, all three functions or none. A backend that sets them also
+  writes `GDEFSTOR_ModelApply::blinds` in `apply` and visits blind rows
+  through `GDEFSTOR_ModelVisitor::blind` from `items`, `dump` and the
+  reference engine's scan. `blind_put`, called with `blind_ctx`, writes one
+  blind row for a version that exists, replacing the row of the same entity,
+  item, `valid_from` and field; set only by a backend that serves the blind
+  index, and without it `gdefstor_blind_put()` is `GDEFSTOR_ERR_UNSUPPORTED`.
+- Records, counters and the outbox: `sys_ctx` and eleven functions, all or
+  none. They keep those rows in the same transactions as the entities, leave
+  them alone in `rebuild`, list them in `dump` through the visitor's `record`,
+  `counter` and `outbox`, and keep each counter's floor so that an aborted
+  transaction's value is never returned again (`model_backend.h` says each
+  member's contract; the port checks names, values and what each answer
+  holds).
+- `languages`, with `lang_ctx`, lists the languages an entity has a tree in
+  from its root items; a backend without it is read through `items` instead,
+  which reads every language's whole tree. Every item version, close and
+  blind row carries its language and every revision row the languages it
+  changed, and `items` takes a language (or none, every language). A backend
+  keeps the language as a column, never as a table or a column per language,
+  and reads one language's items without the others' where it is asked for
+  one.
+- Restoring a snapshot: `restore_ctx` and three functions, all or none.
+  `restore_revision` is an `apply` that keeps the commit sequence it is given
+  and raises the tenant's to at least it, `restore_counter` sets a counter's
+  committed value, and `restore_outbox` inserts an outbox row with its lease,
+  failures and parked flag. A backend without them cannot be imported into.
 
 Every backend runs the conformance suite, installed beside the port:
 `model.inc` (named cases for every rule above, the purchase-order fixture,
@@ -626,8 +625,10 @@ never inside a snapshot. The data half is a snapshot taken with
 (`gdefstor_snapshot_taken()` reads it); the restore that pairs the two, and
 refuses a key set older than its data set, is core's.
 
-A backend of `GDEFSTOR_KEYSTORE_BACKEND_SIZE_V1` (without these members) is
-still accepted; every call that needs them is `GDEFSTOR_ERR_UNSUPPORTED` on it.
+A backend may leave these members NULL, all of them; every call that needs
+them is `GDEFSTOR_ERR_UNSUPPORTED` on it. The struct has one size,
+`sizeof(GDEFSTOR_KeyStoreBackend)`, and a backend that says another is
+refused.
 
 ## Not built here
 

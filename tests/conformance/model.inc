@@ -1794,7 +1794,7 @@ TEST_F(ModelDraft, JsonRoundTripsTheTree) {
   EXPECT_EQ(want, Read(back));
   gdefstor_tree_free(back);
   /* Other formats and fields the type does not have are refused. */
-  std::string other = "{\"format\":\"defiant-tree/2\",\"root\":{}}";
+  std::string other = "{\"format\":\"defiant-tree/9\",\"root\":{}}";
   EXPECT_EQ(GDEFSTOR_ERR_UNSUPPORTED, gdefstor_tree_from_json(type,
       reinterpret_cast<const uint8_t *>(other.data()), other.size(), nullptr,
       &back));

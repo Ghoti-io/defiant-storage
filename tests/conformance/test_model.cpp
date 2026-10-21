@@ -1256,15 +1256,27 @@ void ModelClose(GDEFSTOR_Store * store) {
 
 #include "model.inc"
 
-/* A backend of the size before records, counters and the outbox: those calls
- * are refused as unsupported and nothing else changes; and a backend with
- * some of the members and not all is refused when the store is opened. */
+/* A backend without records, counters and the outbox (their members NULL):
+ * those calls are refused as unsupported and nothing else changes; and a
+ * backend with some of the members and not all is refused when the store is
+ * opened. */
 TEST(ModelPort, ABackendWithoutTheSystemFamiliesServesTheRest) {
   GDEFSTOR_ModelBackend mb;
   ScratchBackend(nullptr, &mb);
   GDEFSTOR_ModelBackend v3 = mb;
   v3.destroy = [](void *) {}; /* the last store below destroys the Scratch */
-  v3.size = GDEFSTOR_MODEL_BACKEND_SIZE_V3;
+  v3.sys_ctx = nullptr;
+  v3.record_put = nullptr;
+  v3.record_delete = nullptr;
+  v3.record_get = nullptr;
+  v3.record_list = nullptr;
+  v3.counter_next = nullptr;
+  v3.counter_get = nullptr;
+  v3.outbox_insert = nullptr;
+  v3.outbox_claim = nullptr;
+  v3.outbox_delete = nullptr;
+  v3.outbox_fail = nullptr;
+  v3.outbox_parked = nullptr;
   GDEFSTOR_Store * old = nullptr;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_open(&v3, nullptr,
       nullptr, &old));
@@ -1297,7 +1309,7 @@ TEST(ModelPort, ABackendWithoutTheSystemFamiliesServesTheRest) {
   gdefstor_store_destroy(old); /* destroys the backends, once */
 }
 
-/* A backend of the size before gdefstor_blind_put() serves everything else and
+/* A backend without gdefstor_blind_put()'s member serves everything else and
  * refuses the put as unsupported; a put without a blind table is refused when
  * the store is opened. */
 TEST(ModelPort, ABackendWithoutBlindPutRefusesOnlyThePut) {
@@ -1305,7 +1317,7 @@ TEST(ModelPort, ABackendWithoutBlindPutRefusesOnlyThePut) {
   ScratchBackend(nullptr, &mb);
   GDEFSTOR_ModelBackend v6 = mb;
   v6.destroy = [](void *) {}; /* the last store below destroys the Scratch */
-  v6.size = GDEFSTOR_MODEL_BACKEND_SIZE_V6;
+  v6.blind_put = nullptr;
   GDEFSTOR_Store * old = nullptr;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_open(&v6, nullptr,
       nullptr, &old));
@@ -1332,6 +1344,25 @@ TEST(ModelPort, ABackendWithoutBlindPutRefusesOnlyThePut) {
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_open(&mb, nullptr,
       nullptr, &old));
   gdefstor_store_destroy(old); /* destroys the backends, once */
+}
+
+/* The backend struct has one size (AD-34: no size steps before the suite's
+ * first release): a backend that says another, the size of the struct at an
+ * earlier member included, is refused when the store is opened. */
+TEST(ModelPort, ABackendOfAnotherSizeIsRefused) {
+  GDEFSTOR_ModelBackend mb;
+  ScratchBackend(nullptr, &mb);
+  GDEFSTOR_Store * store = nullptr;
+  for (size_t size : {offsetof(GDEFSTOR_ModelBackend, index_ctx),
+           offsetof(GDEFSTOR_ModelBackend, blind_put), sizeof mb - 1,
+           sizeof mb + 1, (size_t)0}) {
+    GDEFSTOR_ModelBackend other = mb;
+    other.size = size;
+    EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_store_open(&other, nullptr,
+        nullptr, &store)) << size;
+  }
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_store_open(&mb, nullptr, nullptr, &store));
+  gdefstor_store_destroy(store); /* destroys the backend, once */
 }
 
 /* A scratch key store over the cipher it is given, apart from the memory
@@ -1608,15 +1639,16 @@ static GDEFSTOR_Result ks_restore(void * ctx, const char * t, size_t tl,
 
 } /* namespace */
 
-/* A backend of the first size: the calls it cannot serve are refused as
- * unsupported, and the rest still work. */
-TEST(KeyStorePort, AFirstSizeBackendServesWhatItHas) {
+/* A backend without the optional members: the calls it cannot serve are
+ * refused as unsupported, and the rest still work. A backend of any size but
+ * the struct's is refused. */
+TEST(KeyStorePort, ABackendWithoutTheOptionalMembersServesWhatItHas) {
   KScratch * k = new KScratch();
   k->alloc = gdefstor_allocator_default();
   std::memset(&k->cipher, 0, sizeof k->cipher);
   GDEFSTOR_KeyStoreBackend b;
   std::memset(&b, 0, sizeof b);
-  b.size = GDEFSTOR_KEYSTORE_BACKEND_SIZE_V1;
+  b.size = sizeof b;
   b.ctx = k;
   b.destroy = ks_destroy;
   b.create = ks_create;
@@ -1625,6 +1657,11 @@ TEST(KeyStorePort, AFirstSizeBackendServesWhatItHas) {
   b.erase = ks_erase;
   b.ledger = ks_ledger;
   GDEFSTOR_KeyStore * ks = nullptr;
+  b.size = offsetof(GDEFSTOR_KeyStoreBackend, sealed_put);
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_create(&b, nullptr, &ks));
+  b.size = sizeof b - 1;
+  EXPECT_EQ(GDEFSTOR_ERR_INVALID, gdefstor_keystore_create(&b, nullptr, &ks));
+  b.size = sizeof b;
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_create(&b, nullptr, &ks));
   const uint8_t m[1] = {1};
   uint8_t * out = nullptr;

@@ -416,17 +416,12 @@ typedef struct GDEFSTOR_ModelBackend {
    * GDEFSTOR_MODEL_CURRENT, every `entity` and current `item`. */
   GDEFSTOR_Result (*dump)(void * ctx, const char * tenant, size_t tenant_len,
       int which, const GDEFSTOR_ModelVisitor * visitor);
-  /* ---- added after the first version: optional ---------------------------
-   * A backend built against the struct that ends at @ref dump sets @ref size
-   * to that size (GDEFSTOR_MODEL_BACKEND_SIZE_V1), and one built against the
-   * struct that ends at @ref index_state to GDEFSTOR_MODEL_BACKEND_SIZE_V2,
-   * at @ref blind_delete to GDEFSTOR_MODEL_BACKEND_SIZE_V3, and at
-   * @ref outbox_parked to GDEFSTOR_MODEL_BACKEND_SIZE_V4, and at
-   * @ref languages to GDEFSTOR_MODEL_BACKEND_SIZE_V5, and at
-   * @ref restore_outbox to GDEFSTOR_MODEL_BACKEND_SIZE_V6; the port treats
-   * every member past its size as NULL. (The rows above gained a language
-   * with languages, so a backend is built against this header whatever its
-   * size.) */
+  /* ---- optional --------------------------------------------------------
+   * Every member below may be NULL; a family that must come whole (the blind
+   * index, records and the rest, restoring) is all set or all NULL, and the
+   * store refuses a half-set one at open. The struct has one size,
+   * `sizeof(GDEFSTOR_ModelBackend)` (AD-34: no size steps before the suite's
+   * first release). */
   /** The context @ref index_state is called with. A member of its own, not
    * @ref ctx, so that a wrapper that copies this struct and replaces @ref ctx
    * to intercept the other members still reaches the backend that owns the
@@ -601,38 +596,6 @@ typedef struct GDEFSTOR_ModelBackend {
   GDEFSTOR_Result (*blind_put)(void * blind_ctx, void * txn,
       const GDEFSTOR_Type * type, uint64_t row, const GDEFSTOR_ModelBlind * b);
 } GDEFSTOR_ModelBackend;
-
-/** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::index_ctx
- * was added; gdefstor_store_create_model() accepts it. */
-#define GDEFSTOR_MODEL_BACKEND_SIZE_V1 \
-  offsetof(GDEFSTOR_ModelBackend, index_ctx)
-
-/** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::blind_ctx
- * was added; gdefstor_store_create_model() accepts it. */
-#define GDEFSTOR_MODEL_BACKEND_SIZE_V2 \
-  offsetof(GDEFSTOR_ModelBackend, blind_ctx)
-
-/** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::sys_ctx
- * was added; gdefstor_store_create_model() accepts it. */
-#define GDEFSTOR_MODEL_BACKEND_SIZE_V3 \
-  offsetof(GDEFSTOR_ModelBackend, sys_ctx)
-
-/** `sizeof(GDEFSTOR_ModelBackend)` before @ref GDEFSTOR_ModelBackend::lang_ctx
- * was added; gdefstor_store_create_model() accepts it. */
-#define GDEFSTOR_MODEL_BACKEND_SIZE_V4 \
-  offsetof(GDEFSTOR_ModelBackend, lang_ctx)
-
-/** `sizeof(GDEFSTOR_ModelBackend)` before
- * @ref GDEFSTOR_ModelBackend::restore_ctx was added;
- * gdefstor_store_create_model() accepts it. */
-#define GDEFSTOR_MODEL_BACKEND_SIZE_V5 \
-  offsetof(GDEFSTOR_ModelBackend, restore_ctx)
-
-/** `sizeof(GDEFSTOR_ModelBackend)` before
- * @ref GDEFSTOR_ModelBackend::blind_put was added;
- * gdefstor_store_create_model() accepts it. */
-#define GDEFSTOR_MODEL_BACKEND_SIZE_V6 \
-  offsetof(GDEFSTOR_ModelBackend, blind_put)
 
 /**
  * @brief The reference query engine: answer @p plan over the entities

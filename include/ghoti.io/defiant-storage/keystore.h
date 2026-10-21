@@ -135,9 +135,9 @@ typedef struct GDEFSTOR_KeyStoreBackend {
       GDEFSTOR_Result (*visit)(void * vctx, const char * subject,
           size_t subject_len, int64_t when_ms),
       void * vctx);
-  /* Everything below is optional, all of it or none: a backend of
-   * ::GDEFSTOR_KEYSTORE_BACKEND_SIZE_V1, or one that leaves them NULL, answers
-   * ::GDEFSTOR_ERR_UNSUPPORTED to every call that needs them. */
+  /* Everything below is optional, all of it or none: a backend that leaves
+   * them NULL answers ::GDEFSTOR_ERR_UNSUPPORTED to every call that needs
+   * them. */
   /** Keep caller-sealed material as the subject's key. ::GDEFSTOR_ERR_INVALID
    * when the subject has a key or material, or was erased. */
   GDEFSTOR_Result (*sealed_put)(void * ctx, const char * tenant,
@@ -174,11 +174,6 @@ typedef struct GDEFSTOR_KeyStoreBackend {
   GDEFSTOR_Result (*restore)(void * ctx, const char * tenant,
       size_t tenant_len, const GDEFSTOR_KeyRow * rows, size_t count);
 } GDEFSTOR_KeyStoreBackend;
-
-/** The size of a backend without the optional members (sealed material,
- * tenant secrets, the key set). gdefstor_keystore_create() accepts it. */
-#define GDEFSTOR_KEYSTORE_BACKEND_SIZE_V1                                      \
-  offsetof(GDEFSTOR_KeyStoreBackend, sealed_put)
 
 /** An open key store. Opaque. */
 typedef struct GDEFSTOR_KeyStore GDEFSTOR_KeyStore;
