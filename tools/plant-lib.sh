@@ -70,6 +70,7 @@
 #
 #   plant_hook_control EXE FILTER    the line the passing control prints
 #   plant_hook_caught NAME EXPECT LOG    what a caught plant prints (stdout)
+#   plant_hook_stale NAME FILES OBJECTS  what the stale-object plant prints
 #   plant_hook_done                  the last line of a gate that passed
 #
 # plant_spawn runs any function of the gate's in a slot of its own, with the
@@ -252,6 +253,12 @@ plant_hook_caught() { # name expect log
     printf '%s: %s: caught by %s\n' "$PLANT_TAG" "$1" "$t"
     grep -E "\[  FAILED  \] $t( |\$)" "$3" | head -1 | sed "s/^/$PLANT_TAG:   /"
   done
+}
+
+plant_hook_stale() { # name files objects
+  printf '%s: %s: caught by the stale-object check: %s edited, and not rebuilt:\n' \
+    "$PLANT_TAG" "$1" "$2"
+  printf '%s\n' "$3" | sed "s/^/$PLANT_TAG:   /"
 }
 
 plant_hook_done() {
@@ -479,9 +486,7 @@ PY
   stale_objs=$(plant_stale_objects "$dir" "$log" $files)
   if [ "$stale" = 1 ]; then
     if [ -n "$stale_objs" ]; then
-      printf '%s: %s: caught by the stale-object check: %s edited, and not rebuilt:\n' \
-        "$PLANT_TAG" "$name" "$(printf '%s' "$files" | tr '\n' ' ' | sed 's/ *$//')"
-      printf '%s\n' "$stale_objs" | sed "s/^/$PLANT_TAG:   /"
+      plant_hook_stale "$name" "$(printf '%s' "$files" | tr '\n' ' ' | sed 's/ *$//')" "$stale_objs"
       return 0
     fi
     printf '%s: %s: every object that depends on the edit was rebuilt anyway, so the stale-object check was not shown to work - read %s\n' \
