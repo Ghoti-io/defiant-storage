@@ -2,8 +2,9 @@
 #
 # Shared by the check-*.sh gates that plant a defect in the library source.
 # Sourced, not run. This is the one copy: defiant-storage installs it with its
-# conformance suites, and the backends' gates source it from there
-# (pkg-config --variable=conformance_dir), so there is nothing to keep in step.
+# conformance suites, and the gates of the other Defiant libraries source it
+# from there (pkg-config --variable=conformance_dir), so there is nothing to
+# keep in step.
 #
 # A gate that only shows its test can fail (an `if` inside the test body)
 # says nothing about the library. These plants edit a scratch COPY of the
@@ -50,6 +51,30 @@
 #
 # plant_wait waits for every plant started so far and prints what they have to
 # say; use it before reading $PLANT_FAIL.
+#
+# A gate that already had its own wording keeps it, with these (all optional,
+# set after plant_setup or before the first plant):
+#
+#   PLANT_TAG        what each line starts with (default: plant)
+#   PLANT_RUN_FILTER a plant runs the tests this filter matches (for example
+#                    every test of its program), not only the ones named;
+#                    the named tests still have to be among the failures
+#   PLANT_NEED_TEXT  set before one plant: the red run's log must also carry
+#                    this text (cleared when the plant has started)
+#   PLANT_TIMEOUT    seconds a test program may run in a plant. The program
+#                    is then built first and run directly under `timeout`
+#   PLANT_TREE_DIRS  the directories the copy takes (default: src include
+#                    tests tools pkgconfig documentation examples)
+#
+# and these functions, which a gate may redefine after sourcing this file:
+#
+#   plant_hook_control EXE FILTER    the line the passing control prints
+#   plant_hook_caught NAME EXPECT LOG    what a caught plant prints (stdout)
+#   plant_hook_done                  the last line of a gate that passed
+#
+# plant_spawn runs any function of the gate's in a slot of its own, with the
+# same ordered output, for a gate whose plant is not a single copy of the tree
+# (plant_acquire and plant_launch are its two halves).
 
 set -u
 
@@ -59,6 +84,11 @@ plant_setup() {
   PLANT_MAKE="${1:?plant_setup <make> <build-dir> [make args]}"
   PLANT_BUILD="${2:?plant_setup <make> <build-dir> [make args]}"
   shift 2
+  PLANT_TAG="${PLANT_TAG:-plant}"
+  PLANT_NEED_TEXT=
+  PLANT_RUN_FILTER="${PLANT_RUN_FILTER:-}"
+  PLANT_TIMEOUT="${PLANT_TIMEOUT:-}"
+  PLANT_TREE_DIRS="${PLANT_TREE_DIRS:-src include tests tools pkgconfig documentation examples}"
   PLANT_JOBS="${GHOTI_CHECK_JOBS:-$(n=$(nproc 2>/dev/null || echo 4); [ "$n" -gt 4 ] && n=4; echo "$n")}"
   # The control is one run of make and takes every job; a plant is one of
   # several, and a warm one recompiles little, so it takes one.
@@ -92,13 +122,18 @@ plant_setup() {
   fi
 }
 
+# plant_cp <args>: cp -a, sharing the data blocks where the file system can.
+plant_cp() {
+  cp -a --reflink=auto "$@" 2> /dev/null || cp -a "$@"
+}
+
 plant_copy_tree() {
   dest=$1
   mkdir -p "$dest"
-  for d in src include tests tools pkgconfig documentation examples; do
-    [ -e "$PLANT_ROOT/$d" ] && cp -a "$PLANT_ROOT/$d" "$dest/"
+  for d in $PLANT_TREE_DIRS; do
+    [ -e "$PLANT_ROOT/$d" ] && plant_cp "$PLANT_ROOT/$d" "$dest/"
   done
-  cp -a "$PLANT_ROOT/Makefile" "$PLANT_ROOT/Doxyfile" "$dest/"
+  plant_cp "$PLANT_ROOT/Makefile" "$PLANT_ROOT/Doxyfile" "$dest/"
   rm -rf "$dest/tests/fuzz/corpus"
   plant_warm "$PLANT_ROOT" "$dest" "$PLANT_BUILD"
 }
@@ -113,7 +148,7 @@ plant_warm() {
   case "$3" in /*|*..*|'') return 0 ;; esac
   [ -d "$1/$3" ] || return 0
   mkdir -p "$2/$(dirname "$3")"
-  cp -a "$1/$3" "$2/$3"
+  plant_cp "$1/$3" "$2/$3"
 }
 
 # ---- what a gate prints, in order ------------------------------------------
@@ -149,7 +184,7 @@ plant_drain() {
         wait "$pid"
       fi
       if [ ! -e "$s.done" ]; then
-        printf 'plant: a plant ended without a result (slot %s), which is a failure\n' "$n" >&2
+        printf '%s: a plant ended without a result (slot %s), which is a failure\n' "$PLANT_TAG" "$n" >&2
         PLANT_FAIL=1
         PLANT_NEXT=$n
         continue
@@ -169,15 +204,88 @@ plant_wait() {
   plant_drain 1
 }
 
+# plant_acquire: wait for a place to run in and take the next slot (PLANT_SLOT).
+plant_acquire() {
+  if [ "$PLANT_PAR" -gt 1 ]; then
+    read -r PLANT_TOKEN <&3
+  fi
+  plant_slot_new
+}
+
+# plant_launch <fn> [args]: run the function in the slot plant_acquire took,
+# its standard output and error going to the slot, its status being the slot's
+# result. In the background where there is room for more than one.
+plant_launch() {
+  slot=$PLANT_SLOT
+  if [ "$PLANT_PAR" -gt 1 ]; then
+    (
+      "$@" > "$slot.out" 2> "$slot.err"
+      echo $? > "$slot.rc"
+      printf 'x\n' >&3
+      : > "$slot.done"
+    ) &
+    eval "PLANT_PID_$PLANT_SEQ=$!"
+  else
+    (
+      "$@" > "$slot.out" 2> "$slot.err"
+      echo $? > "$slot.rc"
+      : > "$slot.done"
+    )
+  fi
+  plant_drain 0
+}
+
+# plant_spawn <fn> [args]: plant_acquire, then plant_launch.
+plant_spawn() {
+  plant_acquire
+  plant_launch "$@"
+}
+
+# ---- what the helpers say, unless the gate says it its own way -----------
+
+plant_hook_control() { # exe filter
+  plant_say "$PLANT_TAG: control passes: $1 $2"
+}
+
+plant_hook_caught() { # name expect log
+  for t in $2; do
+    printf '%s: %s: caught by %s\n' "$PLANT_TAG" "$1" "$t"
+    grep -E "\[  FAILED  \] $t( |\$)" "$3" | head -1 | sed "s/^/$PLANT_TAG:   /"
+  done
+}
+
+plant_hook_done() {
+  printf '%s: every planted defect turned its named test red\n' "$PLANT_TAG"
+}
+
 # ---- running one plant --------------------------------------------------------
 
-# plant_run <dir> <exe> <filter> <log> [make args]: build the one test program
-# in <dir> and run the tests matching <filter>. Exit status is the test run's.
+# plant_run <dir> <exe> <filter> <log> [make args]: build the test program(s)
+# in <dir> and run the tests matching <filter>. <exe> may name several
+# programs. Exit status is the test run's.
 plant_run() {
   dir=$1 exe=$2 filter=$3 log=$4
   shift 4
+  paths=
+  for e in $exe; do
+    paths="$paths $PLANT_BUILD/apps/$e$PLANT_EXE_EXT"
+  done
+  if [ -n "$PLANT_TIMEOUT" ]; then
+    # Built first, then run on its own under a time limit: a plant that
+    # makes a test wait for ever is a failure of that plant, not a hung gate.
+    # shellcheck disable=SC2086
+    ( cd "$dir" && "$PLANT_MAKE" --no-print-directory $paths "$@" ) > "$log" 2>&1 || return 1
+    status=0
+    for e in $exe; do
+      ( cd "$dir" && LD_LIBRARY_PATH="$dir/$PLANT_BUILD/apps${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+          GTEST_FILTER="$filter" timeout "$PLANT_TIMEOUT" \
+          "$PLANT_BUILD/apps/$e$PLANT_EXE_EXT" --gtest_brief=1 ) >> "$log" 2>&1 || status=1
+    done
+    return $status
+  fi
+  # shellcheck disable=SC2086
   ( cd "$dir" && GTEST_FILTER="$filter" "$PLANT_MAKE" --no-print-directory test \
-      TEST_GATES= TEST_EXECUTABLES="$PLANT_BUILD/apps/$exe$PLANT_EXE_EXT" \
+      TEST_GATES= TEST_EXECUTABLES="$paths" \
       "$@" ) > "$log" 2>&1
 }
 
@@ -188,22 +296,22 @@ plant_control() {
     plant_copy_tree "$PLANT_SCRATCH/control"
     PLANT_CONTROL_DONE=1
   fi
-  log="$PLANT_SCRATCH/control-$exe.log"
+  log="$PLANT_SCRATCH/control-$(printf '%s' "$exe" | tr ' ' '-').log"
   # shellcheck disable=SC2086
   if ! plant_run "$PLANT_SCRATCH/control" "$exe" "$filter" "$log" $PLANT_ARGS; then
     plant_wait
-    printf 'plant: the CONTROL (unpatched) copy fails %s %s, so no plant below would mean anything. Its log:\n' \
-      "$exe" "$filter" >&2
+    printf '%s: the CONTROL (unpatched) copy fails %s %s, so no plant below would mean anything. Its log:\n' \
+      "$PLANT_TAG" "$exe" "$filter" >&2
     tail -40 "$log" >&2
     exit 1
   fi
   if ! grep -Eq '\[  PASSED  \] [1-9][0-9]* test' "$log"; then
     plant_wait
-    printf 'plant: the CONTROL run of %s %s passed but ran no tests (a filter that matches nothing)\n' \
-      "$exe" "$filter" >&2
+    printf '%s: the CONTROL run of %s %s passed but ran no tests (a filter that matches nothing)\n' \
+      "$PLANT_TAG" "$exe" "$filter" >&2
     exit 1
   fi
-  plant_say "plant: control passes: $exe $filter"
+  plant_hook_control "$exe" "$filter"
   plant_drain 0
 }
 
@@ -252,20 +360,12 @@ plant_stale_objects() {
   done
 }
 
-# plant_job <kind> <stale> <name> <exe> <expect> <file/edits...>
+# plant_edit <kind> <dir> <edits...>: apply the exact text edits to the files
+# of <dir>; 0 if all applied.
 # kind p: <file> <old> <new> [<old> <new> ...]    (plant)
 # kind m: <file> <old> <new> [<file> <old> <new> ...]    (plantm)
-# <stale> = 1: after the edit, make every object that depends on it look up to
-# date, so the rebuild does not happen; the plant is then expected to be
-# refused as STALE OBJECT, and is a failure if it is not.
-# Runs in a subshell of its own, in a copy of the control tree already at
-# $PLANT_SCRATCH/<name>; leaves 0 for a plant that behaved, 1 otherwise.
-plant_job() {
-  kind=$1 stale=$2 name=$3 exe=$4 expect=$5
-  shift 5
-  dir="$PLANT_SCRATCH/$name"
-  log="$dir.log"
-  python3 - "$kind" "$dir" "$@" <<'PY'
+plant_edit() {
+  python3 - "$@" <<'PY'
 import sys
 kind = sys.argv[1]
 root = sys.argv[2]
@@ -301,9 +401,25 @@ for f, old, new in triples:
 for f in texts:
     open(root + "/" + f, "w").write(texts[f])
 PY
+}
+
+# plant_job <kind> <stale> <name> <exe> <expect> <file/edits...>
+# kind p: <file> <old> <new> [<old> <new> ...]    (plant)
+# kind m: <file> <old> <new> [<file> <old> <new> ...]    (plantm)
+# <stale> = 1: after the edit, make every object that depends on it look up to
+# date, so the rebuild does not happen; the plant is then expected to be
+# refused as STALE OBJECT, and is a failure if it is not.
+# Runs in a subshell of its own, in a copy of the control tree already at
+# $PLANT_SCRATCH/<name>; leaves 0 for a plant that behaved, 1 otherwise.
+plant_job() {
+  kind=$1 stale=$2 name=$3 exe=$4 expect=$5
+  shift 5
+  dir="$PLANT_SCRATCH/$name"
+  log="$dir.log"
+  plant_edit "$kind" "$dir" "$@"
   rc=$?
   if [ $rc -ne 0 ]; then
-    printf 'plant: %s: THE EDIT DID NOT APPLY, nothing was tested\n' "$name" >&2
+    printf '%s: %s: THE EDIT DID NOT APPLY, nothing was tested\n' "$PLANT_TAG" "$name" >&2
     return 1
   fi
   if [ "$kind" = p ]; then
@@ -319,9 +435,9 @@ PY
   for file in $files; do
     if cmp -s "$PLANT_ROOT/$file" "$dir/$file"; then
       if [ "$kind" = p ]; then
-        printf 'plant: %s: the edited file equals the original, nothing was tested\n' "$name" >&2
+        printf '%s: %s: the edited file equals the original, nothing was tested\n' "$PLANT_TAG" "$name" >&2
       else
-        printf 'plant: %s: %s equals the original, nothing was tested\n' "$name" "$file" >&2
+        printf '%s: %s: %s equals the original, nothing was tested\n' "$PLANT_TAG" "$name" "$file" >&2
       fi
       return 1
     fi
@@ -338,7 +454,11 @@ PY
     done
   fi
   rm -f "$dir/$PLANT_BUILD"/apps/test*
-  filter=$(printf '%s' "$expect" | tr ' ' ':')
+  if [ -n "$PLANT_RUN_FILTER" ]; then
+    filter=$PLANT_RUN_FILTER
+  else
+    filter=$(printf '%s' "$expect" | tr ' ' ':')
+  fi
   # shellcheck disable=SC2086
   if plant_run "$dir" "$exe" "$filter" "$log" $PLANT_PLANT_ARGS; then
     ran=0
@@ -346,49 +466,62 @@ PY
     ran=1
   fi
   if [ $ran -ne 0 ] && ! grep -Eq '\[==========\] .* ran\.' "$log"; then
-    printf 'plant: %s: the run failed without finishing (a build error or a crash), which is not a test catching a defect - read %s\n' \
-      "$name" "$log" >&2
+    printf '%s: %s: the run failed without finishing (a build error or a crash), which is not a test catching a defect - read %s\n' \
+      "$PLANT_TAG" "$name" "$log" >&2
     tail -30 "$log" >&2
     return 1
   fi
   if [ $ran -eq 0 ] && ! grep -Eq '\[==========\] .* ran\.' "$log"; then
-    printf 'plant: %s: the run finished without running tests - read %s\n' "$name" "$log" >&2
+    printf '%s: %s: the run finished without running tests - read %s\n' "$PLANT_TAG" "$name" "$log" >&2
     return 1
   fi
   # shellcheck disable=SC2086
   stale_objs=$(plant_stale_objects "$dir" "$log" $files)
   if [ "$stale" = 1 ]; then
     if [ -n "$stale_objs" ]; then
-      printf 'plant: %s: caught by the stale-object check: %s edited, and not rebuilt:\n' \
-        "$name" "$(printf '%s' "$files" | tr '\n' ' ' | sed 's/ *$//')"
-      printf '%s\n' "$stale_objs" | sed 's/^/plant:   /'
+      printf '%s: %s: caught by the stale-object check: %s edited, and not rebuilt:\n' \
+        "$PLANT_TAG" "$name" "$(printf '%s' "$files" | tr '\n' ' ' | sed 's/ *$//')"
+      printf '%s\n' "$stale_objs" | sed "s/^/$PLANT_TAG:   /"
       return 0
     fi
-    printf 'plant: %s: every object that depends on the edit was rebuilt anyway, so the stale-object check was not shown to work - read %s\n' \
-      "$name" "$log" >&2
+    printf '%s: %s: every object that depends on the edit was rebuilt anyway, so the stale-object check was not shown to work - read %s\n' \
+      "$PLANT_TAG" "$name" "$log" >&2
     return 1
   fi
   if [ -n "$stale_objs" ]; then
-    printf 'plant: %s: STALE OBJECT: the edit was not rebuilt into the test program, so the defect never reached the tests (read %s):\n' \
-      "$name" "$log" >&2
-    printf '%s\n' "$stale_objs" | sed 's/^/plant:   /' >&2
+    printf '%s: %s: STALE OBJECT: the edit was not rebuilt into the test program, so the defect never reached the tests (read %s):\n' \
+      "$PLANT_TAG" "$name" "$log" >&2
+    printf '%s\n' "$stale_objs" | sed "s/^/$PLANT_TAG:   /" >&2
     return 1
   fi
   if [ $ran -eq 0 ]; then
-    printf 'plant: %s: %s PASSED with the defect planted\n' "$name" "$expect" >&2
+    printf '%s: %s: %s PASSED with the defect planted\n' "$PLANT_TAG" "$name" "$expect" >&2
     return 1
   fi
   for t in $expect; do
     if ! grep -Eq "\[  FAILED  \] $t( |\$)" "$log"; then
-      printf 'plant: %s: the run failed, but %s was not among the failures - read %s\n' \
-        "$name" "$t" "$log" >&2
+      printf '%s: %s: the run failed, but %s was not among the failures - read %s\n' \
+        "$PLANT_TAG" "$name" "$t" "$log" >&2
       grep -E '\[  FAILED  \]' "$log" >&2
       return 1
     fi
-    printf 'plant: %s: caught by %s\n' "$name" "$t"
-    grep -E "\[  FAILED  \] $t( |\$)" "$log" | head -1 | sed 's/^/plant:   /'
   done
+  if [ -n "${PLANT_NEED_TEXT:-}" ] && ! grep -q -- "$PLANT_NEED_TEXT" "$log"; then
+    printf '%s: %s: red, but the log does not show "%s" - read %s\n' \
+      "$PLANT_TAG" "$name" "$PLANT_NEED_TEXT" "$log" >&2
+    grep -E '\[  FAILED  \]' "$log" >&2
+    return 1
+  fi
+  plant_hook_caught "$name" "$expect" "$log"
   return 0
+}
+
+# plant_job_in_copy <job args>: plant_job, then the copy is removed.
+plant_job_in_copy() {
+  plant_job "$@"
+  rc=$?
+  rm -rf "$PLANT_SCRATCH/$3"
+  return $rc
 }
 
 # plant_start <kind> <stale> <name> <exe> <expect> ...: start the plant in
@@ -396,38 +529,19 @@ PY
 plant_start() {
   kind=$1 stale=$2 name=$3
   if [ "$PLANT_CONTROL_DONE" -eq 0 ]; then
-    printf 'plant: %s: no plant_control before the first plant\n' "$name" >&2
+    printf '%s: %s: no plant_control before the first plant\n' "$PLANT_TAG" "$name" >&2
     PLANT_FAIL=1
+    PLANT_NEED_TEXT=
     return
   fi
-  if [ "$PLANT_PAR" -gt 1 ]; then
-    read -r PLANT_TOKEN <&3
-  fi
-  plant_slot_new
-  slot=$PLANT_SLOT
+  plant_acquire
   dir="$PLANT_SCRATCH/$name"
   rm -rf "$dir"
   # Copied here, before the plant is started in the background and while no
   # control is running: the control tree is never copied as it changes.
-  cp -a "$PLANT_SCRATCH/control" "$dir"
-  if [ "$PLANT_PAR" -gt 1 ]; then
-    (
-      plant_job "$@" > "$slot.out" 2> "$slot.err"
-      echo $? > "$slot.rc"
-      rm -rf "$dir"
-      printf 'x\n' >&3
-      : > "$slot.done"
-    ) &
-    eval "PLANT_PID_$PLANT_SEQ=$!"
-  else
-    (
-      plant_job "$@" > "$slot.out" 2> "$slot.err"
-      echo $? > "$slot.rc"
-      rm -rf "$dir"
-      : > "$slot.done"
-    )
-  fi
-  plant_drain 0
+  plant_cp "$PLANT_SCRATCH/control" "$dir"
+  plant_launch plant_job_in_copy "$@"
+  PLANT_NEED_TEXT=
 }
 
 # plant <name> <file> <exe> <expect> <old> <new> [<old> <new> ...]
@@ -457,7 +571,7 @@ plant_stale() {
   shift 4
   if [ -n "${GHOTI_CHECK_COLD:-}" ]; then
     # Nothing is copied, so nothing can be left standing.
-    plant_say "plant: $name: SKIPPED: GHOTI_CHECK_COLD copies no build output, so no object can be stale"
+    plant_say "$PLANT_TAG: $name: SKIPPED: GHOTI_CHECK_COLD copies no build output, so no object can be stale"
     return
   fi
   plant_start p 1 "$name" "$exe" "$expect" "$file" "$@"
@@ -468,5 +582,5 @@ plant_finish() {
   if [ "$PLANT_FAIL" -ne 0 ]; then
     exit 1
   fi
-  printf 'plant: every planted defect turned its named test red\n'
+  plant_hook_done
 }
