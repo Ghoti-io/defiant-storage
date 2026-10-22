@@ -4220,6 +4220,7 @@ TEST(ModelOom, EveryAllocationFailureIsReportedAndCleanedUp) {
   EXPECT_EQ(0, count.live);
   long budget = count.calls;
   ASSERT_GT(budget, 100);
+  std::printf("entity allocation failures: %ld points\n", budget);
   for (long i = 1; i <= budget; i++) {
     count = OomCount();
     count.base = gcu_allocator_default();
@@ -4371,6 +4372,7 @@ TEST(ModelOom, EveryBlindIndexCallReportsAnAllocationFailure) {
   EXPECT_EQ(0, count.live);
   long budget = count.calls;
   ASSERT_GT(budget, 50);
+  std::printf("blind-index allocation failures: %ld points\n", budget);
   for (long i = 1; i <= budget; i++) {
     count = OomCount();
     count.base = gcu_allocator_default();

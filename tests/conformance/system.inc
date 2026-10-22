@@ -1146,6 +1146,8 @@ TEST(ModelOom, EveryRecordCounterAndOutboxCallReportsAnAllocationFailure) {
   EXPECT_EQ(0, count.live);
   long budget = count.calls;
   ASSERT_GT(budget, 20);
+  std::printf("record, counter and outbox allocation failures: %ld points\n",
+      budget);
   for (long i = 1; i <= budget; i++) {
     count = OomCount();
     count.base = gcu_allocator_default();
