@@ -857,8 +857,15 @@ check-aliasing: ## Fail if the strict-aliasing warning is not actually armed
 		printf '\033[0;31mcheck-aliasing: CFLAGS resolves to -Wstrict-aliasing=%s, and only level 1 reports the planted store - 0, 2 and 3 are all silent on it. The level is wrong; the flags are not missing. Note that 3 is also what -Wall implies, so it means either an explicit override later on the command line or ALIASING flags that stopped being passed, and this cannot tell which.\033[0m\n' "$$level" >&2; \
 	fi; \
 	exit 1
+# The paths this Makefile bakes into objects, handed to the copy a plant builds
+# in, so the copy compiles with the same flags as this tree and keeps its
+# objects (tools/plant-lib.sh). Left to default they would name the copy's own
+# directory, the flags stamp would differ, and every plant would recompile the
+# library.
+PLANT_PATHS = TEST_DATA=$(TEST_DATA)
+
 check-model: ## Fail unless each defect planted in the entity port turns a named test red
-	@tools/check-model.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC) TEXT_PC=$(TEXT_PC) ARCHIVE_PC=$(ARCHIVE_PC)
+	@tools/check-model.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC) TEXT_PC=$(TEXT_PC) ARCHIVE_PC=$(ARCHIVE_PC) $(PLANT_PATHS)
 
 check-symbols: ## Fail if any exported symbol lacks the version namespace
 check-symbols: $(APP_DIR)/$(TARGET)
@@ -930,6 +937,11 @@ ifeq ($(OS_NAME), Linux)
 else
 	@printf "check-symbols: skipped (Linux only)\n"
 endif
+
+# A gate copies the finished build into its scratch tree (tools/plant-lib.sh),
+# so under make -j no gate may start before the library and every test
+# executable are linked.
+$(TEST_GATES): | $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
 
 test: ## Make and run the unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES)
@@ -1333,8 +1345,10 @@ endif
 	@mkdir -p $(PKGCONFIG_INSTALL_PATH)
 	@mkdir -p $(CONFORMANCE_DIR)
 	@# A suite this tree no longer has (suite.inc, query.inc) is not left behind.
-	@rm -f $(CONFORMANCE_DIR)/*.inc
+	@rm -f $(CONFORMANCE_DIR)/*.inc $(CONFORMANCE_DIR)/plant-lib.sh
 	@cp tests/conformance/*.inc $(CONFORMANCE_DIR)/
+	@# The backends' gates plant defects with the same helpers (tools/plant-lib.sh).
+	@cp tools/plant-lib.sh $(CONFORMANCE_DIR)/
 	@cat pkgconfig/$(SUITE)-$(PROJECT).pc | sed 's/(SUITE)/$(SUITE)/g; s/(PROJECT)/$(PROJECT)/g; s/(BRANCH)/$(BRANCH)/g; s/(VERSION)/$(VERSION)/g; s|(PC_LIB_DIR)|$(PC_LIB_DIR)|g; s|(PC_INCLUDE_DIR)|$(PC_INCLUDE_DIR)|g; s|(REQUIRES)|$(PC_REQUIRES)|g; s|(CONFORMANCE_DIR)|$(CONFORMANCE_DIR)|g' > $(PKGCONFIG_INSTALL_PATH)/$(SUITE)-$(PROJECT)$(BRANCH).pc
 ifeq ($(OS_NAME), Linux)
 	@if [ -n "$(LDCONF_INSTALL_PATH)" ]; then ldconfig >> /dev/null 2>&1; fi

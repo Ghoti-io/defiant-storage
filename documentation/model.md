@@ -599,7 +599,14 @@ trips build, through the public calls only) and `keystore.inc`. `make check-mode
 in each rule the port decides and requires the named test to fail; a
 backend's own repository plants the defects a backend can make (a `valid_to`
 written twice, a revert that reopens old rows, a current table that drifts
-from the truth).
+from the truth). The helpers that plant them (`tools/plant-lib.sh`) are
+installed beside the suites, so that a backend's gate and this one are the same
+code. A plant's scratch copy starts from the finished build and recompiles what
+its edit reaches, several plants run at once (`GHOTI_CHECK_JOBS`, at most four
+by default) and print in the order they were written, and each must show that
+its edit was compiled in: an object left standing from before the edit is
+refused as a stale object, and a plant of its own (`stale-object`) shows that
+refusal working.
 
 ## The key store port
 

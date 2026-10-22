@@ -385,4 +385,16 @@ plant empty-stamp-imported src/model_snapshot.c testModel \
   '         gdefstor_schema_ok(*out, *out_len);' \
   '         (*out_len == 0 || gdefstor_schema_ok(*out, *out_len));'
 
+# The stale-object plant. A plant's copy starts from the finished build, so the
+# edit has to be compiled into it; this one is made not to be (the object that
+# depends on the edit is left looking up to date), and the gate has to refuse it
+# as a STALE OBJECT. If it ever passes instead, a warm copy could pass with the
+# defect never built in.
+plant_stale stale-object src/model.c testModel \
+  'ModelBackendStamp.AnEmptyRevisionStampIsCorrupt' \
+  '  if (!langs_text_ok(r->languages, r->languages_len) ||
+      !gdefstor_schema_ok(r->schema, r->schema_len)) {' \
+  '  if (!langs_text_ok(r->languages, r->languages_len) ||
+      (r->schema_len != 0 && !gdefstor_schema_ok(r->schema, r->schema_len))) {'
+
 plant_finish

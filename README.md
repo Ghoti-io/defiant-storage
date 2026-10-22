@@ -35,4 +35,5 @@ make test-valgrind test-asan fuzz FUZZ_TIME=30 PREFIX=/path/to/prefix
 
 Backends run the conformance suites installed beside the port: `model.inc`
 (the entity port, with `system.inc`, `language.inc` and `snapshot.inc`) and
-`keystore.inc`.
+`keystore.inc`, and plant defects with the helpers installed with them
+(`plant-lib.sh`).
