@@ -1133,33 +1133,5 @@ inline GDEFSTOR_Result SystemOomScenario(const GDEFSTOR_Allocator * alloc) {
 }
 
 TEST(ModelOom, EveryRecordCounterAndOutboxCallReportsAnAllocationFailure) {
-  OomCount count;
-  GCU_Allocator alloc;
-  count.base = gcu_allocator_default();
-  alloc.ctx = &count;
-  alloc.malloc_fn = oom_malloc;
-  alloc.calloc_fn = oom_calloc;
-  alloc.realloc_fn = oom_realloc;
-  alloc.free_fn = oom_free;
-  ASSERT_EQ(GDEFSTOR_OK,
-      SystemOomScenario(reinterpret_cast<const GDEFSTOR_Allocator *>(&alloc)));
-  EXPECT_EQ(0, count.live);
-  long budget = count.calls;
-  ASSERT_GT(budget, 20);
-  std::printf("record, counter and outbox allocation failures: %ld points\n",
-      budget);
-  for (long i = 1; i <= budget; i++) {
-    count = OomCount();
-    count.base = gcu_allocator_default();
-    count.fail_at = i;
-    GDEFSTOR_Result rc =
-        SystemOomScenario(reinterpret_cast<const GDEFSTOR_Allocator *>(&alloc));
-    EXPECT_TRUE(rc == GDEFSTOR_ERR_OOM || rc == GDEFSTOR_OK)
-        << "allocation " << i << ": " << gdefstor_result_string(rc);
-    EXPECT_EQ(0, count.live) << "allocation " << i;
-    EXPECT_EQ(0, count.underflow) << "allocation " << i;
-    if (HasFailure()) {
-      break;
-    }
-  }
+  OomSweepPoints("record, counter and outbox", 20, SystemOomScenario);
 }

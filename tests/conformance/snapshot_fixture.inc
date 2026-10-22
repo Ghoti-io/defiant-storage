@@ -39,6 +39,7 @@
 #ifndef GDEFSTOR_SNAPSHOT_FIXTURE_INC
 #define GDEFSTOR_SNAPSHOT_FIXTURE_INC
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -329,11 +330,16 @@ inline GDEFSTOR_Result SaveTrees(GDEFSTOR_Store * s, const char * tenant,
 
 /* The MAC the personal values carry when Populate() is asked for them. */
 inline const uint8_t * MacBytes() {
-  static uint8_t m[GDEFSTOR_BLIND_MAC_BYTES];
-  for (size_t i = 0; i < sizeof m; i++) {
-    m[i] = static_cast<uint8_t>(0xA0 + i);
-  }
-  return m;
+  /* Filled once, by the initializer, so that threads asking at once (the
+   * allocation-failure sweeps) read it and write nothing. */
+  static const std::array<uint8_t, GDEFSTOR_BLIND_MAC_BYTES> m = [] {
+    std::array<uint8_t, GDEFSTOR_BLIND_MAC_BYTES> bytes;
+    for (size_t i = 0; i < bytes.size(); i++) {
+      bytes[i] = static_cast<uint8_t>(0xA0 + i);
+    }
+    return bytes;
+  }();
+  return m.data();
 }
 
 inline GDEFSTOR_Result Populate(GDEFSTOR_Store * s, const char * tenant,

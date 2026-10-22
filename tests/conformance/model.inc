@@ -36,9 +36,11 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -48,6 +50,7 @@
 #include <unistd.h>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 /* For the snapshot cases (snapshot.inc). */
@@ -4044,6 +4047,101 @@ static void oom_free(void * ctx, void * p) {
 }
 }
 
+/* One failure run's allocator: its own counter, so runs on different threads
+ * never share one. port() is what a store is opened with. */
+struct OomRun {
+  OomCount count;
+  GCU_Allocator alloc;
+  explicit OomRun(long fail_at = 0) {
+    count.base = gcu_allocator_default();
+    count.fail_at = fail_at;
+    alloc.ctx = &count;
+    alloc.malloc_fn = oom_malloc;
+    alloc.calloc_fn = oom_calloc;
+    alloc.realloc_fn = oom_realloc;
+    alloc.free_fn = oom_free;
+  }
+  OomRun(const OomRun &) = delete;
+  OomRun & operator=(const OomRun &) = delete;
+  const GDEFSTOR_Allocator * port() {
+    return reinterpret_cast<const GDEFSTOR_Allocator *>(&alloc);
+  }
+};
+
+/* How many threads a failure sweep runs on: GDEFSTOR_TEST_THREADS, or the
+ * processors there are (at most sixteen), and at least one. Every iteration of
+ * a sweep owns its allocator and its store, so the iterations are independent
+ * and the sweep covers the same allocation points whatever the number is;
+ * ModelOpen and ModelClose are called from several threads at once. */
+inline unsigned OomThreads() {
+  const char * env = std::getenv("GDEFSTOR_TEST_THREADS");
+  long n = env != nullptr ? std::strtol(env, nullptr, 10) : 0;
+  if (n < 1) {
+    unsigned hw = std::thread::hardware_concurrency();
+    n = hw < 1 ? 1 : (hw > 16 ? 16 : hw);
+  }
+  return static_cast<unsigned>(n);
+}
+
+/* Run @p work(worker_index) on @p count threads (on this one if count is 1)
+ * and wait for all of them. */
+template <class Work>
+inline void OomWorkers(unsigned count, Work work) {
+  if (count <= 1) {
+    work(0u);
+    return;
+  }
+  std::vector<std::thread> pool;
+  for (unsigned w = 0; w < count; w++) {
+    pool.emplace_back([&work, w]() { work(w); });
+  }
+  for (std::thread & t : pool) {
+    t.join();
+  }
+}
+
+/* The sweep every scenario test shares. @p scenario(alloc) opens a store with
+ * the allocator, makes every kind of call once and closes it; the first error
+ * stops it. It runs once with nothing failing (which has to succeed and leak
+ * nothing), to count the allocations it makes, and then once for each of them
+ * with that one failing: the answer has to be ERR_OOM (or OK, where the call
+ * got past a failure it could do without), nothing leaks, nothing is freed
+ * twice. @p min_points is how few allocations would mean the scenario no
+ * longer exercises the library. Prints the number of points walked. */
+template <class Scenario>
+inline void OomSweepPoints(const char * what, long min_points, Scenario scenario) {
+  OomRun first;
+  ASSERT_EQ(GDEFSTOR_OK, scenario(first.port()));
+  EXPECT_EQ(0, first.count.live);
+  long budget = first.count.calls;
+  ASSERT_GT(budget, min_points);
+  std::printf("%s allocation failures: %ld points\n", what, budget);
+  std::atomic<long> next(1);
+  std::atomic<bool> stop(false);
+  unsigned threads = OomThreads();
+  if (static_cast<long>(threads) > budget) {
+    threads = static_cast<unsigned>(budget);
+  }
+  OomWorkers(threads, [&](unsigned) {
+    for (;;) {
+      long i = next.fetch_add(1);
+      if (i > budget || stop.load()) {
+        return;
+      }
+      OomRun run(i);
+      GDEFSTOR_Result rc = scenario(run.port());
+      bool answered = rc == GDEFSTOR_ERR_OOM || rc == GDEFSTOR_OK;
+      EXPECT_TRUE(answered)
+          << "allocation " << i << ": " << gdefstor_result_string(rc);
+      EXPECT_EQ(0, run.count.live) << "allocation " << i;
+      EXPECT_EQ(0, run.count.underflow) << "allocation " << i;
+      if (!answered || run.count.live != 0 || run.count.underflow != 0) {
+        stop.store(true);
+      }
+    }
+  });
+}
+
 /* Every kind of call once, over a store whose every allocation the test
  * controls. The first error stops it; every error must be ERR_OOM. */
 inline GDEFSTOR_Result OomScenario(const GDEFSTOR_Allocator * alloc) {
@@ -4207,34 +4305,7 @@ inline GDEFSTOR_Result OomScenario(const GDEFSTOR_Allocator * alloc) {
 /* Every allocation the entity port makes can fail: the call reports
  * ERR_OOM, nothing leaks, nothing is freed twice, and nothing crashes. */
 TEST(ModelOom, EveryAllocationFailureIsReportedAndCleanedUp) {
-  OomCount count;
-  GCU_Allocator alloc;
-  count.base = gcu_allocator_default();
-  alloc.ctx = &count;
-  alloc.malloc_fn = oom_malloc;
-  alloc.calloc_fn = oom_calloc;
-  alloc.realloc_fn = oom_realloc;
-  alloc.free_fn = oom_free;
-  ASSERT_EQ(GDEFSTOR_OK,
-      OomScenario(reinterpret_cast<const GDEFSTOR_Allocator *>(&alloc)));
-  EXPECT_EQ(0, count.live);
-  long budget = count.calls;
-  ASSERT_GT(budget, 100);
-  std::printf("entity allocation failures: %ld points\n", budget);
-  for (long i = 1; i <= budget; i++) {
-    count = OomCount();
-    count.base = gcu_allocator_default();
-    count.fail_at = i;
-    GDEFSTOR_Result rc =
-        OomScenario(reinterpret_cast<const GDEFSTOR_Allocator *>(&alloc));
-    EXPECT_TRUE(rc == GDEFSTOR_ERR_OOM || rc == GDEFSTOR_OK)
-        << "allocation " << i << ": " << gdefstor_result_string(rc);
-    EXPECT_EQ(0, count.live) << "allocation " << i;
-    EXPECT_EQ(0, count.underflow) << "allocation " << i;
-    if (HasFailure()) {
-      break;
-    }
-  }
+  OomSweepPoints("entity", 100, OomScenario);
 }
 
 /* Every blind-index call once, over a store whose every allocation the test
@@ -4359,34 +4430,7 @@ inline GDEFSTOR_Result BlindOomScenario(const GDEFSTOR_Allocator * alloc) {
 }
 
 TEST(ModelOom, EveryBlindIndexCallReportsAnAllocationFailure) {
-  OomCount count;
-  GCU_Allocator alloc;
-  count.base = gcu_allocator_default();
-  alloc.ctx = &count;
-  alloc.malloc_fn = oom_malloc;
-  alloc.calloc_fn = oom_calloc;
-  alloc.realloc_fn = oom_realloc;
-  alloc.free_fn = oom_free;
-  ASSERT_EQ(GDEFSTOR_OK,
-      BlindOomScenario(reinterpret_cast<const GDEFSTOR_Allocator *>(&alloc)));
-  EXPECT_EQ(0, count.live);
-  long budget = count.calls;
-  ASSERT_GT(budget, 50);
-  std::printf("blind-index allocation failures: %ld points\n", budget);
-  for (long i = 1; i <= budget; i++) {
-    count = OomCount();
-    count.base = gcu_allocator_default();
-    count.fail_at = i;
-    GDEFSTOR_Result rc =
-        BlindOomScenario(reinterpret_cast<const GDEFSTOR_Allocator *>(&alloc));
-    EXPECT_TRUE(rc == GDEFSTOR_ERR_OOM || rc == GDEFSTOR_OK)
-        << "allocation " << i << ": " << gdefstor_result_string(rc);
-    EXPECT_EQ(0, count.live) << "allocation " << i;
-    EXPECT_EQ(0, count.underflow) << "allocation " << i;
-    if (HasFailure()) {
-      break;
-    }
-  }
+  OomSweepPoints("blind-index", 50, BlindOomScenario);
 }
 
 /* ---- the sweep: seeded random histories against an independent model ---- */
