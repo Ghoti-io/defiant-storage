@@ -310,4 +310,79 @@ plant second-writer-admitted src/store.c testModel \
       break;
     }'
 
+# A backend that gives up a revision, a draft or a record with an empty
+# schema stamp is corrupt. Every row is written with a stamp, so none can lack
+# one; a port that let the empty one through would hand a reader a row whose
+# shape it cannot know. One plant for each place a backend's row is taken: the
+# read, and the export that copies it into a snapshot.
+plant empty-revision-stamp-accepted src/model.c testModel \
+  'ModelBackendStamp.AnEmptyRevisionStampIsCorrupt' \
+  '  if (!langs_text_ok(r->languages, r->languages_len) ||
+      !gdefstor_schema_ok(r->schema, r->schema_len)) {' \
+  '  if (!langs_text_ok(r->languages, r->languages_len) ||
+      (r->schema_len != 0 && !gdefstor_schema_ok(r->schema, r->schema_len))) {'
+
+plant empty-draft-stamp-accepted src/model.c testModel \
+  'ModelBackendStamp.AnEmptyDraftStampIsCorrupt' \
+  '  if (!gdefstor_schema_ok(d->schema, d->schema_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  c->type = ' \
+  '  if (d->schema_len != 0 && !gdefstor_schema_ok(d->schema, d->schema_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  c->type = '
+
+plant empty-record-stamp-accepted src/system.c testModel \
+  'ModelBackendStamp.AnEmptyRecordStampIsCorrupt' \
+  '      !gdefstor_schema_ok(r->schema, r->schema_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  memcpy(c->schema' \
+  '      (r->schema_len != 0 && !gdefstor_schema_ok(r->schema, r->schema_len))) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  memcpy(c->schema'
+
+plant empty-record-stamp-listed src/system.c testModel \
+  'ModelBackendStamp.AnEmptyRecordStampIsCorrupt' \
+  '                       r->key_len) >= 0) ||
+      !gdefstor_schema_ok(r->schema, r->schema_len)) {' \
+  '                       r->key_len) >= 0) ||
+      (r->schema_len != 0 && !gdefstor_schema_ok(r->schema, r->schema_len))) {'
+
+plant empty-revision-stamp-exported src/model_snapshot.c testModel \
+  'ModelBackendStamp.AnEmptyRevisionStampIsCorrupt' \
+  '  if (!gdefstor_schema_ok(r->schema, r->schema_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  rc = GROW(m, revs);' \
+  '  rc = GROW(m, revs);'
+
+plant empty-draft-stamp-exported src/model_snapshot.c testModel \
+  'ModelBackendStamp.AnEmptyDraftStampIsCorrupt' \
+  '  if (!gdefstor_schema_ok(d->schema, d->schema_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  rc = GROW(m, drafts);' \
+  '  rc = GROW(m, drafts);'
+
+plant empty-record-stamp-exported src/model_snapshot.c testModel \
+  'ModelBackendStamp.AnEmptyRecordStampIsCorrupt' \
+  '  if (r == NULL || (r->bytes == NULL && r->len != 0) ||
+      !gdefstor_schema_ok(r->schema, r->schema_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  rc = GROW(m, recs);' \
+  '  if (r == NULL || (r->bytes == NULL && r->len != 0)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  rc = GROW(m, recs);'
+
+# A snapshot row with an empty stamp read as though it were a stamp.
+plant empty-stamp-imported src/model_snapshot.c testModel \
+  'ModelSnapshot.AStampIsRequiredAndOnlyAStampIsTaken' \
+  '         gdefstor_schema_ok(*out, *out_len);' \
+  '         (*out_len == 0 || gdefstor_schema_ok(*out, *out_len));'
+
 plant_finish

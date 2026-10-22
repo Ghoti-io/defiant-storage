@@ -206,12 +206,10 @@ static GDEFSTOR_Result catch_record(void * ctx, const GDEFSTOR_ModelRecord * r) 
   if (c->found || r == NULL || !same_span(r->ns, r->ns_len, c->ns, c->ns_len) ||
       !same_span(r->key, r->key_len, c->key, c->key_len) ||
       (r->bytes == NULL && r->len != 0) ||
-      (r->schema_len != 0 && !gdefstor_schema_ok(r->schema, r->schema_len))) {
+      !gdefstor_schema_ok(r->schema, r->schema_len)) {
     return GDEFSTOR_ERR_CORRUPT;
   }
-  if (r->schema_len > 0) {
-    memcpy(c->schema, r->schema, r->schema_len);
-  }
+  memcpy(c->schema, r->schema, r->schema_len);
   c->schema[r->schema_len] = '\0';
   c->schema_len = r->schema_len;
   /* One byte more, so that an empty value is a block too. */
@@ -325,7 +323,7 @@ static GDEFSTOR_Result take_record(void * ctx, const GDEFSTOR_ModelRecord * r) {
       (l->prefix_len > 0 && memcmp(r->key, l->prefix, l->prefix_len) != 0) ||
       (l->n > 0 && key_cmp(l->v[l->n - 1].key, l->v[l->n - 1].key_len, r->key,
                        r->key_len) >= 0) ||
-      (r->schema_len != 0 && !gdefstor_schema_ok(r->schema, r->schema_len))) {
+      !gdefstor_schema_ok(r->schema, r->schema_len)) {
     return GDEFSTOR_ERR_CORRUPT;
   }
   if (l->n == l->cap) {

@@ -1094,7 +1094,7 @@ TEST_F(ModelSnapshot, EveryRowKeepsItsSchemaStampThroughAnExportAndAnImport) {
 
 /* A stamp is `<component>/<version>`: a write without one, or with anything
  * else, is refused and writes nothing; and a snapshot member whose row says
- * no stamp is not what the format holds. */
+ * no stamp, or an empty one, is not what the format holds. */
 TEST_F(ModelSnapshot, AStampIsRequiredAndOnlyAStampIsTaken) {
   const char * component = nullptr;
   size_t component_len = 0;
@@ -1164,6 +1164,20 @@ TEST_F(ModelSnapshot, AStampIsRequiredAndOnlyAStampIsTaken) {
     std::string why;
     EXPECT_EQ(GDEFSTOR_ERR_CORRUPT,
         snapshot_fixture::Import(copy, kTenant, ZipOf(cut), &why)) << stamp;
+    EXPECT_EQ("", snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH));
+    /* And one that says an empty stamp is refused as well: a snapshot is the
+     * rows of a store that has no such row to give. */
+    auto blank = members;
+    for (auto & m : blank) {
+      size_t at = m.second.find(stamp);
+      if (m.first.find(c.first) != std::string::npos &&
+          at != std::string::npos) {
+        m.second.replace(at, std::strlen(stamp), ",\"schema\":\"\"");
+        break;
+      }
+    }
+    EXPECT_EQ(GDEFSTOR_ERR_CORRUPT,
+        snapshot_fixture::Import(copy, kTenant, ZipOf(blank), &why)) << stamp;
     EXPECT_EQ("", snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH));
   }
 }

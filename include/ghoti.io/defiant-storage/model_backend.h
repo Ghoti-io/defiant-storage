@@ -128,8 +128,8 @@ typedef struct GDEFSTOR_ModelRevision {
    * stored as given. */
   const char * languages;
   size_t languages_len;   ///< Its length.
-  /** Its schema stamp (model.h), from the port, stored as given. A backend
-   * that holds a row from before it kept stamps visits it empty. */
+  /** Its schema stamp (model.h), from the port, stored as given and visited
+   * as stored. An empty or malformed one is corrupt: the port refuses it. */
   const char * schema;
   size_t schema_len;      ///< Its length.
 } GDEFSTOR_ModelRevision;

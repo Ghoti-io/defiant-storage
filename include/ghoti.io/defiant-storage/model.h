@@ -682,9 +682,8 @@ typedef struct GDEFSTOR_RevisionInfo {
    * by bytes and joined by `,`: `de,fr`. */
   const char * languages;
   size_t languages_len;  ///< Its length.
-  /** Its schema stamp, as written (GDEFSTOR_RevisionMeta::schema). Empty only
-   * for a revision a SQL store held before it took the step that added the
-   * stamp column (a store made before stamps existed). */
+  /** Its schema stamp, as written (GDEFSTOR_RevisionMeta::schema). Never
+   * empty: a backend that gives up a revision without one is corrupt. */
   const char * schema;
   size_t schema_len;     ///< Its length.
 } GDEFSTOR_RevisionInfo;
@@ -828,7 +827,7 @@ typedef struct GDEFSTOR_DraftInfo {
   size_t type_len;        ///< Its length.
   uint64_t base_revision; ///< The revision it was made from; 0 for a new entity.
   size_t language_count;  ///< Its languages: gdefstor_draft_tree() reads each.
-  const char * schema;    ///< Its schema stamp, as put (empty: see GDEFSTOR_RevisionInfo::schema).
+  const char * schema;    ///< Its schema stamp, as put (never empty).
   size_t schema_len;      ///< Its length.
 } GDEFSTOR_DraftInfo;
 
@@ -1153,8 +1152,8 @@ GDEFSTOR_API GDEFSTOR_Result gdefstor_record_delete(GDEFSTOR_Write * write,
  *   an empty value), else NULL.
  * @param out_len Receives its length.
  * @param out_schema NULL, or ::GDEFSTOR_SCHEMA_MAX_BYTES + 1 bytes that
- *   receive the record's schema stamp, NUL-terminated (empty when not found,
- *   and as GDEFSTOR_RevisionInfo::schema says).
+ *   receive the record's schema stamp, NUL-terminated (empty only when not
+ *   found).
  * @param out_schema_len Receives its length. May be NULL.
  * @return ::GDEFSTOR_OK, ::GDEFSTOR_ERR_INVALID, ::GDEFSTOR_ERR_UNSUPPORTED,
  *   ::GDEFSTOR_ERR_OOM, or a backend's error.

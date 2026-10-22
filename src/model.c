@@ -2853,7 +2853,7 @@ static GDEFSTOR_Result catch_revision(void * ctx, uint64_t row,
     h->caprev = grown;
   }
   if (!langs_text_ok(r->languages, r->languages_len) ||
-      (r->schema_len != 0 && !gdefstor_schema_ok(r->schema, r->schema_len))) {
+      !gdefstor_schema_ok(r->schema, r->schema_len)) {
     return GDEFSTOR_ERR_CORRUPT;
   }
   o = &h->revs[h->nrev];
@@ -3282,7 +3282,7 @@ static GDEFSTOR_Result catch_draft(void * ctx, const GDEFSTOR_ModelDraft * d) {
   if (c->seen) {
     return GDEFSTOR_ERR_INTERNAL;
   }
-  if (d->schema_len != 0 && !gdefstor_schema_ok(d->schema, d->schema_len)) {
+  if (!gdefstor_schema_ok(d->schema, d->schema_len)) {
     return GDEFSTOR_ERR_CORRUPT;
   }
   c->type = gdefstor_dup(c->alloc, d->type, d->type_len);
@@ -3798,15 +3798,11 @@ GDEFSTOR_Result gdefstor_draft_apply(GDEFSTOR_Write * write,
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
-  /* The revision is data of the shape the draft was written in. A draft a
-   * store kept from before stamps has none to give, and is not applied. */
+  /* The revision is data of the shape the draft was written in. The draft's
+   * stamp was checked as the backend gave it up (catch_draft). */
   stamped = *meta;
   stamped.schema = c.schema;
   stamped.schema_len = c.schema_len;
-  if (!gdefstor_schema_ok(c.schema, c.schema_len)) {
-    draft_catch_release(&c);
-    return GDEFSTOR_ERR_CORRUPT;
-  }
   rc = find_entity(store, txn, write->tenant, write->tenant_len, public_id,
       public_id_len, &e);
   exists = rc == GDEFSTOR_OK;
@@ -4179,11 +4175,7 @@ static GDEFSTOR_Result dump_revision(void * ctx, uint64_t row,
   l_i64(l, r->when_ms);
   l_hex(l, r->why, r->why_len);
   l_hex(l, r->languages, r->languages_len);
-  /* The stamp is last, and only when there is one: a row a store kept from
-   * before stamps reads as it did. */
-  if (r->schema_len > 0) {
-    l_hex(l, r->schema, r->schema_len);
-  }
+  l_hex(l, r->schema, r->schema_len);
   l_end(l);
   return l->rc;
 }
@@ -4226,9 +4218,7 @@ static GDEFSTOR_Result dump_draft(void * ctx, const GDEFSTOR_ModelDraft * d) {
   l_hex(l, d->type, d->type_len);
   l_u64(l, d->base_revision);
   l_hex(l, d->json, d->json_len);
-  if (d->schema_len > 0) {
-    l_hex(l, d->schema, d->schema_len);
-  }
+  l_hex(l, d->schema, d->schema_len);
   l_end(l);
   return l->rc;
 }
@@ -4262,9 +4252,7 @@ static GDEFSTOR_Result dump_record(void * ctx, const GDEFSTOR_ModelRecord * r) {
   l_hex(l, r->ns, r->ns_len);
   l_hex(l, r->key, r->key_len);
   l_hex(l, r->bytes, r->len);
-  if (r->schema_len > 0) {
-    l_hex(l, r->schema, r->schema_len);
-  }
+  l_hex(l, r->schema, r->schema_len);
   l_end(l);
   return l->rc;
 }

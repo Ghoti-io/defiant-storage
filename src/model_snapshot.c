@@ -539,7 +539,11 @@ static GDEFSTOR_Result take_revision(void * ctx, uint64_t row,
     const GDEFSTOR_ModelRevision * r) {
   GDEFSTOR_SnapModel * m = (GDEFSTOR_SnapModel *)ctx;
   SRev * n;
-  GDEFSTOR_Result rc = GROW(m, revs);
+  GDEFSTOR_Result rc;
+  if (!gdefstor_schema_ok(r->schema, r->schema_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  rc = GROW(m, revs);
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
@@ -622,7 +626,11 @@ static GDEFSTOR_Result take_item(void * ctx, uint64_t row,
 static GDEFSTOR_Result take_draft(void * ctx, const GDEFSTOR_ModelDraft * d) {
   GDEFSTOR_SnapModel * m = (GDEFSTOR_SnapModel *)ctx;
   SDraft * n;
-  GDEFSTOR_Result rc = GROW(m, drafts);
+  GDEFSTOR_Result rc;
+  if (!gdefstor_schema_ok(d->schema, d->schema_len)) {
+    return GDEFSTOR_ERR_CORRUPT;
+  }
+  rc = GROW(m, drafts);
   if (rc != GDEFSTOR_OK) {
     return rc;
   }
@@ -653,7 +661,8 @@ static GDEFSTOR_Result take_record(void * ctx, const GDEFSTOR_ModelRecord * r) {
   GDEFSTOR_SnapModel * m = (GDEFSTOR_SnapModel *)ctx;
   SRec * n;
   GDEFSTOR_Result rc;
-  if (r == NULL || (r->bytes == NULL && r->len != 0)) {
+  if (r == NULL || (r->bytes == NULL && r->len != 0) ||
+      !gdefstor_schema_ok(r->schema, r->schema_len)) {
     return GDEFSTOR_ERR_CORRUPT;
   }
   rc = GROW(m, recs);
@@ -1781,12 +1790,12 @@ static GDEFSTOR_Result read_order(const GTEXT_JSON_Value * o, double * out) {
   return isfinite(*out) ? GDEFSTOR_OK : GDEFSTOR_ERR_CORRUPT;
 }
 
-/* A row's "schema": the stamp it was written with (model.h), or empty for a
- * row its store kept from before stamps; never missing. */
+/* A row's "schema": the stamp it was written with (model.h); never missing,
+ * never empty. */
 static int stamp_ok(const GTEXT_JSON_Value * row, const char ** out,
     size_t * out_len) {
   return get_str(row, "schema", out, out_len) &&
-         (*out_len == 0 || gdefstor_schema_ok(*out, *out_len));
+         gdefstor_schema_ok(*out, *out_len);
 }
 
 static GDEFSTOR_Result read_entity(GDEFSTOR_SnapModel * m,

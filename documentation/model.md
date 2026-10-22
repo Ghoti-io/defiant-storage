@@ -198,9 +198,9 @@ is what queries and `gdefstor_entity_get()` see.
   valid one is `GDEFSTOR_ERR_INVALID`. Storage keeps it exactly, through
   every export and import, and never reads it: history keeps each revision's
   stamp, so a reader knows the shape of what it reads. A draft applied is
-  data of the draft's stamp, not the apply's. A SQL store made before stamps
-  existed takes the step that adds them on its first use, and the rows it
-  held then read with an empty stamp.
+  data of the draft's stamp, not the apply's. A backend that visits a
+  revision, draft or record with an empty or malformed stamp is corrupt
+  (`GDEFSTOR_ERR_CORRUPT`), and so is a snapshot row that has none.
 
 **Order keys** are doubles, per parent and field. The items that stay under
 the same parent keep their keys when they lie on the longest run of keys

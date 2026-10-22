@@ -41,6 +41,13 @@
 
 namespace {
 
+/* The kinds of row this backend gives up with an empty schema stamp, as a
+ * backend would whose rows had lost theirs (model_backend.h: the port refuses
+ * such a row as corrupt). Set by the tests that look at that, and nowhere
+ * else. */
+enum { BLANK_REVISIONS = 1, BLANK_DRAFTS = 2, BLANK_RECORDS = 4 };
+int g_blank_stamps = 0;
+
 struct OVal {
   int type = 0;
   int64_t integer = 0;
@@ -531,7 +538,7 @@ static GDEFSTOR_Result s_history(void * ctx, void * txn, const char * t,
     m.languages = r.langs.data();
     m.languages_len = r.langs.size();
     m.schema = r.schema.data();
-    m.schema_len = r.schema.size();
+    m.schema_len = (g_blank_stamps & BLANK_REVISIONS) ? 0 : r.schema.size();
     GDEFSTOR_Result rc = v->revision(v->ctx, row, &m);
     if (rc != GDEFSTOR_OK) {
       return rc;
@@ -615,7 +622,7 @@ static GDEFSTOR_Result s_draft_get(void * ctx, void * txn, const char * t,
   m.json = reinterpret_cast<const uint8_t *>(it->second.json.data());
   m.json_len = it->second.json.size();
   m.schema = it->second.schema.data();
-  m.schema_len = it->second.schema.size();
+  m.schema_len = (g_blank_stamps & BLANK_DRAFTS) ? 0 : it->second.schema.size();
   return v->draft(v->ctx, &m);
 }
 
@@ -667,7 +674,7 @@ static GDEFSTOR_Result s_scan(void * ctx, const char * type, size_t type_len,
       m.languages = r.langs.data();
       m.languages_len = r.langs.size();
       m.schema = r.schema.data();
-      m.schema_len = r.schema.size();
+      m.schema_len = (g_blank_stamps & BLANK_REVISIONS) ? 0 : r.schema.size();
       rc = v->revision(v->ctx, e.row, &m);
     }
     if (rc != GDEFSTOR_OK) {
@@ -723,7 +730,7 @@ static GDEFSTOR_Result s_dump(void * ctx, const char * t, size_t tl, int which,
       m.json = reinterpret_cast<const uint8_t *>(kv.second.json.data());
       m.json_len = kv.second.json.size();
       m.schema = kv.second.schema.data();
-      m.schema_len = kv.second.schema.size();
+      m.schema_len = (g_blank_stamps & BLANK_DRAFTS) ? 0 : kv.second.schema.size();
       rc = v->draft(v->ctx, &m);
       if (rc != GDEFSTOR_OK) {
         return rc;
@@ -916,7 +923,7 @@ static GDEFSTOR_Result visit_record(const GDEFSTOR_ModelVisitor * v,
   r.bytes = b.empty() ? nullptr : reinterpret_cast<const uint8_t *>(b.data());
   r.len = b.size();
   r.schema = rec.schema.data();
-  r.schema_len = rec.schema.size();
+  r.schema_len = (g_blank_stamps & BLANK_RECORDS) ? 0 : rec.schema.size();
   return v->record(v->ctx, &r);
 }
 
@@ -1277,6 +1284,77 @@ void ModelClose(GDEFSTOR_Store * store) {
 }
 
 #include "model.inc"
+
+namespace model_conformance {
+
+/* A backend that gives up a revision, a draft or a record with an empty schema
+ * stamp is corrupt, wherever the row is read: every row is written with a
+ * stamp (model.h), so no store holds one without. */
+class ModelBackendStamp : public ModelSnapshot {
+ public:
+  void TearDown() override {
+    g_blank_stamps = 0;
+    ModelSnapshot::TearDown();
+  }
+};
+
+TEST_F(ModelBackendStamp, AnEmptyRevisionStampIsCorrupt) {
+  ASSERT_EQ(GDEFSTOR_OK, PopulateStamped(store));
+  EXPECT_EQ("blog/1 blog/2 blog/12", RevisionStamps(store, "p1"));
+  g_blank_stamps = BLANK_REVISIONS;
+  GDEFSTOR_History * h = nullptr;
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, gdefstor_entity_history(store, kTenant, 2,
+      "p1", 2, nullptr, 0, &h));
+  EXPECT_EQ(nullptr, h);
+  uint8_t * zip = nullptr;
+  size_t len = 0;
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, gdefstor_snapshot_export_at(store, kTenant,
+      2, nullptr, 1234, &zip, &len));
+  EXPECT_EQ(nullptr, zip);
+}
+
+TEST_F(ModelBackendStamp, AnEmptyDraftStampIsCorrupt) {
+  ASSERT_EQ(GDEFSTOR_OK, PopulateStamped(store));
+  EXPECT_EQ("blog/2", DraftStamp(store, "p1"));
+  g_blank_stamps = BLANK_DRAFTS;
+  GDEFSTOR_Draft * d = nullptr;
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, gdefstor_draft_get(store, kTenant, 2, "p1",
+      2, &d));
+  EXPECT_EQ(nullptr, d);
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, snapshot_fixture::InWrite(store, kTenant,
+      [](GDEFSTOR_Write * w) {
+    GDEFSTOR_RevisionMeta m = snapshot_fixture::Meta("u1", 2000);
+    return gdefstor_draft_apply(w, "p1", 2, &m, nullptr);
+  }));
+  uint8_t * zip = nullptr;
+  size_t len = 0;
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, gdefstor_snapshot_export_at(store, kTenant,
+      2, nullptr, 1234, &zip, &len));
+  EXPECT_EQ(nullptr, zip);
+}
+
+TEST_F(ModelBackendStamp, AnEmptyRecordStampIsCorrupt) {
+  ASSERT_EQ(GDEFSTOR_OK, PopulateStamped(store));
+  EXPECT_EQ("core/1", RecordStamp(store, "core.x", "k"));
+  g_blank_stamps = BLANK_RECORDS;
+  int found = 0;
+  uint8_t * bytes = nullptr;
+  size_t len = 0;
+  char stamp[GDEFSTOR_SCHEMA_MAX_BYTES + 1];
+  size_t stamp_len = 0;
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, gdefstor_record_get(store, kTenant, 2,
+      "core.x", 6, "k", 1, &found, &bytes, &len, stamp, &stamp_len));
+  GDEFSTOR_RecordList * l = nullptr;
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, gdefstor_record_list(store, kTenant, 2,
+      "core.x", 6, nullptr, 0, 0, 10, &l));
+  EXPECT_EQ(nullptr, l);
+  uint8_t * zip = nullptr;
+  EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, gdefstor_snapshot_export_at(store, kTenant,
+      2, nullptr, 1234, &zip, &len));
+  EXPECT_EQ(nullptr, zip);
+}
+
+} /* namespace model_conformance */
 
 /* A backend without records, counters and the outbox (their members NULL):
  * those calls are refused as unsupported and nothing else changes; and a

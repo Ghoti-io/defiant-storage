@@ -92,9 +92,9 @@ and item versions. It says its format first; a member without it is
 `revisions` are revisions 1 to the entity's newest, each with its commit
 sequence (`commit`: the same for every revision one write made), who, when,
 why, the languages it changed, and `schema`, the stamp it was written with
-(`<component>/<version>`, model.md "Schema stamps"), exactly; an empty
-`schema` is a revision its store kept from before stamps, and a row without
-`schema` is `GDEFSTOR_ERR_CORRUPT`. `items` is every item version of every
+(`<component>/<version>`, model.md "Schema stamps"), exactly; a row
+without `schema`, or with an empty or malformed one, is
+`GDEFSTOR_ERR_CORRUPT`. `items` is every item version of every
 language, by group, item and `from`: `group` is the group number of the
 declaration (0 the root group), `item` and `parent` the stable item ids,
 `order` the order key's IEEE-754 bits in 16 hex digits (exact, and no locale
