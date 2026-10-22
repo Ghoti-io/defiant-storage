@@ -139,17 +139,33 @@ plant_copy_tree() {
   plant_warm "$PLANT_ROOT" "$dest" "$PLANT_BUILD"
 }
 
-# The copy also takes the main tree's build output for this build directory,
-# with its timestamps, so make recompiles only what the plant edited (and,
-# through the .d files, whatever includes an edited header) and relinks.
+# The copy also takes the main tree's build output for this build directory
+# (but not its test programs), with its timestamps, so make recompiles only
+# what the plant edited (and, through the .d files, whatever includes an edited
+# header) and relinks.
 # Without it every plant was a cold rebuild of the whole library.
 # GHOTI_CHECK_COLD=1 copies no build output, for comparing the two.
 plant_warm() {
   [ -n "${GHOTI_CHECK_COLD:-}" ] && return 0
   case "$3" in /*|*..*|'') return 0 ;; esac
   [ -d "$1/$3" ] || return 0
-  mkdir -p "$2/$(dirname "$3")"
-  plant_cp "$1/$3" "$2/$3"
+  mkdir -p "$2/$3"
+  for e in "$1/$3"/* "$1/$3"/.[!.]*; do
+    [ -e "$e" ] || continue
+    case "${e##*/}" in
+      apps)
+        # Not the test programs: every plant relinks the one it runs (plant_job
+        # removes them all), so copying them is the largest part of a copy
+        # and none of it is used.
+        mkdir -p "$2/$3/apps"
+        for a in "$e"/* "$e"/.[!.]*; do
+          [ -e "$a" ] || continue
+          case "${a##*/}" in test*) ;; *) plant_cp "$a" "$2/$3/apps/" ;; esac
+        done
+        ;;
+      *) plant_cp "$e" "$2/$3/" ;;
+    esac
+  done
 }
 
 # ---- what a gate prints, in order ------------------------------------------
