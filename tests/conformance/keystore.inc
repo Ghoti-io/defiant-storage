@@ -32,6 +32,8 @@
  * ignore it.
  */
 
+#include "size_structs.inc"
+
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -169,6 +171,24 @@ class KeyStore : public ::testing::Test {
     return s;
   }
 };
+
+/* AD-34: a struct with a size member is accepted at exactly its own size. The
+ * one here is the cipher a key store seals with (size_structs.inc lists every
+ * struct). */
+TEST_F(KeyStore, TheStructHereIsAcceptedAtOnlyItsOwnSize) {
+  const std::map<std::string, size_structs::Probe> probes = {
+      {"GDEFSTOR_KeyCipher", [&](size_t size) {
+         GDEFSTOR_KeyCipher other = cipher;
+         other.size = size;
+         GDEFSTOR_KeyStore * opened = nullptr;
+         GDEFSTOR_Result rc = KeyStoreOpen(&other, &opened);
+         gdefstor_keystore_destroy(opened);
+         return rc == GDEFSTOR_OK;
+       }},
+  };
+  size_structs::Run(size_structs::Storage(), "tests/conformance/keystore.inc",
+      probes);
+}
 
 TEST_F(KeyStore, WrapOpensOnlyUnderItsSubject) {
   ASSERT_EQ(GDEFSTOR_OK, gdefstor_keystore_subject_create(ks, "t1", 2, "p1", 2));

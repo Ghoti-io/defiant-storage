@@ -1793,6 +1793,9 @@ TEST(KeyStorePort, ABackendWithoutTheOptionalMembersServesWhatItHas) {
 
 GDEFSTOR_Result KeyStoreOpen(const GDEFSTOR_KeyCipher * cipher,
     GDEFSTOR_KeyStore ** out) {
+  if (cipher == nullptr || cipher->size != sizeof *cipher) {
+    return GDEFSTOR_ERR_INVALID; /* as a backend that seals with it must */
+  }
   KScratch * k = new KScratch();
   k->alloc = gdefstor_allocator_default();
   k->cipher = *cipher;
@@ -1820,6 +1823,51 @@ GDEFSTOR_Result KeyStoreOpen(const GDEFSTOR_KeyCipher * cipher,
 }
 
 #include "keystore.inc"
+
+/* AD-34: a struct with a size member is accepted at exactly its own size. The
+ * two here are the backends a store and a key store are opened over
+ * (size_structs.inc lists every struct). */
+TEST(StructSizes, TheBackendsHereAreAcceptedAtOnlyTheirOwnSize) {
+  const std::map<std::string, size_structs::Probe> probes = {
+      {"GDEFSTOR_ModelBackend", [&](size_t size) {
+         GDEFSTOR_ModelBackend mb;
+         ScratchBackend(nullptr, &mb);
+         mb.size = size;
+         GDEFSTOR_Store * store = nullptr;
+         GDEFSTOR_Result rc = gdefstor_store_open(&mb, nullptr, nullptr, &store);
+         if (rc == GDEFSTOR_OK) {
+           gdefstor_store_destroy(store); /* destroys the backend, once */
+         } else {
+           mb.destroy(mb.ctx); /* a refused backend is still the caller's */
+         }
+         return rc == GDEFSTOR_OK;
+       }},
+      {"GDEFSTOR_KeyStoreBackend", [&](size_t size) {
+         KScratch * k = new KScratch();
+         k->alloc = gdefstor_allocator_default();
+         GDEFSTOR_KeyStoreBackend b;
+         std::memset(&b, 0, sizeof b);
+         b.size = size;
+         b.ctx = k;
+         b.destroy = ks_destroy;
+         b.create = ks_create;
+         b.wrap = ks_wrap;
+         b.unwrap = ks_unwrap;
+         b.erase = ks_erase;
+         b.ledger = ks_ledger;
+         GDEFSTOR_KeyStore * ks = nullptr;
+         GDEFSTOR_Result rc = gdefstor_keystore_create(&b, nullptr, &ks);
+         if (rc == GDEFSTOR_OK) {
+           gdefstor_keystore_destroy(ks); /* destroys the backend, once */
+         } else {
+           ks_destroy(k);
+         }
+         return rc == GDEFSTOR_OK;
+       }},
+  };
+  size_structs::Run(size_structs::Storage(), "tests/conformance/test_model.cpp",
+      probes);
+}
 
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);

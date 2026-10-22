@@ -444,7 +444,7 @@ TEST_COMPILE_FLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cf
 # coverage target does, because --coverage links the gcov runtime, whose
 # mangle_path check-symbols is right to reject in a shipping library and
 # wrong to reject in an instrumented one. Spelled as text's TEST_GATES is.
-TEST_GATES ?= check-symbols check-aliasing check-seams check-model
+TEST_GATES ?= check-symbols check-aliasing check-seams check-model check-sizes
 
 # Valgrind flags (exclude "still reachable" as it's not a leak)
 # --suppressions: see tests/valgrind.supp. It holds allocations that are
@@ -663,7 +663,7 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 ####################################################################
 
 # General commands
-.PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-aliasing check-seams check-model
+.PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-aliasing check-seams check-model check-sizes
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -863,6 +863,9 @@ check-aliasing: ## Fail if the strict-aliasing warning is not actually armed
 # directory, the flags stamp would differ, and every plant would recompile the
 # library.
 PLANT_PATHS = TEST_DATA=$(TEST_DATA)
+
+check-sizes: ## Every size-member struct is listed and probed, no size prefix is read in src; real-source plants
+	@tools/check-size-structs.sh . tests/conformance/size_structs.inc
 
 check-model: ## Fail unless each defect planted in the entity port turns a named test red
 	@tools/check-model.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC) TEXT_PC=$(TEXT_PC) ARCHIVE_PC=$(ARCHIVE_PC) $(PLANT_PATHS)
@@ -1345,10 +1348,12 @@ endif
 	@mkdir -p $(PKGCONFIG_INSTALL_PATH)
 	@mkdir -p $(CONFORMANCE_DIR)
 	@# A suite this tree no longer has (suite.inc, query.inc) is not left behind.
-	@rm -f $(CONFORMANCE_DIR)/*.inc $(CONFORMANCE_DIR)/plant-lib.sh
+	@rm -f $(CONFORMANCE_DIR)/*.inc $(CONFORMANCE_DIR)/plant-lib.sh $(CONFORMANCE_DIR)/check-size-structs.sh
 	@cp tests/conformance/*.inc $(CONFORMANCE_DIR)/
 	@# The backends' gates plant defects with the same helpers (tools/plant-lib.sh).
 	@cp tools/plant-lib.sh $(CONFORMANCE_DIR)/
+	@# So do their size gates (tools/check-size-structs.sh).
+	@cp tools/check-size-structs.sh $(CONFORMANCE_DIR)/
 	@cat pkgconfig/$(SUITE)-$(PROJECT).pc | sed 's/(SUITE)/$(SUITE)/g; s/(PROJECT)/$(PROJECT)/g; s/(BRANCH)/$(BRANCH)/g; s/(VERSION)/$(VERSION)/g; s|(PC_LIB_DIR)|$(PC_LIB_DIR)|g; s|(PC_INCLUDE_DIR)|$(PC_INCLUDE_DIR)|g; s|(REQUIRES)|$(PC_REQUIRES)|g; s|(CONFORMANCE_DIR)|$(CONFORMANCE_DIR)|g' > $(PKGCONFIG_INSTALL_PATH)/$(SUITE)-$(PROJECT)$(BRANCH).pc
 ifeq ($(OS_NAME), Linux)
 	@if [ -n "$(LDCONF_INSTALL_PATH)" ]; then ldconfig >> /dev/null 2>&1; fi

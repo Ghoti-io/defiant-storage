@@ -61,6 +61,7 @@
 #include <ghoti.io/cutil/fiber.h>
 
 #include "snapshot_fixture.inc"
+#include "size_structs.inc"
 
 namespace model_conformance {
 
@@ -5380,5 +5381,6 @@ TEST_F(ModelSweep, RandomHistoriesMatchAnIndependentModel) {
 #include "system.inc"
 #include "language.inc"
 #include "snapshot.inc"
+#include "sizes.inc"
 
 } /* namespace model_conformance */

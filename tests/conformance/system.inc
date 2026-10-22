@@ -467,6 +467,28 @@ TEST_F(ModelCounters, CountersAreApartByNameAndTenant) {
 
 class ModelOutbox : public ModelSystem {};
 
+/* AD-34: a struct with a size member is accepted at exactly its own size. The
+ * one here is what a claim of the outbox lists, filled by the port
+ * (size_structs.inc lists every struct). */
+TEST_F(ModelOutbox, TheStructHereIsAcceptedAtOnlyItsOwnSize) {
+  ASSERT_EQ(GDEFSTOR_OK, AppendOne("core.sized", "m1"));
+  GDEFSTOR_OutboxClaim * claim = nullptr;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_model_outbox_claim(store, kTenant, 2,
+      "core.sized", 10, 10, 0, 5, &claim));
+  ASSERT_EQ(1u, gdefstor_model_outbox_claim_count(claim));
+  const std::map<std::string, size_structs::Probe> probes = {
+      {"GDEFSTOR_OutboxEntry", [&](size_t size) {
+         GDEFSTOR_OutboxEntry e;
+         std::memset(&e, 0, sizeof e);
+         e.size = size;
+         return gdefstor_model_outbox_claim_entry(claim, 0, &e) == GDEFSTOR_OK;
+       }},
+  };
+  size_structs::Run(size_structs::Storage(), "tests/conformance/system.inc",
+      probes);
+  gdefstor_model_outbox_claim_free(claim);
+}
+
 TEST_F(ModelOutbox, AppendsAreSequencedPerStream) {
   uint64_t s[4] = {0, 0, 0, 0};
   ASSERT_EQ(GDEFSTOR_OK, InWrite([&](GDEFSTOR_Write * w) {
