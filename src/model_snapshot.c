@@ -1787,7 +1787,10 @@ static GDEFSTOR_Result read_order(const GTEXT_JSON_Value * o, double * out) {
     bits = bits * 16 + (uint64_t)h;
   }
   memcpy(out, &bits, sizeof *out);
-  return isfinite(*out) ? GDEFSTOR_OK : GDEFSTOR_ERR_CORRUPT;
+  /* Infinity and NaN are the patterns with every exponent bit set. The bits are
+   * read, not isfinite(): on mingw that macro converts the double to float in
+   * a branch it never takes, and -Wfloat-conversion refuses it. */
+  return ((bits >> 52) & 0x7ffu) != 0x7ffu ? GDEFSTOR_OK : GDEFSTOR_ERR_CORRUPT;
 }
 
 /* A row's "schema": the stamp it was written with (model.h); never missing,
