@@ -1182,6 +1182,41 @@ TEST_F(ModelSnapshot, AStampIsRequiredAndOnlyAStampIsTaken) {
   }
 }
 
+/* A version's order key is a finite number. A snapshot whose "order" says
+ * infinity or NaN (every exponent bit set, either sign, any payload) is
+ * refused as corrupt and nothing is imported; the same member with a finite
+ * key in its place imports, which shows the edit reached the key. */
+TEST_F(ModelSnapshot, ANonFiniteOrderKeyIsRefusedAndNothingIsImported) {
+  ASSERT_EQ(GDEFSTOR_OK, PopulateStamped(store));
+  auto members = ZipMembers(snapshot_fixture::Export(store, kTenant));
+  const std::string key = "\"order\":\"";
+  auto with_order = [&](const std::string & hex) {
+    auto edited = members;
+    bool changed = false;
+    for (auto & m : edited) {
+      size_t at = m.second.find(key);
+      if (at != std::string::npos && at + key.size() + 16 <= m.second.size()) {
+        m.second.replace(at + key.size(), 16, hex);
+        changed = true;
+        break;
+      }
+    }
+    EXPECT_TRUE(changed);
+    return ZipOf(edited);
+  };
+  for (const char * bad : {"7ff0000000000000", "fff0000000000000",
+           "7ff8000000000000", "fff8000000000001", "7fffffffffffffff"}) {
+    std::string why;
+    EXPECT_EQ(GDEFSTOR_ERR_CORRUPT, snapshot_fixture::Import(copy, kTenant,
+        with_order(bad), &why)) << bad;
+    EXPECT_EQ("", snapshot_fixture::Dump(copy, kTenant, GDEFSTOR_MODEL_TRUTH))
+        << bad;
+  }
+  std::string why;
+  EXPECT_EQ(GDEFSTOR_OK, snapshot_fixture::Import(copy, kTenant,
+      with_order("3ff0000000000000"), &why)) << why;
+}
+
 /* Every allocation an export or an import makes may fail: each failure is
  * reported (::GDEFSTOR_ERR_OOM), an export that failed returns nothing, and
  * an import that failed writes nothing - the next attempt would be refused

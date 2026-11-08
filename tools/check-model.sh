@@ -223,6 +223,12 @@ plant snapshot-member-without-format src/model_snapshot.c testModel \
   '    j_lit(&j, "{\"format\":\"" REVISION_FORMAT "\",\"type\":");' \
   '    j_lit(&j, "{\"type\":");'
 
+# An order key that is infinity or NaN is read as a number and accepted.
+plant snapshot-accepts-a-non-finite-order src/model_snapshot.c testModel \
+  'ModelSnapshot.ANonFiniteOrderKeyIsRefusedAndNothingIsImported' \
+  '  return ((bits >> 52) & 0x7ffu) != 0x7ffu ? GDEFSTOR_OK : GDEFSTOR_ERR_CORRUPT;' \
+  '  return GDEFSTOR_OK;'
+
 # A reader accepting another version (story S9), twice: an entity's member
 # read whatever defiant-revision version it says, and a manifest whatever
 # defiant-snapshot version.
