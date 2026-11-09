@@ -516,6 +516,33 @@ PY
     return 1
   fi
   if [ $ran -eq 0 ]; then
+    # A test that cannot run on this platform cannot catch a defect here. That
+    # is a plant not exercised, and it is said so, but only for a test the
+    # caller names in GHOTI_PLANT_UNEXERCISED and only when the planted test
+    # program is seen to skip it: a named test that ran and passed is still a gate that cannot fail.
+    unexercised=1
+    for t in $expect; do
+      case " ${GHOTI_PLANT_UNEXERCISED:-} " in
+      *" $t "*)
+        # The gate's own run may be brief, which leaves the skipped tests out of the log:
+        # ask the planted test program itself, on that one test.
+        seen_skip=0
+        for e in $exe; do
+          if ( cd "$dir" && LD_LIBRARY_PATH="$dir/$PLANT_BUILD/apps${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                GTEST_FILTER="$t" "$PLANT_BUILD/apps/$e$PLANT_EXE_EXT" 2>&1 ) \
+              | grep -Eq "\[  SKIPPED \] $t( |\$)"; then
+            seen_skip=1
+          fi
+        done
+        [ $seen_skip -eq 1 ] || unexercised=0 ;;
+      *) unexercised=0 ;;
+      esac
+    done
+    if [ $unexercised -eq 1 ]; then
+      printf '%s: %s: NOT EXERCISED on this platform: %s is skipped here, so the plant could not be caught\n' \
+        "$PLANT_TAG" "$name" "$expect"
+      return 0
+    fi
     printf '%s: %s: %s PASSED with the defect planted\n' "$PLANT_TAG" "$name" "$expect" >&2
     return 1
   fi
